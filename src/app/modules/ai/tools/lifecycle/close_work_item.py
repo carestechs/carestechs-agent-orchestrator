@@ -32,12 +32,23 @@ def tool_definition() -> ToolDefinition:
     return ToolDefinition(
         name=TOOL_NAME,
         description=(
-            "Flip the work-item brief's Status to 'Completed' and record a "
-            "Completed timestamp.  Refuses if the current Status isn't 'In Progress'."
+            "Flip the BRIEF's Status to 'Completed' and record a Completed "
+            "timestamp.  The ``work_item_id`` argument must be the work "
+            "item's brief id (e.g. 'IMP-002', 'FEAT-042', 'BUG-017') — it "
+            "is NOT a task id (T-XXX).  Refuses if the brief's current "
+            "Status isn't 'In Progress'."
         ),
         parameters={
             "type": "object",
-            "properties": {"work_item_id": {"type": "string"}},
+            "properties": {
+                "work_item_id": {
+                    "type": "string",
+                    "description": (
+                        "The brief's id as written in its Identity table "
+                        "(e.g. 'IMP-002').  Not a task id."
+                    ),
+                },
+            },
             "required": ["work_item_id"],
         },
     )
@@ -46,8 +57,22 @@ def tool_definition() -> ToolDefinition:
 async def handle(args: dict[str, Any], *, memory: LifecycleMemory) -> LifecycleMemory:
     work_item_id: str = args["work_item_id"]
 
-    if memory.work_item is None or memory.work_item.id != work_item_id:
-        raise PolicyError(f"work_item_id mismatch: {work_item_id}")
+    if memory.work_item is None:
+        raise PolicyError("no work_item in memory; load_work_item must run first")
+
+    # Be forgiving about the common LLM confusion between task id ("T-001")
+    # and brief id ("IMP-002"): if the provided id is a known task id, log
+    # the mismatch but use the brief id from memory instead of failing.
+    if memory.work_item.id != work_item_id:
+        known_task = any(t.id == work_item_id for t in memory.tasks)
+        if known_task:
+            # Recognized substitution — proceed with the real brief id.
+            work_item_id = memory.work_item.id
+        else:
+            raise PolicyError(
+                f"work_item_id mismatch: got {work_item_id!r}, expected "
+                f"{memory.work_item.id!r}"
+            )
 
     repo_root = get_settings().repo_root.resolve()
     path = repo_root / memory.work_item.path

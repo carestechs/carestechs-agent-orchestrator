@@ -12,7 +12,8 @@
 | **ID** | FEAT-005 |
 | **Name** | Lifecycle Agent v1 + Self-Hosted Feature Delivery Proof |
 | **Target Version** | v0.5.0 |
-| **Status** | Not Started |
+| **Status** | Completed |
+| **Completed** | 2026-04-18 (proven via IMP-002) |
 | **Priority** | Critical |
 | **Requested By** | Tech Lead (`ai@techer.com.br`) |
 | **Date Created** | 2026-04-18 |

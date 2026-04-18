@@ -18,8 +18,21 @@ from app.modules.ai.tools.lifecycle.memory import LifecycleMemory, LifecycleTask
 
 TOOL_NAME = "generate_tasks"
 
-# Captures "### T-001: Title text" rows produced by the task-generation prompt.
-_TASK_ROW_RE = re.compile(r"^###\s+(T-\d+):\s*(.+?)\s*$", re.MULTILINE)
+# Accepts the canonical `### T-001: Title` heading plus common variants
+# models emit in practice: `## T-001: Title`, `- T-001: Title`,
+# `**T-001**: Title`, `- [ ] **TASK-001** · Title`, etc.  The id token is
+# `T-<digits>` or `TASK-<digits>`; we normalize the latter to `T-<digits>`
+# so downstream tools (``generate_plan``, ``review_implementation``) see a
+# single convention.
+_TASK_ROW_RE = re.compile(
+    r"^[\s\-*#`>\[\]x]*\**\s*(T(?:ASK)?-\d+)\**[:\s·|\-\u2013\u2014]+\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _normalize_task_id(raw: str) -> str:
+    """``TASK-001`` → ``T-001``; ``T-001`` passes through unchanged."""
+    return raw.replace("TASK-", "T-", 1) if raw.startswith("TASK-") else raw
 
 
 def tool_definition() -> ToolDefinition:
@@ -27,7 +40,12 @@ def tool_definition() -> ToolDefinition:
         name=TOOL_NAME,
         description=(
             "Write the generated task list to tasks/<work_item_id>-tasks.md "
-            "and populate memory.tasks with (id, title) per task row."
+            "and populate memory.tasks with (id, title) per task row. "
+            "The markdown MUST declare each task using a heading of the "
+            "form '### T-XXX: Task title' (numeric task id, colon, then "
+            "a short one-line title on the same line). Every task you "
+            "include under that shape becomes one entry in memory.tasks; "
+            "rows in any other format are ignored."
         ),
         parameters={
             "type": "object",
@@ -38,7 +56,10 @@ def tool_definition() -> ToolDefinition:
                 },
                 "tasks_markdown": {
                     "type": "string",
-                    "description": "Full rendered task-breakdown markdown.",
+                    "description": (
+                        "Full rendered task-breakdown markdown. Each task "
+                        "declared as '### T-XXX: Title' on its own line."
+                    ),
                 },
             },
             "required": ["work_item_id", "tasks_markdown"],
@@ -61,5 +82,7 @@ async def handle(args: dict[str, Any], *, memory: LifecycleMemory) -> LifecycleM
     target = repo_root / "tasks" / f"{work_item_id}-tasks.md"
     write_atomic(target, tasks_markdown, repo_root=repo_root)
 
-    tasks = [LifecycleTask(id=tid, title=title) for tid, title in rows]
+    tasks = [
+        LifecycleTask(id=_normalize_task_id(tid), title=title) for tid, title in rows
+    ]
     return memory.model_copy(update={"tasks": tasks})

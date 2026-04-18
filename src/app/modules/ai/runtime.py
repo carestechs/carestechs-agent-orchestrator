@@ -13,6 +13,7 @@ has exactly one way to exit.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -59,10 +60,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
-    "You are the policy for an agent-driven loop.  Each turn, choose the "
-    "next action by selecting one of the provided tools.  Call the "
-    f"{TERMINATE_TOOL_NAME!r} tool when the run's goal has been met."
+    "You are the policy for an agent-driven loop. Each turn, you will see "
+    "the current run state — the intake, the accumulated memory, and the "
+    "last step's outcome — and you MUST advance the run by calling exactly "
+    "one of the provided tools. The tool list on each turn is already "
+    "narrowed to the moves allowed from the current state: do not try to "
+    "re-run a stage that already completed; choose the forward action. "
+    "Read memory carefully — once a step wrote to memory, that record IS "
+    "the evidence that the step is done. "
+    f"Call the {TERMINATE_TOOL_NAME!r} tool only when no progress tool is "
+    "available AND the run's goal has been met."
 )
+
+
+def _allowed_tools_for(
+    agent: AgentDefinition,
+    last_tool: ToolCall | None,
+    fallback: list[str],
+) -> list[str]:
+    """Return the tool names the policy is allowed to choose from this iteration.
+
+    Gating uses ``agent.flow.transitions``: on the very first iteration
+    (``last_tool is None``) only the entry node is exposed; subsequent
+    iterations expose the declared successors of the last tool.  A missing
+    or empty transitions entry falls back to *fallback* (every declared
+    node) so permissive agents still work.
+
+    This is the "Omit it from the per-call tool list to gate availability"
+    pattern from CLAUDE.md — stops the policy from re-running completed
+    stages just because the tool is still visible.
+    """
+    transitions = agent.flow.transitions or {}
+    if last_tool is None:
+        return [agent.flow.entry_node]
+    successors = transitions.get(last_tool.name)
+    if successors is None:
+        return fallback
+    # Empty successor list = terminal node; returning [] hides every node
+    # tool, leaving only ``terminate`` in the tool list the runtime builds.
+    return list(successors)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +167,7 @@ async def _iterate(
     last_engine_error: Exception | None = None
 
     terminal_nodes = frozenset(agent.terminal_nodes)
-    tool_names = [n.name for n in agent.nodes]
+    all_node_names = [n.name for n in agent.nodes]
 
     max_steps = agent.default_budget.max_steps
     max_tokens = agent.default_budget.max_tokens
@@ -167,8 +203,16 @@ async def _iterate(
         # ------------------------------------------------------------------
         try:
             prompt_context = await _build_context(run_id, session_factory)
-            tools = build_tools(agent, tool_names)
-            messages = [{"role": "user", "content": prompt_context}]
+            allowed_tools = _allowed_tools_for(agent, last_tool, all_node_names)
+            tools = build_tools(agent, allowed_tools)
+            # Anthropic's Messages API requires ``content`` to be a string
+            # or a list of content blocks — a raw dict yields HTTP 400.  We
+            # serialize the context to JSON so the policy sees the full
+            # structure verbatim.  The ``PolicyCall`` row still stores the
+            # dict form via ``prompt_context`` for trace fidelity.
+            messages = [
+                {"role": "user", "content": json.dumps(prompt_context, default=str)}
+            ]
             tool_call = await policy.chat_with_tools(
                 system=_SYSTEM_PROMPT,
                 messages=messages,

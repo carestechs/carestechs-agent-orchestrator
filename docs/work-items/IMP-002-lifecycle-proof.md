@@ -10,7 +10,8 @@
 |-------|-------|
 | **ID** | IMP-002 |
 | **Name** | Lifecycle self-hosted delivery proof |
-| **Status** | In Progress |
+| **Status** | Completed |
+| **Completed** | 2026-04-18T22:24:24+00:00 |
 | **Priority** | Medium |
 | **Requested By** | Tech Lead (`carlos.escalona@carestechs.com.br`) |
 | **Date Created** | 2026-04-18 |

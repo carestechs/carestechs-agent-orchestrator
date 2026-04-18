@@ -5,7 +5,7 @@
 - **What:** A coordination layer built on top of `carestechs-flow-engine` that turns the ia-framework's feature lifecycle into an agent-driven loop — composing flows, an LLM policy, and scoped memory so deterministic pipelines become decision-making units.
 - **Value Proposition:** Teams that have adopted the ia-framework can hand a feature brief to the orchestrator and get tasks, plans, implementations, reviews, and closure events back — without manually re-running each stage of the loop.
 - **Success Criteria:**
-  1. The orchestrator drives at least one real feature of its *own* codebase end-to-end (brief → closed work item) without a human routing between stages.
+  1. The orchestrator drives at least one real feature of its *own* codebase end-to-end (brief → closed work item) without a human routing between stages. **Met** — see [`docs/work-items/IMP-002-lifecycle-proof.md`](work-items/IMP-002-lifecycle-proof.md) (2026-04-18).
   2. Every stage transition is traceable: the agent's policy call, inputs, and outputs are inspectable per node.
   3. Removing the LLM policy degrades the system to a deterministic flow that still runs — proving the composition boundary holds.
 
@@ -54,7 +54,7 @@ A feature brief enters the orchestrator. The agent generates tasks per the frame
 
 | Metric | Target | How Measured |
 |--------|--------|--------------|
-| Self-hosted feature delivery | ≥1 feature of this repo shipped end-to-end via the orchestrator | Work item closed; git history shows orchestrator-driven commits per stage |
+| Self-hosted feature delivery | **≥1 — met (IMP-002, 2026-04-18)** | Work item closed; git history shows orchestrator-driven commits per stage |
 | Lifecycle stage automation coverage | All 8 lifecycle stages (intake → closure) executable without manual routing | Stage transitions logged by the orchestrator, not by a human prompt |
 | Policy traceability | 100% of policy calls have inspectable inputs, outputs, and selected next-node | Per-run trace export; spot-check on every shipped feature |
 | Composition integrity | Removing the LLM policy degrades cleanly to a deterministic flow run | Test: same agent definition with a stub policy completes as a pipeline |
