@@ -109,6 +109,9 @@ plan creation → implementation → review → corrections → closure) against
 any FEAT / BUG / IMP work item in this repo.
 
 ```bash
+# 0. Smoke-check that the lifecycle agent loads.
+uv run orchestrator agents show lifecycle-agent@0.1.0
+
 # 1. Drop a filled-in work item at docs/work-items/FEAT-XXX.md.
 
 # 2. Start the run (Anthropic recommended for real decisions).
