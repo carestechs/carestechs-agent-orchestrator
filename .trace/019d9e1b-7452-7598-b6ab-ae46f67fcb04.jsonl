@@ -1,0 +1,1 @@
+{"kind": "webhook_event", "data": {"id": "019d9e1b-7461-7d90-b427-091b6d7c787a", "eventType": "node_finished", "engineRunId": "eng-run-xyz-123", "payload": {"result": "ok"}, "signatureOk": true, "receivedAt": "2026-04-18T01:01:32.625208Z", "processedAt": null}}

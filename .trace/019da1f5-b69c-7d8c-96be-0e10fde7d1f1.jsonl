@@ -1,0 +1,1 @@
+{"kind": "operator_signal", "data": {"id": "019da1f5-b6c0-7c76-b98e-2dd6111c7a28", "runId": "019da1f5-b69c-7d8c-96be-0e10fde7d1f1", "name": "implementation-complete", "taskId": "T-001", "payload": {"commit_sha": "abc1234"}, "receivedAt": "2026-04-18T18:58:48.089905Z", "dedupeKey": "79eced23badab6328432900eeace6b11b9b5e1cc980c3eff49b5ff9dccc4cece"}}

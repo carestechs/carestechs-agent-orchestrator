@@ -1,0 +1,49 @@
+# Sample agent used across the FEAT-002 test suite.
+# 3 nodes in a linear flow, review_plan is terminal.
+ref: sample-linear
+version: "1.0"
+description: Minimal 3-node linear agent for composition-integrity tests.
+
+nodes:
+  - name: analyze_brief
+    description: Read the intake brief and extract key points.
+    inputSchema:
+      type: object
+      properties:
+        brief:
+          type: string
+      required: [brief]
+    timeoutSeconds: 60
+
+  - name: draft_plan
+    description: Produce a plan from the analysis.
+    inputSchema:
+      type: object
+      properties: {}
+    timeoutSeconds: 60
+
+  - name: review_plan
+    description: Review the plan; this node is terminal.
+    inputSchema:
+      type: object
+      properties: {}
+    timeoutSeconds: 60
+
+flow:
+  entryNode: analyze_brief
+  transitions:
+    analyze_brief: [draft_plan]
+    draft_plan: [review_plan]
+    review_plan: []
+
+intakeSchema:
+  type: object
+  properties:
+    brief:
+      type: string
+  required: [brief]
+
+terminalNodes: [review_plan]
+
+defaultBudget:
+  maxSteps: 10

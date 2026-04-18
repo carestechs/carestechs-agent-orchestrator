@@ -1,0 +1,116 @@
+# lifecycle-agent@0.1.0 — FEAT-005
+#
+# Drives the ia-framework's 8-stage lifecycle loop against a single work
+# item (FEAT / BUG / IMP).  Every node is a local tool (no flow-engine
+# dispatch); `wait_for_implementation` pauses for an operator-injected
+# signal.
+#
+# Node names are the tool names the policy will invoke — they must match
+# the TOOL_NAME constants in src/app/modules/ai/tools/lifecycle/*.py.
+#
+# Design rationale: plans/plan-T-100-lifecycle-agent-yaml-investigation.md
+ref: lifecycle-agent@0.1.0
+version: "0.1.0"
+description: >
+  Drives the ia-framework's 8-stage lifecycle (intake → closure) against a
+  single work item.  Every stage is a local tool; wait_for_implementation
+  pauses for an operator signal via POST /api/v1/runs/{id}/signals.
+
+nodes:
+  - name: load_work_item
+    description: Load a work-item markdown file and populate memory.work_item.
+    inputSchema:
+      type: object
+      properties:
+        path: {type: string}
+      required: [path]
+
+  - name: generate_tasks
+    description: Write the rendered task list to tasks/<work_item_id>-tasks.md and populate memory.tasks.
+    inputSchema:
+      type: object
+      properties:
+        work_item_id: {type: string}
+        tasks_markdown: {type: string}
+      required: [work_item_id, tasks_markdown]
+
+  - name: assign_task
+    description: Assign an executor to a task (v1 always picks 'local-claude-code').
+    inputSchema:
+      type: object
+      properties:
+        task_id: {type: string}
+      required: [task_id]
+
+  - name: generate_plan
+    description: Write a per-task implementation plan to plans/plan-<task_id>-<slug>.md.
+    inputSchema:
+      type: object
+      properties:
+        task_id: {type: string}
+        plan_markdown: {type: string}
+        slug: {type: string}
+      required: [task_id, plan_markdown]
+
+  - name: wait_for_implementation
+    description: Pause and wait for an operator-injected implementation-complete signal.
+    inputSchema:
+      type: object
+      properties:
+        task_id: {type: string}
+      required: [task_id]
+
+  - name: review_implementation
+    description: Record a pass/fail verdict + feedback for the task's current implementation.
+    inputSchema:
+      type: object
+      properties:
+        task_id: {type: string}
+        verdict: {type: string, enum: [pass, fail]}
+        feedback: {type: string}
+      required: [task_id, verdict, feedback]
+
+  - name: corrections
+    description: Increment memory.correction_attempts[task_id] and route back to wait_for_implementation.
+    inputSchema:
+      type: object
+      properties:
+        task_id: {type: string}
+      required: [task_id]
+
+  - name: close_work_item
+    description: Flip the work-item Status to 'Completed' and stamp the Completed timestamp.
+    inputSchema:
+      type: object
+      properties:
+        work_item_id: {type: string}
+      required: [work_item_id]
+
+flow:
+  entryNode: load_work_item
+  transitions:
+    load_work_item: [generate_tasks]
+    generate_tasks: [assign_task]
+    assign_task: [generate_plan]
+    generate_plan: [generate_plan, wait_for_implementation]
+    wait_for_implementation: [review_implementation]
+    review_implementation: [corrections, close_work_item]
+    corrections: [wait_for_implementation]
+    close_work_item: []
+
+intakeSchema:
+  type: object
+  properties:
+    workItemPath: {type: string}
+  required: [workItemPath]
+
+terminalNodes: [close_work_item]
+
+defaultBudget:
+  maxSteps: 300
+
+policy:
+  systemPrompts:
+    generate_tasks: .ai-framework/prompts/feature-tasks.md
+    generate_plan: .ai-framework/prompts/plan-generation.md
+    review_implementation: .ai-framework/prompts/lifecycle-review.md
