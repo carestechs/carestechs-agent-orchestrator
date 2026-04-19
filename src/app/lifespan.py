@@ -84,8 +84,60 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.exception("zombie reconciliation failed; continuing startup")
 
+    # FEAT-006 rc2: ensure flow-engine workflows are registered.  Optional —
+    # if lifecycle-engine config is absent we skip so dev setups without the
+    # engine up still boot.
+    await _bootstrap_lifecycle_workflows(app, session_factory)
+
     try:
         yield
     finally:
+        engine_client = getattr(app.state, "lifecycle_engine_client", None)
+        if engine_client is not None:
+            try:
+                await engine_client.aclose()
+            except Exception:
+                logger.warning("lifecycle engine client close failed", exc_info=True)
         await supervisor.shutdown(grace=5.0)
         logger.info("supervisor drained on shutdown")
+
+
+async def _bootstrap_lifecycle_workflows(
+    app: FastAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Register FEAT-006 workflows in the flow engine on cold start."""
+    from app.config import get_settings
+    from app.modules.ai.lifecycle.bootstrap import ensure_workflows
+    from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
+
+    settings = get_settings()
+    base_url = settings.flow_engine_lifecycle_base_url
+    api_key = settings.flow_engine_tenant_api_key
+    if base_url is None or api_key is None:
+        logger.info(
+            "lifecycle engine not configured; skipping workflow bootstrap"
+        )
+        app.state.lifecycle_engine_client = None
+        app.state.lifecycle_workflow_ids = {}
+        return
+
+    client = FlowEngineLifecycleClient(
+        base_url=str(base_url),
+        api_key=api_key.get_secret_value(),
+    )
+    app.state.lifecycle_engine_client = client
+
+    try:
+        async with session_factory() as session:
+            workflow_ids = await ensure_workflows(session, client)
+    except Exception:
+        logger.exception("lifecycle workflow bootstrap failed; continuing startup")
+        app.state.lifecycle_workflow_ids = {}
+        return
+
+    app.state.lifecycle_workflow_ids = workflow_ids
+    logger.info(
+        "lifecycle workflow bootstrap complete: %s",
+        {name: str(wid) for name, wid in workflow_ids.items()},
+    )

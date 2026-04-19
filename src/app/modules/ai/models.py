@@ -520,3 +520,22 @@ class TaskImplementation(Base):
             "submitted_at",
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# EngineWorkflow (FEAT-006 rc2) — caches the engine-side workflow IDs so
+# subsequent ``create_item`` calls know which workflow to target.  Written
+# once per workflow name at startup; no other code path mutates.
+# ---------------------------------------------------------------------------
+
+
+class EngineWorkflow(Base):
+    """Local cache of a flow-engine workflow ID keyed by declared name."""
+
+    __tablename__ = "engine_workflows"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    engine_workflow_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
