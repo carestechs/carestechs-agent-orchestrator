@@ -97,6 +97,14 @@ class Settings(BaseSettings):
     # -- GitHub integration (FEAT-006) ------------------------------------
     github_webhook_secret: SecretStr | None = None
 
+    # -- Flow-engine lifecycle surface (FEAT-006 rc2) ---------------------
+    # Points at the same flow engine as ``engine_base_url``; separate field
+    # because the lifecycle surface (workflows / items / transitions) is
+    # accessed with a tenant API key + JWT, whereas ``engine_base_url`` is
+    # the node/dispatch surface used by FEAT-005.
+    flow_engine_lifecycle_base_url: AnyHttpUrl | None = None
+    flow_engine_tenant_api_key: SecretStr | None = None
+
     # -- Observability -----------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     trace_backend: Literal["noop", "jsonl"] = "jsonl"
