@@ -23,7 +23,7 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 
 | Module | Entities Owned | DbContext (v2) |
 |--------|---------------|----------------|
-| `ai` | `Run`, `Step`, `PolicyCall`, `WebhookEvent`, `RunMemory`, `RunSignal` | `ai` module's `AsyncSession` (per `adrs/python/sqlalchemy-async.md`) |
+| `ai` | `Run`, `Step`, `PolicyCall`, `WebhookEvent`, `RunMemory`, `RunSignal`, `WorkItem`, `Task`, `TaskAssignment`, `Approval` | `ai` module's `AsyncSession` (per `adrs/python/sqlalchemy-async.md`) |
 
 ## Entity Definitions
 
@@ -136,10 +136,11 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | event_type | enum `WebhookEventType` | Required | See enum. |
 | engine_run_id | text | Required | Correlation id from the engine. |
 | payload | JSONB | Required | Full, validated event body. |
-| signature_ok | bool | Required | Whether HMAC validation passed. Events with `false` are persisted and rejected. |
+| signature_ok | bool | Required | Whether signature validation passed (HMAC for engine source; GitHub signature for github source). Events with `false` are persisted and rejected. |
+| source | enum `WebhookSource` | Required, default `engine` | Origin of the event. Added by FEAT-006 to support non-engine sources. |
 | received_at | timestamptz | Required, Auto | When the HTTP request landed. |
 | processed_at | timestamptz | Nullable | When the runtime loop consumed the event. |
-| dedupe_key | text | Required, Unique | Deterministic key for idempotent retry handling (e.g., `engine_run_id:event_type:engine_event_id`). |
+| dedupe_key | text | Required, Unique | Deterministic key for idempotent retry handling (e.g., `engine_run_id:event_type:engine_event_id` for `engine`; `github:pr:<pr_number>:<delivery_id>` for `github`). |
 
 **Indexes:**
 - UNIQUE on `dedupe_key` — idempotency.
@@ -194,6 +195,117 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 
 ---
 
+### WorkItem
+
+> *Module: `ai` — The deterministic-flow counterpart to a FEAT/BUG/IMP markdown brief. Persists the current state of a work item under orchestrator management. Introduced by FEAT-006.*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK | Work item id (UUIDv7). |
+| external_ref | text | Required, Unique | Human-facing id (e.g., `FEAT-042`, `BUG-017`). |
+| type | enum `WorkItemType` | Required | `FEAT`, `BUG`, `IMP`. |
+| title | text | Required | Human-readable title. |
+| source_path | text | Nullable | Path to the originating markdown brief, if any. |
+| status | enum `WorkItemStatus` | Required, default `open` | See enum. |
+| locked_from | enum `WorkItemStatus` | Nullable | State active before a lock (always `in_progress` in v1). |
+| opened_by | text | Required | Actor id (admin) who opened the work item. |
+| closed_at | timestamptz | Nullable | Set when `status=closed`. |
+| closed_by | text | Nullable | Admin who closed the work item. |
+| created_at | timestamptz | Required, Auto | Record creation timestamp. |
+| updated_at | timestamptz | Required, Auto | Last state change. |
+
+**Indexes:**
+- UNIQUE on `external_ref`.
+- BTREE on `status, updated_at DESC` — "show me work items currently active".
+
+**Business Rules:**
+- `status` transitions: `open → in_progress → ready → closed`, plus `in_progress ⇄ locked`. Any other transition is rejected at the service layer.
+- `in_progress` is derived from child-task state (first task approved). `ready` is derived from "all child tasks in a terminal state (`done` or `deferred`)". Both derivations fire idempotently.
+- `closed_at` and `closed_by` are set together or neither.
+- `locked_from` is set on lock, cleared on unlock.
+- Closing from any state other than `ready` returns `409 Conflict`.
+
+---
+
+### Task
+
+> *Module: `ai` — A single task under a work item. Carries its own state machine through proposal → approval → planning → implementation → review → done. Introduced by FEAT-006.*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK | Task id (UUIDv7). |
+| work_item_id | UUID | FK → WorkItem.id, Required | Parent work item. |
+| external_ref | text | Required | Human-facing id (e.g., `T-042`). Unique per work item. |
+| title | text | Required | Task title. |
+| status | enum `TaskStatus` | Required, default `proposed` | See enum. |
+| proposer_type | enum `ActorType` | Required | `admin`, `agent` (who drafted the task). |
+| proposer_id | text | Required | Actor id (e.g., admin id or agent ref). |
+| deferred_from | enum `TaskStatus` | Nullable | State active before deferral. Audit. |
+| created_at | timestamptz | Required, Auto | Record creation timestamp. |
+| updated_at | timestamptz | Required, Auto | Last state change. |
+
+**Indexes:**
+- UNIQUE on `(work_item_id, external_ref)`.
+- BTREE on `work_item_id, status` — "all tasks in this work item by state".
+
+**Business Rules:**
+- `status` transitions are enforced at the service layer. Allowed forward edges: `proposed → approved → assigning → planning → plan_review → implementing → impl_review → done`. Allowed rejection edges: `plan_review → planning`, `impl_review → implementing`, `proposed → proposed` (revision). Allowed deferral edge: any non-terminal → `deferred` (admin only).
+- Rejection iterations are unbounded in v1; iteration count is reconstructable from the `Approval` table.
+- `deferred_from` is set on transition to `deferred` and never cleared; `deferred` is terminal for the W5 derivation.
+- Assignment history is tracked in `TaskAssignment`, not on this entity; querying "current assignee" uses the latest `TaskAssignment` row for the task.
+
+---
+
+### TaskAssignment
+
+> *Module: `ai` — Append-only record of current and historical task assignments. Introduced by FEAT-006.*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK | Assignment id (UUIDv7). |
+| task_id | UUID | FK → Task.id, Required | Owning task. |
+| assignee_type | enum `AssigneeType` | Required | `dev`, `agent`. |
+| assignee_id | text | Required | Actor id (dev identifier or agent ref). |
+| assigned_by | text | Required | Admin who performed the assignment. |
+| assigned_at | timestamptz | Required, Auto | When the assignment was recorded. |
+| superseded_at | timestamptz | Nullable | Set when a later assignment replaces this one. |
+
+**Indexes:**
+- BTREE on `task_id, assigned_at DESC` — latest assignment lookup.
+- Partial UNIQUE on `task_id WHERE superseded_at IS NULL` — at most one active assignment per task.
+
+**Business Rules:**
+- Append-only. Reassigning a task inserts a new row and sets `superseded_at` on the prior active row.
+- Created only by the `assign-task` signal handler (S7).
+- Assignment type drives approval routing: `assignee_type=dev` routes `plan_review` approval to that dev (self-signal); `assignee_type=agent` routes to admin.
+
+---
+
+### Approval
+
+> *Module: `ai` — Append-only record of every approval/rejection decision on a task. Reconstructs rejection iteration count and audit trail. Introduced by FEAT-006.*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK | Approval id (UUIDv7). |
+| task_id | UUID | FK → Task.id, Required | Owning task. |
+| stage | enum `ApprovalStage` | Required | `proposed`, `plan`, `impl`. |
+| decision | enum `ApprovalDecision` | Required | `approve`, `reject`. |
+| decided_by | text | Required | Actor id (admin or dev) who made the decision. |
+| decided_by_role | enum `ActorRole` | Required | `admin`, `dev`. |
+| feedback | text | Nullable | Free-form feedback. Required (non-empty) when `decision=reject`. |
+| decided_at | timestamptz | Required, Auto | When the decision was recorded. |
+
+**Indexes:**
+- BTREE on `(task_id, stage, decided_at)` — "iterations of plan review for this task".
+
+**Business Rules:**
+- Append-only. No decision is ever edited after insert.
+- `feedback` MUST be non-empty when `decision=reject`. The service layer returns `422` if the caller omits it.
+- The count of `reject` rows for a `(task_id, stage)` pair equals the rejection iteration count for that stage. No bound in v1.
+
+---
+
 ## Relationships
 
 ### One-to-Many
@@ -205,6 +317,9 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | Run | WebhookEvent | `webhook_event.run_id` | Same |
 | Run | RunSignal | `run_signal.run_id` | Same |
 | Step | WebhookEvent | `webhook_event.step_id` (nullable) | Same |
+| WorkItem | Task | `task.work_item_id` | No cascade delete — append-only history |
+| Task | TaskAssignment | `task_assignment.task_id` | Same |
+| Task | Approval | `approval.task_id` | Same |
 
 ### One-to-One
 
@@ -270,12 +385,107 @@ None — single-module project in v1.
 | `node_finished` | Engine completed the node successfully |
 | `node_failed` | Engine failed the node |
 | `flow_terminated` | Engine considers the dispatched flow/subflow fully ended |
+| `github_pr_opened` | GitHub PR was opened referencing a task (FEAT-006) |
+| `github_pr_closed` | GitHub PR was closed (merged or discarded) (FEAT-006) |
+
+### WebhookSource
+
+> *Used by: `WebhookEvent.source` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `engine` | Event originated from `carestechs-flow-engine`; signature is HMAC-SHA256 over raw body |
+| `github` | Event originated from a GitHub webhook; signature is `X-Hub-Signature-256` |
+
+### WorkItemType
+
+> *Used by: `WorkItem.type` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `FEAT` | Feature work item |
+| `BUG` | Bug work item |
+| `IMP` | Improvement work item |
+
+### WorkItemStatus
+
+> *Used by: `WorkItem.status`, `WorkItem.locked_from` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `open` | Admin opened; awaiting task generation / first task approval |
+| `in_progress` | At least one task has been approved (derived transition W2) |
+| `locked` | Admin paused; reachable only from `in_progress` |
+| `ready` | All tasks in a terminal state (derived transition W5) |
+| `closed` | Admin closed the work item |
+
+### TaskStatus
+
+> *Used by: `Task.status`, `Task.deferred_from` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `proposed` | Draft proposed; awaiting admin approval |
+| `approved` | Admin approved the proposal; ready for assignment |
+| `assigning` | Awaiting admin to write an assignee |
+| `planning` | Plan being drafted |
+| `plan_review` | Plan submitted; awaiting approver (dev self-signal or admin) |
+| `implementing` | Implementation underway |
+| `impl_review` | Implementation submitted; awaiting reviewer |
+| `done` | Terminal success |
+| `deferred` | Terminal deferral (admin signal); satisfies W5 |
+
+### ActorType
+
+> *Used by: `Task.proposer_type` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `admin` | An admin actor |
+| `agent` | An agent run acting on behalf of the system |
+
+### ActorRole
+
+> *Used by: `Approval.decided_by_role` — introduced by FEAT-006. Differs from `ActorType` in that approvers are always humans (`admin` or `dev`), never agents.*
+
+| Value | Description |
+|-------|-------------|
+| `admin` | Admin role |
+| `dev` | Developer role |
+
+### AssigneeType
+
+> *Used by: `TaskAssignment.assignee_type` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `dev` | Assigned to a human developer |
+| `agent` | Assigned to an agent |
+
+### ApprovalStage
+
+> *Used by: `Approval.stage` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `proposed` | Decision on the task proposal itself |
+| `plan` | Decision on a submitted plan |
+| `impl` | Decision on a submitted implementation |
+
+### ApprovalDecision
+
+> *Used by: `Approval.decision` — introduced by FEAT-006.*
+
+| Value | Description |
+|-------|-------------|
+| `approve` | Approved; task advances |
+| `reject` | Rejected; task returns to prior state with feedback |
 
 ## Database Conventions
 
 | Convention | Rule | Example |
 |------------|------|---------|
-| Table naming | snake_case, plural | `runs`, `steps`, `policy_calls`, `webhook_events`, `run_memory` |
+| Table naming | snake_case, plural | `runs`, `steps`, `policy_calls`, `webhook_events`, `run_memory`, `work_items`, `tasks`, `task_assignments`, `approvals` |
 | Column naming | snake_case | `created_at`, `engine_run_id` |
 | Primary keys | UUIDv7, column named `id` (except `run_memory.run_id` which is both PK and FK) | `id UUID PK` |
 | Timestamps | `timestamptz`, UTC, `created_at` on every append-only entity; `updated_at` where mutable | `created_at timestamptz not null default now()` |
@@ -293,6 +503,7 @@ None — single-module project in v1.
 
 ## Changelog
 
+- 2026-04-19 — FEAT-006 — Added `WorkItem`, `Task`, `TaskAssignment`, `Approval` entities for the deterministic lifecycle flow. Added enums `WorkItemType`, `WorkItemStatus`, `TaskStatus`, `ActorType`, `ActorRole`, `AssigneeType`, `ApprovalStage`, `ApprovalDecision`, and `WebhookSource`. Extended `WebhookEvent` with a `source` column (`engine` default; `github` for GitHub PR webhooks) and added `github_pr_opened` / `github_pr_closed` values to `WebhookEventType`. Derived transitions (W2, W5, T4) documented as orchestrator-internal; the flow engine remains logic-free per AD-1.
 - 2026-04-18 — FEAT-005 — Added `RunSignal` entity (operator-injected signals, unique `dedupe_key` derived from `(run_id, name, task_id)`, persist-first-then-wake contract). Noted that lifecycle-agent steps legitimately have `engine_run_id=NULL` (local-tool path — no engine dispatch).
 - 2026-04-18 — FEAT-002 — Documented `Run` and `Step` status transitions, the `StopReason` → `RunStatus` mapping, `Step` monotonic reconciliation, and `PolicyCall` append-only invariant. No schema changes.
 - 2026-04-15 — Initial version. Defined `Run`, `Step`, `PolicyCall`, `WebhookEvent`, `RunMemory` under the single `ai` module. Documented JSONL-first / Postgres-next storage split and append-only conventions.

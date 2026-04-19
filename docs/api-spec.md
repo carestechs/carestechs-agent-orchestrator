@@ -59,7 +59,12 @@ Single-resource responses omit `meta`. Collection responses always include it.
 ### Authentication
 
 - **Control plane:** `Authorization: Bearer <api-key>`. API key is a server-side secret configured via env var `ORCHESTRATOR_API_KEY`. Missing/invalid → `401`.
-- **Webhooks:** HMAC-SHA256 over the raw request body, keyed by `ENGINE_WEBHOOK_SECRET`, submitted as `X-Engine-Signature: sha256=<hex>`. Missing/mismatched → `401` and the event is persisted with `signature_ok=false`.
+- **Webhooks (engine):** HMAC-SHA256 over the raw request body, keyed by `ENGINE_WEBHOOK_SECRET`, submitted as `X-Engine-Signature: sha256=<hex>`. Missing/mismatched → `401` and the event is persisted with `signature_ok=false`.
+- **Webhooks (GitHub):** GitHub webhook signature (`X-Hub-Signature-256: sha256=<hex>`), keyed by `GITHUB_WEBHOOK_SECRET`. Missing/mismatched → `401`, event persisted with `signature_ok=false`. Introduced by FEAT-006.
+
+### Role Header (FEAT-006)
+
+For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: admin | dev`. The role is validated against the endpoint's required role(s); mismatch returns `403`. v1 treats role as self-asserted by the API-key holder; proper per-user auth is a follow-up. Endpoints that do not require a role do not read the header.
 
 ### Pagination
 
@@ -397,6 +402,200 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ---
 
+### Lifecycle flow (FEAT-006)
+
+> *14 signals as the orchestrator's deterministic-flow intake surface. 13 REST endpoints (below) plus 1 GitHub webhook endpoint (in the Webhooks section). All REST endpoints return `202 Accepted` with `{ data, meta? }` per the envelope convention, are idempotent on payload hash, and require `X-Actor-Role` per the Role Header section.*
+>
+> *Response envelope is uniform across all 13 endpoints:*
+>
+> ```json
+> {
+>   "data": { "id": "uuid", "workItemId": "uuid | null", "taskId": "uuid | null", "transitionedTo": "string", "at": "timestamptz" },
+>   "meta": { "alreadyReceived": true }
+> }
+> ```
+>
+> *`meta` is omitted on first delivery; duplicate requests return `alreadyReceived=true`. Unless noted otherwise, status codes are:*
+>
+> | Code | Condition |
+> |------|-----------|
+> | 202 | Signal accepted; state written (or duplicate ignored) |
+> | 400 | Malformed payload |
+> | 401 | Missing or invalid API key |
+> | 403 | Wrong actor role for this endpoint |
+> | 404 | Work item or task not found |
+> | 409 | Transition not allowed from current state |
+> | 422 | Domain validation failure (e.g., reject without feedback) |
+
+---
+
+#### POST /api/v1/work-items
+
+> *S1 — open a new work item. Admin only. Dispatches task-generation.*
+
+**Required role:** `admin`.
+
+**Request Body:**
+
+```json
+{
+  "externalRef": "FEAT-042",
+  "type": "FEAT",
+  "title": "Feature title",
+  "sourcePath": "docs/work-items/FEAT-042.md"
+}
+```
+
+**Response Data:** `{ id, externalRef, status: "open", openedAt }`.
+
+---
+
+#### POST /api/v1/work-items/{id}/lock
+
+> *S2 — admin pause. Only valid from `in_progress`.*
+
+**Required role:** `admin`.
+
+**Request Body:** `{ "reason": "string — optional" }`.
+
+---
+
+#### POST /api/v1/work-items/{id}/unlock
+
+> *S3 — admin resume. Only valid from `locked`; returns to `in_progress`.*
+
+**Required role:** `admin`. **Request Body:** `{}`.
+
+---
+
+#### POST /api/v1/work-items/{id}/close
+
+> *S4 — admin close. Only valid from `ready`.*
+
+**Required role:** `admin`. **Request Body:** `{ "notes": "string — optional" }`.
+
+---
+
+#### POST /api/v1/tasks/{id}/approve
+
+> *S5 — approve a proposed task. Fires W2 (work-item → in_progress) if this is the first approved task. Fires T4 (approved → assigning) immediately.*
+
+**Required role:** `admin`. **Request Body:** `{}`.
+
+---
+
+#### POST /api/v1/tasks/{id}/reject
+
+> *S6 — reject a proposed task with feedback. Returns the task to `proposed` for the proposer to revise. Iterations are unbounded.*
+
+**Required role:** `admin`.
+
+**Request Body:**
+
+```json
+{ "feedback": "string — required, non-empty" }
+```
+
+`422` if `feedback` is missing or empty.
+
+---
+
+#### POST /api/v1/tasks/{id}/assign
+
+> *S7 — admin writes an assignee. Moves the task from `assigning → planning`. For agent assignments, the orchestrator dispatches a plan-draft run.*
+
+**Required role:** `admin`.
+
+**Request Body:**
+
+```json
+{
+  "assigneeType": "dev | agent",
+  "assigneeId": "string"
+}
+```
+
+---
+
+#### POST /api/v1/tasks/{id}/plan
+
+> *S8 — submit plan for review. Moves the task from `planning → plan_review`. Approver routing follows the approval matrix.*
+
+**Required role:** `dev` for dev-assigned tasks; agent path uses an internal dispatch (no HTTP call).
+
+**Request Body:**
+
+```json
+{
+  "planPath": "plans/plan-T-042-short-title.md",
+  "planSha": "string — content hash"
+}
+```
+
+---
+
+#### POST /api/v1/tasks/{id}/plan/approve
+
+> *S9 — approve a plan. Moves `plan_review → implementing`. For agent-assigned tasks, the orchestrator dispatches the implementation run.*
+
+**Required role:** `dev` (for dev-assigned, self-signal) or `admin` (for agent-assigned). **Request Body:** `{}`.
+
+---
+
+#### POST /api/v1/tasks/{id}/plan/reject
+
+> *S10 — reject a plan. Moves `plan_review → planning` with feedback attached to the `Approval` row.*
+
+**Required role:** `dev` (for dev-assigned) or `admin` (for agent-assigned).
+
+**Request Body:** `{ "feedback": "string — required" }`. `422` if empty.
+
+---
+
+#### POST /api/v1/tasks/{id}/implementation
+
+> *S11 (agent path) — submit an implementation for review. Moves `implementing → impl_review`. Human implementers reach the same state via the GitHub PR webhook; see `/hooks/github/pr`.*
+
+**Required role:** `admin` (agent drafts submitted by the orchestrator on behalf of the agent).
+
+**Request Body:**
+
+```json
+{
+  "prUrl": "string — optional if no PR yet",
+  "commitSha": "string",
+  "summary": "string"
+}
+```
+
+---
+
+#### POST /api/v1/tasks/{id}/review/approve
+
+> *S12 — approve a submitted implementation. Moves `impl_review → done`, releases the `orchestrator/impl-review` check on the PR (if configured), and fires the W5 derivation check.*
+
+**Required role:** `admin` (v1 solo-dev; in multi-dev mode, any `dev` other than the implementer). **Request Body:** `{}`.
+
+---
+
+#### POST /api/v1/tasks/{id}/review/reject
+
+> *S13 — reject a submitted implementation. Moves `impl_review → implementing` with feedback; marks the PR check red.*
+
+**Required role:** same as `/review/approve`. **Request Body:** `{ "feedback": "string — required" }`.
+
+---
+
+#### POST /api/v1/tasks/{id}/defer
+
+> *S14 — admin defers a non-terminal task. Terminal state; contributes to W5. Rejects (`409`) if the task is already `done` or `deferred`.*
+
+**Required role:** `admin`.
+
+**Request Body:** `{ "reason": "string — optional" }`.
+
+---
+
 ### Webhook endpoints (ingress from flow engine)
 
 #### POST /hooks/engine/events
@@ -446,6 +645,45 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | 401 | Missing or invalid signature (event still persisted with `signatureOk=false`) |
 | 404 | `engineRunId` / `stepCorrelationId` does not match a known run/step |
 | 422 | Signature valid, but payload fails domain validation |
+
+---
+
+#### POST /hooks/github/pr
+
+> *S11 (human PR path) — ingress for GitHub PR webhooks. Introduced by FEAT-006.*
+>
+> *On `pull_request.opened` (or `reopened`) with a body/title containing `closes T-NNN` or `orchestrator: T-NNN`, the orchestrator maps the PR to the referenced task, transitions `implementing → impl_review`, and registers the `orchestrator/impl-review` required check on the PR. On `pull_request.closed` with `merged=true`, the orchestrator records the merge event (audit only; merge gating is exercised at review-approval time, not on this webhook).*
+
+| Attribute | Value |
+|-----------|-------|
+| **Auth** | GitHub signature via `X-Hub-Signature-256` |
+| **Idempotency** | Enforced by `dedupeKey` (`github:pr:<pr_number>:<delivery_id>`) |
+
+**Request Headers:**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-Hub-Signature-256` | Yes | `sha256=<hex>` over raw body, keyed by `GITHUB_WEBHOOK_SECRET` |
+| `X-GitHub-Event` | Yes | `pull_request` (other event types are ignored with `202`) |
+| `X-GitHub-Delivery` | Yes | Unique delivery id (component of `dedupeKey`) |
+
+**Request Body:** Standard GitHub `pull_request` event payload. The orchestrator reads `action`, `pull_request.number`, `pull_request.title`, `pull_request.body`, `pull_request.head.sha`, and `pull_request.merged`.
+
+**Response (202 Accepted):**
+
+```json
+{ "data": { "received": true, "eventId": "uuid", "matchedTaskId": "uuid | null" } }
+```
+
+`matchedTaskId=null` when no `T-NNN` reference is found in the PR; the event is still persisted for forensics.
+
+**Status Codes:**
+
+| Code | Condition |
+|------|-----------|
+| 202 | Event accepted (including unmatched or deduplicated retries) |
+| 400 | Malformed payload |
+| 401 | Missing or invalid signature (event persisted with `signatureOk=false`) |
 
 ---
 
@@ -527,6 +765,70 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | receivedAt | timestamptz | No | When the HTTP request landed |
 | dedupeKey | string | No | Deterministic hash for idempotent retries |
 
+### WorkItemDto
+
+*FEAT-006.*
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | uuid | No | Work item id |
+| externalRef | string | No | Human-facing id (e.g., `FEAT-042`) |
+| type | enum `WorkItemType` | No | `FEAT`, `BUG`, `IMP` |
+| title | string | No | Human-readable title |
+| sourcePath | string | Yes | Path to originating markdown brief |
+| status | enum `WorkItemStatus` | No | Current state |
+| lockedFrom | enum `WorkItemStatus` | Yes | State active before lock |
+| openedBy | string | No | Admin actor id |
+| closedAt | timestamptz | Yes | Set when `status=closed` |
+| closedBy | string | Yes | Admin who closed |
+
+### TaskDto
+
+*FEAT-006.*
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | uuid | No | Task id |
+| workItemId | uuid | No | Parent work item |
+| externalRef | string | No | Human-facing id (`T-042`) |
+| title | string | No | Task title |
+| status | enum `TaskStatus` | No | Current state |
+| proposerType | enum `ActorType` | No | `admin`, `agent` |
+| proposerId | string | No | Actor id who proposed |
+| deferredFrom | enum `TaskStatus` | Yes | State prior to deferral |
+| currentAssignment | object `TaskAssignmentDto` | Yes | Active assignment, if any |
+| createdAt | timestamptz | No | Record creation |
+| updatedAt | timestamptz | No | Last state change |
+
+### TaskAssignmentDto
+
+*FEAT-006.*
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | uuid | No | Assignment id |
+| taskId | uuid | No | Owning task |
+| assigneeType | enum `AssigneeType` | No | `dev`, `agent` |
+| assigneeId | string | No | Actor id |
+| assignedBy | string | No | Admin who assigned |
+| assignedAt | timestamptz | No | When recorded |
+| supersededAt | timestamptz | Yes | Set when replaced |
+
+### ApprovalDto
+
+*FEAT-006.*
+
+| Field | Type | Nullable | Description |
+|-------|------|----------|-------------|
+| id | uuid | No | Approval id |
+| taskId | uuid | No | Owning task |
+| stage | enum `ApprovalStage` | No | `proposed`, `plan`, `impl` |
+| decision | enum `ApprovalDecision` | No | `approve`, `reject` |
+| decidedBy | string | No | Actor id |
+| decidedByRole | enum `ActorRole` | No | `admin`, `dev` |
+| feedback | string | Yes | Required non-empty when `decision=reject` |
+| decidedAt | timestamptz | No | When recorded |
+
 ### WebhookEventDto
 
 | Field | Type | Nullable | Description |
@@ -552,7 +854,22 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | GET | `/api/v1/runs/{id}/policy-calls` | ai | Required | List policy decisions of a run |
 | GET | `/api/v1/runs/{id}/trace` | ai | Required | Stream run trace as NDJSON |
 | GET | `/api/v1/agents` | ai | Required | List on-disk agent definitions |
-| POST | `/hooks/engine/events` | ai | HMAC | Engine event ingress |
+| POST | `/api/v1/work-items` | ai | Required (admin) | Open a work item (S1, FEAT-006) |
+| POST | `/api/v1/work-items/{id}/lock` | ai | Required (admin) | Pause a work item (S2, FEAT-006) |
+| POST | `/api/v1/work-items/{id}/unlock` | ai | Required (admin) | Resume a locked work item (S3, FEAT-006) |
+| POST | `/api/v1/work-items/{id}/close` | ai | Required (admin) | Close from `ready` (S4, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/approve` | ai | Required (admin) | Approve a proposed task (S5, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/reject` | ai | Required (admin) | Reject a proposed task (S6, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/assign` | ai | Required (admin) | Assign dev/agent (S7, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/plan` | ai | Required (dev or internal) | Submit plan for review (S8, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/plan/approve` | ai | Required (dev or admin) | Approve plan (S9, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/plan/reject` | ai | Required (dev or admin) | Reject plan (S10, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/implementation` | ai | Required (admin) | Submit agent implementation (S11 agent path, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/review/approve` | ai | Required (admin/dev) | Approve review (S12, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/review/reject` | ai | Required (admin/dev) | Reject review (S13, FEAT-006) |
+| POST | `/api/v1/tasks/{id}/defer` | ai | Required (admin) | Defer a task (S14, FEAT-006) |
+| POST | `/hooks/engine/events` | ai | HMAC (engine) | Engine event ingress |
+| POST | `/hooks/github/pr` | ai | GitHub signature | GitHub PR webhook ingress (S11 human path, FEAT-006) |
 | GET | `/health` | (service) | Public | Liveness + dependency checks |
 
 ## AI Task Generation Notes
@@ -567,6 +884,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-04-19 — FEAT-006 — Added 14 lifecycle-flow signal endpoints (S1-S14) across `/api/v1/work-items/...` and `/api/v1/tasks/...` and a GitHub PR webhook at `/hooks/github/pr`. All signal endpoints are idempotent, return `202 Accepted`, and require `X-Actor-Role: admin | dev` as declared on each endpoint (v1 is self-asserted; proper per-user auth is a follow-up). Added `WorkItemDto`, `TaskDto`, `TaskAssignmentDto`, `ApprovalDto` under Shared DTOs. GitHub webhook uses `X-Hub-Signature-256` with `GITHUB_WEBHOOK_SECRET`; missing/invalid signature → `401`, event persisted with `signatureOk=false`.
 - 2026-04-18 — FEAT-005 — `POST /runs/{id}/signals` is live: operator-injected signals (v1: `name="implementation-complete"`), persist-first-then-wake, idempotent on `(run_id, name, task_id)`. Added `RunSignalDto` under Shared DTOs. Trace stream surfaces a new `kind=operator_signal` entry (filterable via `?kind=operator_signal`).
 - 2026-04-18 — FEAT-004 — `GET /runs/{id}/trace` is now live: returns `application/x-ndjson` (one record per line, shape `{"kind":..., "data":<DTO>}`), supports `?follow=true`, `?since=<ISO-8601>`, and repeatable `?kind=` filters. Unknown run id → `404` Problem Details before any bytes are written. `Cache-Control: no-cache` and `X-Accel-Buffering: no` set on the response. Reserved contract from FEAT-001 unchanged.
 - 2026-04-18 — FEAT-002 — Control-plane read/write endpoints replaced their 501 stubs with real implementations backed by the runtime loop. `POST /runs/{id}/cancel` is idempotent on already-terminal runs. `GET /runs/{id}/trace` remains deferred to FEAT-004. No contract changes.
