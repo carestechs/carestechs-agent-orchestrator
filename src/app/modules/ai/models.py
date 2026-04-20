@@ -22,12 +22,27 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType
+from app.modules.ai.enums import (
+    ActorRole,
+    ActorType,
+    ApprovalDecision,
+    ApprovalStage,
+    AssigneeType,
+    RunStatus,
+    StepStatus,
+    StopReason,
+    TaskStatus,
+    WebhookEventType,
+    WebhookSource,
+    WorkItemStatus,
+    WorkItemType,
+)
 
 
 def generate_uuid7() -> uuid.UUID:
@@ -166,22 +181,32 @@ class WebhookEvent(Base):
     __tablename__ = "webhook_events"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("runs.id"), nullable=False)
+    # ``run_id`` is NULL for non-engine events (e.g., GitHub webhooks) that
+    # correlate to a task rather than a run.
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("runs.id"), nullable=True
+    )
     step_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("steps.id"), nullable=True)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     engine_run_id: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     signature_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=WebhookSource.ENGINE.value
+    )
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dedupe_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
 
     # -- Relationships -----------------------------------------------------
-    run: Mapped[Run] = relationship(back_populates="webhook_events", lazy="raise")
+    run: Mapped[Run | None] = relationship(
+        back_populates="webhook_events", lazy="raise"
+    )
     step: Mapped[Step | None] = relationship(back_populates="webhook_events", lazy="raise")
 
     __table_args__ = (
         _enum_check("event_type", WebhookEventType),
+        _enum_check("source", WebhookSource),
         Index("ix_webhook_events_run_id_received_at", "run_id", "received_at"),
     )
 
@@ -235,4 +260,263 @@ class RunSignal(Base):
     __table_args__ = (
         UniqueConstraint("dedupe_key", name="uq_run_signals_dedupe_key"),
         Index("ix_run_signals_run_id_received_at", "run_id", "received_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# WorkItem (FEAT-006)
+# ---------------------------------------------------------------------------
+
+
+class WorkItem(Base):
+    """The deterministic-flow counterpart of a FEAT/BUG/IMP markdown brief.
+
+    Carries the work-item state machine (``open → in_progress ⇄ locked →
+    ready → closed``).  ``in_progress`` and ``ready`` are derived transitions
+    (fired by the orchestrator after child-task state writes).
+    """
+
+    __tablename__ = "work_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    external_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default=WorkItemStatus.OPEN)
+    locked_from: Mapped[str | None] = mapped_column(Text, nullable=True)
+    opened_by: Mapped[str] = mapped_column(Text, nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        _enum_check("status", WorkItemStatus),
+        _enum_check("type", WorkItemType),
+        CheckConstraint(
+            "locked_from IS NULL OR locked_from IN ("
+            + ", ".join(f"'{v.value}'" for v in WorkItemStatus)
+            + ")",
+            name="ck_work_items_locked_from",
+        ),
+        UniqueConstraint("external_ref", name="uq_work_items_external_ref"),
+        Index("ix_work_items_status_updated_at", "status", updated_at.desc()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task (FEAT-006)
+# ---------------------------------------------------------------------------
+
+
+class Task(Base):
+    """A single task under a WorkItem.
+
+    Carries the main FEAT-006 state machine.  ``external_ref`` is unique
+    within a work item (e.g., ``T-042``); across work items the same ref
+    may recur.
+    """
+
+    __tablename__ = "tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("work_items.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default=TaskStatus.PROPOSED)
+    proposer_type: Mapped[str] = mapped_column(Text, nullable=False)
+    proposer_id: Mapped[str] = mapped_column(Text, nullable=False)
+    deferred_from: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        _enum_check("status", TaskStatus),
+        _enum_check("proposer_type", ActorType),
+        CheckConstraint(
+            "deferred_from IS NULL OR deferred_from IN ("
+            + ", ".join(f"'{v.value}'" for v in TaskStatus)
+            + ")",
+            name="ck_tasks_deferred_from",
+        ),
+        UniqueConstraint("work_item_id", "external_ref", name="uq_tasks_work_item_ref"),
+        Index("ix_tasks_work_item_status", "work_item_id", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TaskAssignment (FEAT-006)
+# ---------------------------------------------------------------------------
+
+
+class TaskAssignment(Base):
+    """Append-only record of current and historical task assignments.
+
+    At most one active row per task (where ``superseded_at IS NULL``),
+    enforced by a partial-unique index.  Reassignment inserts a new row and
+    marks the prior active row superseded in the same transaction.
+    """
+
+    __tablename__ = "task_assignments"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    assignee_type: Mapped[str] = mapped_column(Text, nullable=False)
+    assignee_id: Mapped[str] = mapped_column(Text, nullable=False)
+    assigned_by: Mapped[str] = mapped_column(Text, nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        _enum_check("assignee_type", AssigneeType),
+        Index(
+            "ix_task_assignments_active",
+            "task_id",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL"),
+        ),
+        Index(
+            "ix_task_assignments_task_assigned",
+            "task_id",
+            text("assigned_at DESC"),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Approval (FEAT-006)
+# ---------------------------------------------------------------------------
+
+
+class Approval(Base):
+    """Append-only record of every approve/reject decision on a task.
+
+    Rejection iteration count for a ``(task_id, stage)`` pair is derived by
+    counting rows with ``decision='reject'``.  No denormalization.
+    """
+
+    __tablename__ = "approvals"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(Text, nullable=False)
+    decision: Mapped[str] = mapped_column(Text, nullable=False)
+    decided_by: Mapped[str] = mapped_column(Text, nullable=False)
+    decided_by_role: Mapped[str] = mapped_column(Text, nullable=False)
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        _enum_check("stage", ApprovalStage),
+        _enum_check("decision", ApprovalDecision),
+        _enum_check("decided_by_role", ActorRole),
+        Index(
+            "ix_approvals_task_stage_time",
+            "task_id",
+            "stage",
+            "decided_at",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# LifecycleSignal (FEAT-006) — idempotency key store for deterministic-flow
+# signals.  Any signal endpoint computes a key over (entity_id, name,
+# payload) and records it once; replayed requests hit the UNIQUE constraint
+# and short-circuit before running side effects.
+# ---------------------------------------------------------------------------
+
+
+class LifecycleSignal(Base):
+    """Records an idempotency key for a processed lifecycle signal."""
+
+    __tablename__ = "lifecycle_signals"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    signal_name: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_lifecycle_signals_entity_name", "entity_id", "signal_name"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TaskPlan (FEAT-006) — append-only submission audit for plan artifacts.
+# ---------------------------------------------------------------------------
+
+
+class TaskPlan(Base):
+    """One row per plan submission.  History preserved across revisions."""
+
+    __tablename__ = "task_plans"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    plan_path: Mapped[str] = mapped_column(Text, nullable=False)
+    plan_sha: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_by: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_task_plans_task_submitted", "task_id", "submitted_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TaskImplementation (FEAT-006) — append-only submission audit for impls.
+# ---------------------------------------------------------------------------
+
+
+class TaskImplementation(Base):
+    """One row per implementation submission (agent path or PR webhook)."""
+
+    __tablename__ = "task_implementations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    commit_sha: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_by: Mapped[str] = mapped_column(Text, nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_task_implementations_task_submitted",
+            "task_id",
+            "submitted_at",
+        ),
     )

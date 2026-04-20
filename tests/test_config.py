@@ -74,6 +74,8 @@ class TestSettingsFields:
             "trace_dir",
             "repo_root",
             "lifecycle_max_corrections",
+            "solo_dev_mode",
+            "github_webhook_secret",
             "log_level",
             "trace_backend",
             "engine_dispatch_timeout_seconds",

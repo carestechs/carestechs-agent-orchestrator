@@ -143,6 +143,15 @@ async def select_policy_calls(
 # ---------------------------------------------------------------------------
 
 
+def compute_github_pr_dedupe_key(pr_number: int, delivery_id: str) -> str:
+    """Deterministic dedupe key for a GitHub PR webhook event (FEAT-006).
+
+    Shape: ``github:pr:<pr_number>:<delivery_id>``.  Replayed deliveries from
+    GitHub produce the same key and collide on the UNIQUE constraint.
+    """
+    return f"github:pr:{pr_number}:{delivery_id}"
+
+
 def compute_signal_dedupe_key(run_id: uuid.UUID, name: str, task_id: str | None) -> str:
     """Deterministic dedupe key for an operator signal.
 

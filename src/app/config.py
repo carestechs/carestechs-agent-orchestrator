@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     # -- Lifecycle agent (FEAT-005) ---------------------------------------
     lifecycle_max_corrections: int = Field(default=2, ge=1)
 
+    # -- Deterministic lifecycle flow (FEAT-006) --------------------------
+    # When True (v1 default) the impl-review approver collapses to `admin`;
+    # when False a `dev` other than the implementer is expected.
+    solo_dev_mode: bool = True
+
+    # -- GitHub integration (FEAT-006) ------------------------------------
+    github_webhook_secret: SecretStr | None = None
+
     # -- Observability -----------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     trace_backend: Literal["noop", "jsonl"] = "jsonl"

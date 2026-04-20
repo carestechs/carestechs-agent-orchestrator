@@ -7,8 +7,32 @@ import uuid
 import pytest
 from sqlalchemy import inspect
 
-from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType
-from app.modules.ai.models import PolicyCall, Run, RunMemory, Step, WebhookEvent
+from app.modules.ai.enums import (
+    ActorRole,
+    ActorType,
+    ApprovalDecision,
+    ApprovalStage,
+    AssigneeType,
+    RunStatus,
+    StepStatus,
+    StopReason,
+    TaskStatus,
+    WebhookEventType,
+    WebhookSource,
+    WorkItemStatus,
+    WorkItemType,
+)
+from app.modules.ai.models import (
+    Approval,
+    PolicyCall,
+    Run,
+    RunMemory,
+    Step,
+    Task,
+    TaskAssignment,
+    WebhookEvent,
+    WorkItem,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -126,6 +150,7 @@ _WEBHOOK_EVENT_FIELDS = {
     "engine_run_id",
     "payload",
     "signature_ok",
+    "source",
     "received_at",
     "processed_at",
     "dedupe_key",
@@ -196,9 +221,17 @@ class TestCheckConstraints:
 
     def test_webhook_event_type_check(self) -> None:
         checks = _check_constraint_texts(WebhookEvent)
-        assert len(checks) == 1
+        et_checks = [c for c in checks if c.strip().startswith("event_type IN")]
+        assert len(et_checks) == 1
         for v in WebhookEventType:
-            assert f"'{v.value}'" in checks[0]
+            assert f"'{v.value}'" in et_checks[0]
+
+    def test_webhook_event_source_check(self) -> None:
+        checks = _check_constraint_texts(WebhookEvent)
+        src_checks = [c for c in checks if c.strip().startswith("source IN")]
+        assert len(src_checks) == 1
+        for v in WebhookSource:
+            assert f"'{v.value}'" in src_checks[0]
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +266,202 @@ class TestUuidDefault:
         assert isinstance(v, uuid.UUID)
         # UUIDv7 has version 7
         assert v.version == 7
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 — WorkItem
+# ---------------------------------------------------------------------------
+
+
+class TestWorkItem:
+    def test_table_name(self) -> None:
+        assert _table(WorkItem) == "work_items"
+
+    def test_columns(self) -> None:
+        expected = {
+            "id",
+            "external_ref",
+            "type",
+            "title",
+            "source_path",
+            "status",
+            "locked_from",
+            "opened_by",
+            "closed_at",
+            "closed_by",
+            "created_at",
+            "updated_at",
+        }
+        assert _column_names(WorkItem) == expected
+
+    def test_status_check_includes_all_values(self) -> None:
+        checks = _check_constraint_texts(WorkItem)
+        status_check = [c for c in checks if "status" in c and "locked_from" not in c]
+        assert len(status_check) == 1
+        for v in WorkItemStatus:
+            assert f"'{v.value}'" in status_check[0]
+
+    def test_type_check_includes_all_values(self) -> None:
+        checks = _check_constraint_texts(WorkItem)
+        type_check = [c for c in checks if c.strip().startswith("type IN")]
+        assert len(type_check) == 1
+        for v in WorkItemType:
+            assert f"'{v.value}'" in type_check[0]
+
+    def test_locked_from_check_allows_null(self) -> None:
+        checks = _check_constraint_texts(WorkItem)
+        lf_check = [c for c in checks if "locked_from" in c]
+        assert len(lf_check) == 1
+        assert "locked_from IS NULL" in lf_check[0]
+
+    def test_unique_external_ref(self) -> None:
+        uqs = _unique_constraint_columns(WorkItem)
+        assert frozenset(["external_ref"]) in uqs
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 — Task
+# ---------------------------------------------------------------------------
+
+
+class TestTask:
+    def test_table_name(self) -> None:
+        assert _table(Task) == "tasks"
+
+    def test_columns(self) -> None:
+        expected = {
+            "id",
+            "work_item_id",
+            "external_ref",
+            "title",
+            "status",
+            "proposer_type",
+            "proposer_id",
+            "deferred_from",
+            "created_at",
+            "updated_at",
+        }
+        assert _column_names(Task) == expected
+
+    def test_status_check_has_all_nine_values(self) -> None:
+        checks = _check_constraint_texts(Task)
+        status_checks = [
+            c
+            for c in checks
+            if c.strip().startswith("status IN")
+        ]
+        assert len(status_checks) == 1
+        for v in TaskStatus:
+            assert f"'{v.value}'" in status_checks[0]
+
+    def test_proposer_type_check(self) -> None:
+        checks = _check_constraint_texts(Task)
+        pt_checks = [c for c in checks if "proposer_type" in c]
+        assert len(pt_checks) == 1
+        for v in ActorType:
+            assert f"'{v.value}'" in pt_checks[0]
+
+    def test_deferred_from_allows_null(self) -> None:
+        checks = _check_constraint_texts(Task)
+        df_checks = [c for c in checks if "deferred_from" in c]
+        assert len(df_checks) == 1
+        assert "deferred_from IS NULL" in df_checks[0]
+
+    def test_unique_work_item_and_external_ref(self) -> None:
+        uqs = _unique_constraint_columns(Task)
+        assert frozenset(["work_item_id", "external_ref"]) in uqs
+
+    def test_work_item_fk_on_delete_restrict(self) -> None:
+        fk = next(iter(Task.__table__.foreign_keys))
+        assert fk.column.table.name == "work_items"
+        assert fk.ondelete == "RESTRICT"
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 — TaskAssignment
+# ---------------------------------------------------------------------------
+
+
+class TestTaskAssignment:
+    def test_table_name(self) -> None:
+        assert _table(TaskAssignment) == "task_assignments"
+
+    def test_columns(self) -> None:
+        expected = {
+            "id",
+            "task_id",
+            "assignee_type",
+            "assignee_id",
+            "assigned_by",
+            "assigned_at",
+            "superseded_at",
+        }
+        assert _column_names(TaskAssignment) == expected
+
+    def test_assignee_type_check(self) -> None:
+        checks = _check_constraint_texts(TaskAssignment)
+        assert len(checks) == 1
+        for v in AssigneeType:
+            assert f"'{v.value}'" in checks[0]
+
+    def test_partial_unique_active_index(self) -> None:
+        table = TaskAssignment.__table__
+        active = next(i for i in table.indexes if i.name == "ix_task_assignments_active")
+        assert active.unique
+        # partial-where expression should reference superseded_at
+        where = active.dialect_options["postgresql"]["where"]
+        assert "superseded_at IS NULL" in str(where)
+
+    def test_task_fk_on_delete_restrict(self) -> None:
+        fk = next(iter(TaskAssignment.__table__.foreign_keys))
+        assert fk.column.table.name == "tasks"
+        assert fk.ondelete == "RESTRICT"
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 — Approval
+# ---------------------------------------------------------------------------
+
+
+class TestApproval:
+    def test_table_name(self) -> None:
+        assert _table(Approval) == "approvals"
+
+    def test_columns(self) -> None:
+        expected = {
+            "id",
+            "task_id",
+            "stage",
+            "decision",
+            "decided_by",
+            "decided_by_role",
+            "feedback",
+            "decided_at",
+        }
+        assert _column_names(Approval) == expected
+
+    def test_stage_check(self) -> None:
+        checks = _check_constraint_texts(Approval)
+        stage_checks = [c for c in checks if c.strip().startswith("stage IN")]
+        assert len(stage_checks) == 1
+        for v in ApprovalStage:
+            assert f"'{v.value}'" in stage_checks[0]
+
+    def test_decision_check(self) -> None:
+        checks = _check_constraint_texts(Approval)
+        dec_checks = [c for c in checks if c.strip().startswith("decision IN")]
+        assert len(dec_checks) == 1
+        for v in ApprovalDecision:
+            assert f"'{v.value}'" in dec_checks[0]
+
+    def test_decided_by_role_check(self) -> None:
+        checks = _check_constraint_texts(Approval)
+        role_checks = [c for c in checks if "decided_by_role" in c]
+        assert len(role_checks) == 1
+        for v in ActorRole:
+            assert f"'{v.value}'" in role_checks[0]
+
+    def test_task_fk_on_delete_restrict(self) -> None:
+        fk = next(iter(Approval.__table__.foreign_keys))
+        assert fk.column.table.name == "tasks"
+        assert fk.ondelete == "RESTRICT"
