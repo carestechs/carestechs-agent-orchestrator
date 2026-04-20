@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import NotFoundError
 from app.modules.ai.enums import ActorRole, AssigneeType, WorkItemType
 from app.modules.ai.lifecycle import idempotency, tasks, work_items
+from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
     Task,
     TaskAssignment,
@@ -67,6 +68,8 @@ async def open_work_item_signal(
     title: str,
     source_path: str | None,
     opened_by: str,
+    engine: FlowEngineLifecycleClient | None = None,
+    engine_workflow_id: uuid.UUID | None = None,
 ) -> tuple[WorkItem, bool]:
     """S1: create a new work item.  Idempotent on ``external_ref`` + title."""
     # Idempotency scope: admin re-POST with the same external_ref is a no-op.
@@ -101,6 +104,8 @@ async def open_work_item_signal(
         title=title,
         source_path=source_path,
         opened_by=opened_by,
+        engine=engine,
+        engine_workflow_id=engine_workflow_id,
     )
     await db.commit()
     await dispatch_task_generation(wi)
@@ -123,6 +128,7 @@ async def _guarded_work_item_signal(
     payload: Mapping[str, Any],
     transition: _WorkItemTransition,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[WorkItem, bool]:
     """Shared body for S2/S3/S4.
 
@@ -142,7 +148,7 @@ async def _guarded_work_item_signal(
     # harness (SAVEPOINT-wrapped session) the outer rollback is deferred
     # to test teardown, which is also fine.  Operators retrying after a
     # 409 must vary the payload (or drop the key manually) to re-attempt.
-    wi = await transition(db, work_item_id, actor=actor)
+    wi = await transition(db, work_item_id, actor=actor, engine=engine)
     await db.commit()
     return wi, True
 
@@ -153,6 +159,7 @@ async def lock_work_item_signal(
     *,
     reason: str | None,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[WorkItem, bool]:
     """S2: admin pause."""
     return await _guarded_work_item_signal(
@@ -162,6 +169,7 @@ async def lock_work_item_signal(
         payload={"reason": reason},
         transition=work_items.lock_work_item,
         actor=actor,
+        engine=engine,
     )
 
 
@@ -170,6 +178,7 @@ async def unlock_work_item_signal(
     work_item_id: uuid.UUID,
     *,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[WorkItem, bool]:
     """S3: admin resume."""
     return await _guarded_work_item_signal(
@@ -179,6 +188,7 @@ async def unlock_work_item_signal(
         payload={},
         transition=work_items.unlock_work_item,
         actor=actor,
+        engine=engine,
     )
 
 
@@ -188,6 +198,7 @@ async def close_work_item_signal(
     *,
     notes: str | None,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[WorkItem, bool]:
     """S4: admin close (requires ``ready``)."""
     return await _guarded_work_item_signal(
@@ -197,6 +208,7 @@ async def close_work_item_signal(
         payload={"notes": notes},
         transition=work_items.close_work_item,
         actor=actor,
+        engine=engine,
     )
 
 
@@ -217,6 +229,7 @@ async def approve_task_signal(
     task_id: uuid.UUID,
     *,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S5: admin approves a proposed task.
 
@@ -231,8 +244,8 @@ async def approve_task_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.approve_task(db, task_id, actor=actor)
-    await work_items.maybe_advance_to_in_progress(db, task.work_item_id)
+    task = await tasks.approve_task(db, task_id, actor=actor, engine=engine)
+    await work_items.maybe_advance_to_in_progress(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
 
@@ -243,6 +256,7 @@ async def reject_task_signal(
     *,
     feedback: str,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S6: admin rejects a proposed task with non-empty feedback."""
     payload = {"feedback": feedback}
@@ -267,6 +281,7 @@ async def assign_task_signal(
     assignee_type: AssigneeType,
     assignee_id: str,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, TaskAssignment, bool]:
     """S7: admin assigns the task.  ``assigning -> planning``."""
     payload = {
@@ -294,6 +309,7 @@ async def assign_task_signal(
         assignee_type=assignee_type,
         assignee_id=assignee_id,
         assigned_by=actor,
+        engine=engine,
     )
     await db.commit()
     return task, assignment, True
@@ -305,6 +321,7 @@ async def defer_task_signal(
     *,
     reason: str | None,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S14: admin defers a non-terminal task.  Fires W5 derivation."""
     payload = {"reason": reason}
@@ -315,8 +332,8 @@ async def defer_task_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.defer_task(db, task_id, actor=actor, reason=reason)
-    await work_items.maybe_advance_to_ready(db, task.work_item_id)
+    task = await tasks.defer_task(db, task_id, actor=actor, reason=reason, engine=engine)
+    await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
 
@@ -333,6 +350,7 @@ async def submit_plan_signal(
     plan_path: str,
     plan_sha: str,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S8: submit a plan.  Inserts a ``TaskPlan`` row and advances state."""
     payload = {"planPath": plan_path, "planSha": plan_sha}
@@ -343,7 +361,7 @@ async def submit_plan_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.submit_plan(db, task_id, submitted_by=actor)
+    task = await tasks.submit_plan(db, task_id, submitted_by=actor, engine=engine)
     db.add(
         TaskPlan(
             task_id=task_id,
@@ -363,6 +381,7 @@ async def approve_plan_signal(
     actor: str,
     actor_role: ActorRole,
     solo_dev: bool,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S9: approve plan — matrix-derived role check inside the transition.
 
@@ -380,7 +399,7 @@ async def approve_plan_signal(
         return await _reload_task(db, task_id), False
 
     task = await tasks.approve_plan(
-        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev
+        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev, engine=engine
     )
     await db.commit()
     return task, True
@@ -394,6 +413,7 @@ async def reject_plan_signal(
     actor: str,
     actor_role: ActorRole,
     solo_dev: bool,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S10: reject plan with feedback."""
     payload = {"feedback": feedback, "actorRole": actor_role.value}
@@ -411,6 +431,7 @@ async def reject_plan_signal(
         actor_role=actor_role,
         feedback=feedback,
         solo_dev=solo_dev,
+        engine=engine,
     )
     await db.commit()
     return task, True
@@ -429,6 +450,7 @@ async def submit_implementation_signal(
     commit_sha: str,
     summary: str,
     actor: str,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S11 (agent path): submit an implementation for review.
 
@@ -442,7 +464,7 @@ async def submit_implementation_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.submit_implementation(db, task_id, submitted_by=actor)
+    task = await tasks.submit_implementation(db, task_id, submitted_by=actor, engine=engine)
     db.add(
         TaskImplementation(
             task_id=task_id,
@@ -463,6 +485,7 @@ async def approve_review_signal(
     actor: str,
     actor_role: ActorRole,
     solo_dev: bool,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S12: approve implementation review; fires W5."""
     key = idempotency.compute_signal_key(
@@ -475,7 +498,7 @@ async def approve_review_signal(
         return await _reload_task(db, task_id), False
 
     task = await tasks.approve_review(
-        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev
+        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev, engine=engine
     )
     await work_items.maybe_advance_to_ready(db, task.work_item_id)
     await db.commit()
@@ -490,6 +513,7 @@ async def reject_review_signal(
     actor: str,
     actor_role: ActorRole,
     solo_dev: bool,
+    engine: FlowEngineLifecycleClient | None = None,
 ) -> tuple[Task, bool]:
     """S13: reject implementation review with feedback."""
     payload = {"feedback": feedback, "actorRole": actor_role.value}
@@ -507,6 +531,7 @@ async def reject_review_signal(
         actor_role=actor_role,
         feedback=feedback,
         solo_dev=solo_dev,
+        engine=engine,
     )
     await db.commit()
     return task, True
