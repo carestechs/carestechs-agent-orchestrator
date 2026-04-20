@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable, Coroutine
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 
 from app.config import Settings
 from app.core.dependencies import get_settings_dep
 from app.core.exceptions import AuthError, ValidationError
 from app.modules.ai.engine_client import FlowEngineClient
 from app.modules.ai.enums import ActorRole
+
+if TYPE_CHECKING:
+    from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 
 
 def get_engine_client(
@@ -35,6 +39,22 @@ class _AuthForbidden(AuthError):
     http_status = 403
     title = "Forbidden"
     code = "actor-role-forbidden"
+
+
+def get_lifecycle_engine_client(
+    request: Request,
+) -> FlowEngineLifecycleClient | None:
+    """Return the flow-engine lifecycle client configured at startup, if any.
+
+    ``None`` means the orchestrator was booted without engine config — every
+    transition falls back to local-only behavior.
+    """
+    return getattr(request.app.state, "lifecycle_engine_client", None)
+
+
+def get_lifecycle_workflow_ids(request: Request) -> dict[str, uuid.UUID]:
+    """Return the cached flow-engine workflow IDs (``{name: uuid}``)."""
+    return getattr(request.app.state, "lifecycle_workflow_ids", {}) or {}
 
 
 def require_actor_role(

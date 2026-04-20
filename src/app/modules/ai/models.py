@@ -285,6 +285,12 @@ class WorkItem(Base):
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=WorkItemStatus.OPEN)
     locked_from: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # FEAT-006 rc2 (T-131a): nullable for transition.  When the engine
+    # client is configured, ``engine_item_id`` is populated at open-time
+    # and every transition mirrors the local state change onto the engine.
+    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True, unique=True
+    )
     opened_by: Mapped[str] = mapped_column(Text, nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -331,6 +337,10 @@ class Task(Base):
     external_ref: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=TaskStatus.PROPOSED)
+    # FEAT-006 rc2 (T-131a): mirror-write id on the flow-engine side.
+    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True, unique=True
+    )
     proposer_type: Mapped[str] = mapped_column(Text, nullable=False)
     proposer_id: Mapped[str] = mapped_column(Text, nullable=False)
     deferred_from: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -519,4 +529,23 @@ class TaskImplementation(Base):
             "task_id",
             "submitted_at",
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# EngineWorkflow (FEAT-006 rc2) — caches the engine-side workflow IDs so
+# subsequent ``create_item`` calls know which workflow to target.  Written
+# once per workflow name at startup; no other code path mutates.
+# ---------------------------------------------------------------------------
+
+
+class EngineWorkflow(Base):
+    """Local cache of a flow-engine workflow ID keyed by declared name."""
+
+    __tablename__ = "engine_workflows"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    engine_workflow_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

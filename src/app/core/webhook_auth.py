@@ -48,3 +48,22 @@ async def require_engine_signature(
     ok = verify_signature(body, header, settings.engine_webhook_secret.get_secret_value())
     request.state.signature_ok = ok
     return ok
+
+
+async def require_flow_engine_signature(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+) -> bool:
+    """FEAT-006 rc2: verify ``X-FlowEngine-Signature`` for lifecycle webhooks.
+
+    Reuses ``engine_webhook_secret`` — the subscription is created with the
+    same secret at startup (T-129) so verification closes the loop.
+    Failure does not raise; the route decides how to respond.
+    """
+    body: bytes = request.state.raw_body
+    header = request.headers.get("x-flowengine-signature")
+    ok = verify_signature(
+        body, header, settings.engine_webhook_secret.get_secret_value()
+    )
+    request.state.signature_ok = ok
+    return ok

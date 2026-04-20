@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
@@ -24,12 +24,20 @@ from app.core.dependencies import (
 from app.core.envelope import Envelope, Meta, envelope
 from app.core.exceptions import NotFoundError
 from app.core.llm import LLMProvider
-from app.core.webhook_auth import require_engine_signature
+from app.core.webhook_auth import require_engine_signature, require_flow_engine_signature
 from app.modules.ai import repository, service
-from app.modules.ai.dependencies import get_engine_client, require_actor_role
+from app.modules.ai.dependencies import (
+    get_engine_client,
+    get_lifecycle_engine_client,
+    get_lifecycle_workflow_ids,
+    require_actor_role,
+)
 from app.modules.ai.engine_client import FlowEngineClient
 from app.modules.ai.enums import ActorRole, WebhookEventType, WebhookSource
+from app.modules.ai.lifecycle import reactor as lifecycle_reactor
 from app.modules.ai.lifecycle import service as lifecycle_service
+from app.modules.ai.lifecycle.declarations import WORK_ITEM_WORKFLOW_NAME
+from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import Task, WebhookEvent, WorkItem
 from app.modules.ai.schemas import (
     AgentDto,
@@ -267,6 +275,8 @@ async def open_work_item(
     body: WorkItemCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
+    workflow_ids: Annotated[dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)],
 ) -> WorkItemSignalResponse:
     """S1 — open a new work item.  Admin only."""
     del role  # enforced by dependency
@@ -277,6 +287,8 @@ async def open_work_item(
         title=body.title,
         source_path=body.source_path,
         opened_by="admin",
+        engine=engine,
+        engine_workflow_id=workflow_ids.get(WORK_ITEM_WORKFLOW_NAME),
     )
     return _work_item_envelope(wi, already_received=not is_new)
 
@@ -291,11 +303,12 @@ async def lock_work_item(
     body: WorkItemLockRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> WorkItemSignalResponse:
     """S2 — admin pause."""
     del role
     wi, is_new = await lifecycle_service.lock_work_item_signal(
-        db, work_item_id, reason=body.reason, actor="admin"
+        db, work_item_id, reason=body.reason, actor="admin", engine=engine
     )
     return _work_item_envelope(wi, already_received=not is_new)
 
@@ -310,11 +323,12 @@ async def unlock_work_item(
     body: WorkItemUnlockRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> WorkItemSignalResponse:
     """S3 — admin resume."""
     del role, body
     wi, is_new = await lifecycle_service.unlock_work_item_signal(
-        db, work_item_id, actor="admin"
+        db, work_item_id, actor="admin", engine=engine
     )
     return _work_item_envelope(wi, already_received=not is_new)
 
@@ -329,11 +343,12 @@ async def close_work_item(
     body: WorkItemCloseRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> WorkItemSignalResponse:
     """S4 — admin close (requires ``ready``)."""
     del role
     wi, is_new = await lifecycle_service.close_work_item_signal(
-        db, work_item_id, notes=body.notes, actor="admin"
+        db, work_item_id, notes=body.notes, actor="admin", engine=engine
     )
     return _work_item_envelope(wi, already_received=not is_new)
 
@@ -359,11 +374,12 @@ async def approve_task(
     body: TaskApproveRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> TaskSignalResponse:
     """S5 — admin approves a proposed task (fires T4 + W2 derivation)."""
     del role, body
     task, is_new = await lifecycle_service.approve_task_signal(
-        db, task_id, actor="admin"
+        db, task_id, actor="admin", engine=engine
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -378,11 +394,12 @@ async def reject_task(
     body: TaskRejectRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> TaskSignalResponse:
     """S6 — admin rejects a proposed task with feedback."""
     del role
     task, is_new = await lifecycle_service.reject_task_signal(
-        db, task_id, feedback=body.feedback, actor="admin"
+        db, task_id, feedback=body.feedback, actor="admin", engine=engine
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -397,6 +414,7 @@ async def assign_task(
     body: TaskAssignRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> TaskSignalResponse:
     """S7 — admin assigns the task (dev or agent)."""
     del role
@@ -406,6 +424,7 @@ async def assign_task(
         assignee_type=body.assignee_type,
         assignee_id=body.assignee_id,
         actor="admin",
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -420,11 +439,12 @@ async def defer_task(
     body: TaskDeferRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> TaskSignalResponse:
     """S14 — admin defers a non-terminal task (fires W5 derivation)."""
     del role
     task, is_new = await lifecycle_service.defer_task_signal(
-        db, task_id, reason=body.reason, actor="admin"
+        db, task_id, reason=body.reason, actor="admin", engine=engine
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -446,6 +466,7 @@ async def submit_plan(
     role: Annotated[
         ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
     ],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
     """S8 — submit a plan for review.  Allowed for admin or dev."""
@@ -456,6 +477,7 @@ async def submit_plan(
         plan_path=body.plan_path,
         plan_sha=body.plan_sha,
         actor="submitter",
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -472,6 +494,7 @@ async def approve_plan(
     role: Annotated[
         ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
     ],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
     """S9 — approve plan.  Matrix decides required role inside the transition."""
@@ -482,6 +505,7 @@ async def approve_plan(
         actor=role.value,
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -498,6 +522,7 @@ async def reject_plan(
     role: Annotated[
         ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
     ],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
     """S10 — reject plan with feedback."""
@@ -508,6 +533,7 @@ async def reject_plan(
         actor=role.value,
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -527,6 +553,7 @@ async def submit_implementation(
     body: ImplementationSubmitRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
 ) -> TaskSignalResponse:
     """S11 (agent path) — submit an implementation for review."""
     del role
@@ -537,6 +564,7 @@ async def submit_implementation(
         commit_sha=body.commit_sha,
         summary=body.summary,
         actor="admin",
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -553,6 +581,7 @@ async def approve_review(
     role: Annotated[
         ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
     ],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
     """S12 — approve review.  Fires W5 derivation."""
@@ -563,6 +592,7 @@ async def approve_review(
         actor=role.value,
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -579,6 +609,7 @@ async def reject_review(
     role: Annotated[
         ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
     ],
+    engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
     """S13 — reject review with feedback."""
@@ -589,6 +620,7 @@ async def reject_review(
         actor=role.value,
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
+        engine=engine,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -634,6 +666,126 @@ async def receive_engine_event(
         )
 
     return envelope(WebhookAckDto(received=True, event_id=result.id))
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 rc2 — Engine lifecycle webhook (item.transitioned)
+# ---------------------------------------------------------------------------
+
+
+@hooks_router.post("/lifecycle/item-transitioned", status_code=202)
+async def receive_lifecycle_item_transitioned(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    sig_ok: Annotated[bool, Depends(require_flow_engine_signature)],
+    workflow_ids: Annotated[
+        dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)
+    ],
+) -> JSONResponse:
+    """Ingest a flow-engine lifecycle webhook (state change on an item).
+
+    Regardless of signature outcome the event is persisted to
+    ``webhook_events`` (source='engine', event_type=
+    ``lifecycle_item_transitioned``).  On a valid signature, the reactor
+    dispatches derivations (W2/W5).  Idempotent via the delivery id.
+    """
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+    raw: bytes = request.state.raw_body
+
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "https://orchestrator.local/problems/validation-error",
+                "title": "Validation error",
+                "status": 400,
+                "detail": "invalid JSON body",
+            },
+            media_type="application/problem+json",
+        )
+
+    body_dict: dict[str, Any] = parsed if isinstance(parsed, dict) else {}  # type: ignore[assignment]
+    delivery_id: str = str(body_dict.get("deliveryId") or "unknown")
+    item_id_raw = body_dict.get("itemId")
+    item_id: str | None = str(item_id_raw) if item_id_raw else None
+    dedupe_key = f"lifecycle:{item_id or 'unknown'}:{delivery_id}"
+
+    stmt = (
+        _pg_insert(WebhookEvent)
+        .values(
+            run_id=None,
+            step_id=None,
+            event_type=WebhookEventType.LIFECYCLE_ITEM_TRANSITIONED.value,
+            engine_run_id=f"lifecycle:{item_id or 'unknown'}",
+            payload=parsed if isinstance(parsed, dict) else {},
+            signature_ok=sig_ok,
+            source=WebhookSource.ENGINE.value,
+            dedupe_key=dedupe_key,
+        )
+        .on_conflict_do_nothing(index_elements=["dedupe_key"])
+        .returning(WebhookEvent)
+    )
+    result = await db.execute(stmt)
+    row: WebhookEvent | None = result.scalar_one_or_none()
+    if row is None:
+        existing: WebhookEvent | None = await db.scalar(
+            select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
+        )
+        wh_event = existing
+    else:
+        wh_event = row
+    await db.commit()
+
+    if not sig_ok:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "type": "https://orchestrator.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "invalid lifecycle webhook signature",
+            },
+            media_type="application/problem+json",
+        )
+
+    # Parse into the typed event for reactor dispatch.  Malformed body is
+    # logged but not an error — the event row is already persisted for
+    # forensics.
+    try:
+        event = lifecycle_reactor.LifecycleWebhookEvent.model_validate(parsed)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "lifecycle webhook body did not parse; skipping reactor",
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"data": {"received": True, "eventId": str(wh_event.id) if wh_event else None, "reacted": False}},
+        )
+
+    # Flip workflow ids mapping so reactor can resolve name from id.
+    workflow_name_by_id = {wid: name for name, wid in workflow_ids.items()}
+    await lifecycle_reactor.handle_transition(
+        db, event, workflow_name_by_id=workflow_name_by_id
+    )
+    await db.commit()
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "data": {
+                "received": True,
+                "eventId": str(wh_event.id) if wh_event else None,
+                "reacted": True,
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

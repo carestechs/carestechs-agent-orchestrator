@@ -76,12 +76,24 @@ src/app/
 ├── modules/ai/                 — The only feature module in v1
 │   ├── router.py               — /api/v1/* + /hooks/engine/*
 │   ├── service.py              — Agent runtime loop, trace emission, stop conditions
-│   ├── models.py               — Run, Step, PolicyCall, WebhookEvent, RunMemory, RunSignal (SQLAlchemy)
+│   ├── models.py               — Run, Step, PolicyCall, WebhookEvent, RunMemory, RunSignal, WorkItem, Task, TaskAssignment, Approval, LifecycleSignal, EngineWorkflow (SQLAlchemy)
 │   ├── schemas.py              — Pydantic DTOs mirroring data-model.md
-│   ├── dependencies.py         — AI-specific FastAPI deps (policy factory, engine client)
-│   └── tools/
-│       ├── __init__.py         — build_tools + TERMINATE_TOOL_NAME
-│       └── lifecycle/          — FEAT-005 lifecycle agent tools + local registry
+│   ├── dependencies.py         — AI-specific FastAPI deps (policy factory, engine client, lifecycle engine client, actor-role guard)
+│   ├── tools/
+│   │   ├── __init__.py         — build_tools + TERMINATE_TOOL_NAME
+│   │   └── lifecycle/          — FEAT-005 lifecycle agent tools + local registry
+│   ├── lifecycle/              — FEAT-006 deterministic-flow submodule
+│   │   ├── declarations.py     — work_item_workflow + task_workflow state/transition constants
+│   │   ├── engine_client.py    — FlowEngineLifecycleClient (JWT, retries, correlation-id encoding)
+│   │   ├── bootstrap.py        — ensure_workflows on startup (engine registration, idempotent)
+│   │   ├── work_items.py       — work-item transitions (W1-W6) with optional engine mirror
+│   │   ├── tasks.py            — task transitions (T1-T12) with optional engine mirror + approval matrix
+│   │   ├── approval_matrix.py  — pure function: who may approve at each stage
+│   │   ├── service.py          — signal-endpoint adapters (idempotency + transaction boundary)
+│   │   ├── idempotency.py      — lifecycle_signals helper
+│   │   └── reactor.py          — engine webhook dispatcher (W2/W5 derivations)
+│   └── webhooks/
+│       └── github.py           — GitHub PR webhook signature + parsing (FEAT-006)
 └── migrations/                 — Alembic
 
 agents/                         — YAML agent definitions (e.g. lifecycle-agent@0.1.0.yaml)
@@ -133,6 +145,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Each runtime-loop iteration opens its own `AsyncSession`.** The loop runs inside a supervised task, not inside a request handler — never share the request's `AsyncSession` with the loop, and never reuse one session across iterations. Use `session_factory` injected via `get_session_factory`.
 - **Webhook pipeline is ordered: persist → reconcile → wake.** Events are written first (even on bad signature, with `signature_ok=false`), then the step state machine advances, then the owning run-loop is woken. Never wake before persisting.
 - **Local tools bypass the engine.** Lifecycle-agent tools in `modules/ai/tools/lifecycle/` are registered in `tools/lifecycle/registry.py` and executed in-process by the runtime (no HTTP to the flow engine). The policy still selects them via native tool calling; the runtime detects the selection, runs the handler against `LifecycleMemory`, and persists the step as `completed` with `engine_run_id=NULL`. Adding a new lifecycle tool = new module in `tools/lifecycle/` + register it in `registry.py`. Don't reinvent this path for non-lifecycle agents until a second consumer demands it.
+- **FEAT-006 deterministic-flow state lives in the engine.** Signal handlers mirror every state transition onto the flow engine via `modules/ai/lifecycle/engine_client.py`. The engine emits `item.transitioned` webhooks back to `/hooks/engine/lifecycle/item-transitioned`; `lifecycle/reactor.py` fires derivations (W2 first-task-approval → work-item in_progress; W5 all-tasks-terminal → work-item ready). rc2-phase-1 keeps orchestrator state authoritative (engine is a mirror); phase-2 will drop local `status`/`locked_from`/`deferred_from` columns and make the engine the sole writer. Rejection transitions (T3/T8/T11) don't call the engine — status doesn't change; only the `Approval` row records the event.
 - **Pause-for-signal contract.** A local tool that returns `(LifecycleMemory, PauseForSignal)` tells the runtime to suspend the step as `in_progress` and `await supervisor.await_signal(...)`. `POST /api/v1/runs/{id}/signals` with `name=implementation-complete` persists a `RunSignal` row and calls `supervisor.deliver_signal(...)` — persist-first, then wake. Idempotent on `(run_id, name, task_id)`; duplicate calls return `202` with `meta.alreadyReceived=true`.
 - **Correction-attempt bound.** `LIFECYCLE_MAX_CORRECTIONS` (default `2`) caps the number of `corrections` entries per task; exceeding it terminates the run with `stop_reason=error` and `final_state.reason=correction_budget_exceeded`. The bound lives in `stop_conditions.correction_budget_exceeded` and fires inside the existing `error` priority bucket — `cancelled > error > budget_exceeded > policy_terminated > done_node`.
 

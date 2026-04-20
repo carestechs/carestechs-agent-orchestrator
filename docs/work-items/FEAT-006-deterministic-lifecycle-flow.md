@@ -13,7 +13,7 @@
 | **ID** | FEAT-006 |
 | **Name** | Deterministic Lifecycle Flow |
 | **Target Version** | v0.6.0 |
-| **Status** | Delivered — v0.6.0-rc1 (plumbing only; merge-gating + regression insurance land in FEAT-007) |
+| **Status** | Delivered — v0.6.0-rc2-phase-1 (engine mirror-write + derivation reactor; merge-gating in FEAT-007; phase-2 engine-as-sole-writer pending) |
 | **Priority** | High |
 | **Requested By** | Tech Lead (`carlos.escalona@carestechs.com.br`) |
 | **Date Created** | 2026-04-19 |
@@ -212,7 +212,91 @@ When generating tasks from this Feature Brief:
 
 ---
 
-## 14. Delivery Notes (2026-04-19)
+## 14. Delivery Notes (2026-04-19, rc2 phase 1)
+
+**rc1 → rc2 realignment.** rc1 shipped a deterministic flow with state
+persisted in the orchestrator's own Postgres — the flow engine was not in
+the loop, contradicting the design-doc model (engine as shared state
+across tools).  rc2-phase-1 puts the engine in the loop as a secondary
+writer kept in sync with local state; orchestrator still holds the
+authoritative rows but every transition mirrors the new state to the
+engine so other tools subscribing to the engine's webhooks see a
+consistent cross-tool view.
+
+**Delivered in rc2-phase-1:**
+
+- `FlowEngineLifecycleClient` (T-128) — JWT-authed HTTP client for the
+  engine's ``/api/workflows``, ``/api/items``, ``/api/items/{id}/
+  transitions`` and ``/api/webhook-subscriptions`` endpoints.  Correlation
+  UUIDs are encoded into transition comments as
+  ``orchestrator-corr:<uuid>`` so the engine's webhook payload (which
+  carries ``triggeredBy`` but not ``comment``) can thread them back.
+- Workflow bootstrap at startup (T-129) — idempotent registration of
+  ``work_item_workflow`` + ``task_workflow`` in the engine, cached in a
+  new ``engine_workflows`` table.  Gracefully skipped when engine config
+  is absent so dev setups without the engine still boot.
+- `engine_item_id` columns on ``work_items`` + ``tasks`` (nullable,
+  UNIQUE) — populated at open/propose time when the engine client is
+  configured.
+- Mirror write on every transition (T-131a + T-132a) — every function
+  in ``lifecycle/work_items.py`` and ``lifecycle/tasks.py`` accepts
+  optional ``engine`` + ``correlation_id`` kwargs and best-effort
+  mirrors state changes.  Engine errors are logged + swallowed; local
+  state remains authoritative.  Rejection edges (T3, T8, T11) don't
+  transition in the engine (status unchanged); only the ``Approval``
+  row captures the rejection.
+- Engine-side → orchestrator reactor (T-130) —
+  ``POST /hooks/engine/lifecycle/item-transitioned`` receives engine
+  state-change webhooks, persists a ``WebhookEvent`` (source='engine',
+  event_type='lifecycle_item_transitioned'), and dispatches W2/W5
+  derivations via ``lifecycle/reactor.py``.  Idempotent on
+  ``lifecycle:<item_id>:<delivery_id>``.
+- Route + service plumbing — ``get_lifecycle_engine_client`` +
+  ``get_lifecycle_workflow_ids`` FastAPI deps thread the engine client
+  through every signal endpoint so HTTP requests actually exercise
+  the mirror path.
+
+**Deferred to rc2-phase-2 (next PR series):**
+
+- **T-133 PendingSignalContext** — table + plumbing to thread signal
+  payloads (feedback, plan_path, etc.) from adapter to reactor so
+  auxiliary rows (``Approval``, ``TaskAssignment``, ``TaskPlan``,
+  ``TaskImplementation``) can be written reactively rather than
+  inline.  Gate for phase 2.
+- **T-131b drop local state columns** — remove ``status``,
+  ``locked_from``, ``deferred_from`` from ``work_items`` and ``tasks``
+  once the reactor proves it drives derivations + aux writes purely
+  from engine events.
+- **T-134 test suite reshape** — real-engine opt-in integration test
+  (``tests/integration/test_feat006_e2e_real_engine.py``) pointed at
+  a running ``carestechs-flow-engine``; consolidated per-transition
+  integration roll-up.
+- **T-121 GitHub Checks API client** — merge-gating (FEAT-007 scope).
+
+**Delivered in rc1 (still in place):**
+
+- 5 new entities (``WorkItem``, ``Task``, ``TaskAssignment``,
+  ``Approval``, ``LifecycleSignal``) + ``TaskPlan``,
+  ``TaskImplementation``, ``WebhookEvent.source`` extension.
+- Work-item state machine + task state machine + pure approval-matrix
+  helper.
+- 14 signal endpoints + GitHub PR webhook ingress (without Checks API).
+- Full E2E integration test.
+
+**Acceptance-criteria status (updated for rc2-phase-1):**
+
+- AC-1 ✅ · AC-2 partial (unit + route coverage; no consolidated
+  integration roll-up yet)
+- AC-3 ✅ · AC-4 ✅ · AC-5 ✅ · AC-6 ✅ · AC-8 ✅
+- AC-7 ❌ (GitHub Checks not wired — FEAT-007)
+- AC-9 **✅ now formally**: engine is demonstrably in the loop via
+  mirror writes + derivation webhooks.
+- AC-10 ✅ · AC-11 ✅ (no FEAT-005 regressions in 643-test run)
+- AC-12 ✅
+
+---
+
+## 15. Delivery Notes (2026-04-19, rc1 — superseded)
 
 First-pass delivery covers the critical path — state machines, every signal
 endpoint, and the GitHub webhook ingress.  Follow-up work explicitly deferred:

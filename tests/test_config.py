@@ -76,6 +76,8 @@ class TestSettingsFields:
             "lifecycle_max_corrections",
             "solo_dev_mode",
             "github_webhook_secret",
+            "flow_engine_lifecycle_base_url",
+            "flow_engine_tenant_api_key",
             "log_level",
             "trace_backend",
             "engine_dispatch_timeout_seconds",
