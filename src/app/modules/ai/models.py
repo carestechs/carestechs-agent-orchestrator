@@ -549,3 +549,32 @@ class EngineWorkflow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# ---------------------------------------------------------------------------
+# PendingSignalContext (FEAT-006 rc2 phase 2 / T-133)
+# ---------------------------------------------------------------------------
+
+
+class PendingSignalContext(Base):
+    """Threads a signal's payload from adapter → engine → reactor.
+
+    The signal adapter generates a correlation UUID, records the signal
+    name + payload here, and passes the UUID to the engine via the
+    transition's ``comment`` (``orchestrator-corr:<uuid>``).  When the
+    engine webhook arrives, the reactor extracts the UUID from
+    ``triggeredBy``, loads this row to recover the original signal
+    context, and (eventually — phase-2-final) writes the auxiliary rows
+    reactively.  The row is deleted after the reactor consumes it.
+    """
+
+    __tablename__ = "pending_signal_context"
+
+    correlation_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    signal_name: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

@@ -25,12 +25,37 @@ from app.modules.ai.enums import ActorRole, AssigneeType, WorkItemType
 from app.modules.ai.lifecycle import idempotency, tasks, work_items
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
+    PendingSignalContext,
     Task,
     TaskAssignment,
     TaskImplementation,
     TaskPlan,
     WorkItem,
 )
+
+
+async def _with_correlation(
+    db: AsyncSession,
+    *,
+    signal_name: str,
+    payload: Mapping[str, Any],
+) -> uuid.UUID:
+    """Record a PendingSignalContext row and return its correlation id.
+
+    The caller threads the returned UUID to the engine via the transition's
+    comment so the reactor (on webhook arrival) can recover this signal's
+    payload and write auxiliary rows reactively (phase-2-final).
+    """
+    corr = uuid.uuid4()
+    db.add(
+        PendingSignalContext(
+            correlation_id=corr,
+            signal_name=signal_name,
+            payload=dict(payload),
+        )
+    )
+    await db.flush()
+    return corr
 
 
 async def _reload_work_item(db: AsyncSession, work_item_id: uuid.UUID) -> WorkItem:
@@ -244,7 +269,14 @@ async def approve_task_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.approve_task(db, task_id, actor=actor, engine=engine)
+    corr = await _with_correlation(
+        db,
+        signal_name="approve-task",
+        payload={"taskId": str(task_id), "actor": actor},
+    )
+    task = await tasks.approve_task(
+        db, task_id, actor=actor, engine=engine, correlation_id=corr
+    )
     await work_items.maybe_advance_to_in_progress(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
@@ -267,6 +299,15 @@ async def reject_task_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
+    # Rejection does NOT transition the task in the engine (status stays
+    # `proposed`); only the Approval row records it.  We still record a
+    # correlation context row so that phase-2-final can look up the
+    # rejection payload if/when we surface rejections via engine events.
+    await _with_correlation(
+        db,
+        signal_name="reject-task",
+        payload={"taskId": str(task_id), "feedback": feedback},
+    )
     task = await tasks.reject_task_proposal(
         db, task_id, actor=actor, feedback=feedback
     )
@@ -303,6 +344,15 @@ async def assign_task_signal(
         assert active is not None, "idempotent replay must find an active assignment"
         return task, active, False
 
+    corr = await _with_correlation(
+        db,
+        signal_name="assign-task",
+        payload={
+            "taskId": str(task_id),
+            "assigneeType": assignee_type.value,
+            "assigneeId": assignee_id,
+        },
+    )
     task, assignment = await tasks.assign_task(
         db,
         task_id,
@@ -310,6 +360,7 @@ async def assign_task_signal(
         assignee_id=assignee_id,
         assigned_by=actor,
         engine=engine,
+        correlation_id=corr,
     )
     await db.commit()
     return task, assignment, True
@@ -332,7 +383,14 @@ async def defer_task_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.defer_task(db, task_id, actor=actor, reason=reason, engine=engine)
+    corr = await _with_correlation(
+        db,
+        signal_name="defer-task",
+        payload={"taskId": str(task_id), "reason": reason},
+    )
+    task = await tasks.defer_task(
+        db, task_id, actor=actor, reason=reason, engine=engine, correlation_id=corr
+    )
     await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
@@ -361,7 +419,19 @@ async def submit_plan_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.submit_plan(db, task_id, submitted_by=actor, engine=engine)
+    corr = await _with_correlation(
+        db,
+        signal_name="submit-plan",
+        payload={
+            "taskId": str(task_id),
+            "planPath": plan_path,
+            "planSha": plan_sha,
+            "submittedBy": actor,
+        },
+    )
+    task = await tasks.submit_plan(
+        db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
+    )
     db.add(
         TaskPlan(
             task_id=task_id,
@@ -398,8 +468,23 @@ async def approve_plan_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
+    corr = await _with_correlation(
+        db,
+        signal_name="approve-plan",
+        payload={
+            "taskId": str(task_id),
+            "actor": actor,
+            "actorRole": actor_role.value,
+        },
+    )
     task = await tasks.approve_plan(
-        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev, engine=engine
+        db,
+        task_id,
+        actor=actor,
+        actor_role=actor_role,
+        solo_dev=solo_dev,
+        engine=engine,
+        correlation_id=corr,
     )
     await db.commit()
     return task, True
@@ -424,6 +509,15 @@ async def reject_plan_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
+    corr = await _with_correlation(
+        db,
+        signal_name="reject-plan",
+        payload={
+            "taskId": str(task_id),
+            "feedback": feedback,
+            "actorRole": actor_role.value,
+        },
+    )
     task = await tasks.reject_plan(
         db,
         task_id,
@@ -432,6 +526,7 @@ async def reject_plan_signal(
         feedback=feedback,
         solo_dev=solo_dev,
         engine=engine,
+        correlation_id=corr,
     )
     await db.commit()
     return task, True
@@ -464,7 +559,19 @@ async def submit_implementation_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.submit_implementation(db, task_id, submitted_by=actor, engine=engine)
+    corr = await _with_correlation(
+        db,
+        signal_name="submit-implementation",
+        payload={
+            "taskId": str(task_id),
+            "prUrl": pr_url,
+            "commitSha": commit_sha,
+            "summary": summary,
+        },
+    )
+    task = await tasks.submit_implementation(
+        db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
+    )
     db.add(
         TaskImplementation(
             task_id=task_id,
@@ -497,10 +604,25 @@ async def approve_review_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
-    task = await tasks.approve_review(
-        db, task_id, actor=actor, actor_role=actor_role, solo_dev=solo_dev, engine=engine
+    corr = await _with_correlation(
+        db,
+        signal_name="approve-review",
+        payload={
+            "taskId": str(task_id),
+            "actor": actor,
+            "actorRole": actor_role.value,
+        },
     )
-    await work_items.maybe_advance_to_ready(db, task.work_item_id)
+    task = await tasks.approve_review(
+        db,
+        task_id,
+        actor=actor,
+        actor_role=actor_role,
+        solo_dev=solo_dev,
+        engine=engine,
+        correlation_id=corr,
+    )
+    await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
 
@@ -524,6 +646,15 @@ async def reject_review_signal(
     if not is_new:
         return await _reload_task(db, task_id), False
 
+    corr = await _with_correlation(
+        db,
+        signal_name="reject-review",
+        payload={
+            "taskId": str(task_id),
+            "feedback": feedback,
+            "actorRole": actor_role.value,
+        },
+    )
     task = await tasks.reject_review(
         db,
         task_id,
@@ -532,6 +663,7 @@ async def reject_review_signal(
         feedback=feedback,
         solo_dev=solo_dev,
         engine=engine,
+        correlation_id=corr,
     )
     await db.commit()
     return task, True
