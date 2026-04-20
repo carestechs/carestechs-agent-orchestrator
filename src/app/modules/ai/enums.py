@@ -40,7 +40,8 @@ class WebhookEventType(StrEnum):
     """Type of inbound webhook event.
 
     ``github_pr_*`` values were added by FEAT-006 to support GitHub PR
-    webhook ingress.
+    webhook ingress; ``lifecycle_item_transitioned`` by FEAT-006 rc2 to
+    reflect flow-engine lifecycle state changes back to the orchestrator.
     """
 
     NODE_STARTED = "node_started"
@@ -49,6 +50,7 @@ class WebhookEventType(StrEnum):
     FLOW_TERMINATED = "flow_terminated"
     GITHUB_PR_OPENED = "github_pr_opened"
     GITHUB_PR_CLOSED = "github_pr_closed"
+    LIFECYCLE_ITEM_TRANSITIONED = "lifecycle_item_transitioned"
 
 
 class WebhookSource(StrEnum):

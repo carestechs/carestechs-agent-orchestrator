@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
@@ -24,7 +24,7 @@ from app.core.dependencies import (
 from app.core.envelope import Envelope, Meta, envelope
 from app.core.exceptions import NotFoundError
 from app.core.llm import LLMProvider
-from app.core.webhook_auth import require_engine_signature
+from app.core.webhook_auth import require_engine_signature, require_flow_engine_signature
 from app.modules.ai import repository, service
 from app.modules.ai.dependencies import (
     get_engine_client,
@@ -34,6 +34,7 @@ from app.modules.ai.dependencies import (
 )
 from app.modules.ai.engine_client import FlowEngineClient
 from app.modules.ai.enums import ActorRole, WebhookEventType, WebhookSource
+from app.modules.ai.lifecycle import reactor as lifecycle_reactor
 from app.modules.ai.lifecycle import service as lifecycle_service
 from app.modules.ai.lifecycle.declarations import WORK_ITEM_WORKFLOW_NAME
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
@@ -665,6 +666,126 @@ async def receive_engine_event(
         )
 
     return envelope(WebhookAckDto(received=True, event_id=result.id))
+
+
+# ---------------------------------------------------------------------------
+# FEAT-006 rc2 — Engine lifecycle webhook (item.transitioned)
+# ---------------------------------------------------------------------------
+
+
+@hooks_router.post("/lifecycle/item-transitioned", status_code=202)
+async def receive_lifecycle_item_transitioned(
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    sig_ok: Annotated[bool, Depends(require_flow_engine_signature)],
+    workflow_ids: Annotated[
+        dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)
+    ],
+) -> JSONResponse:
+    """Ingest a flow-engine lifecycle webhook (state change on an item).
+
+    Regardless of signature outcome the event is persisted to
+    ``webhook_events`` (source='engine', event_type=
+    ``lifecycle_item_transitioned``).  On a valid signature, the reactor
+    dispatches derivations (W2/W5).  Idempotent via the delivery id.
+    """
+    from sqlalchemy.dialects.postgresql import insert as _pg_insert
+
+    raw: bytes = request.state.raw_body
+
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "https://orchestrator.local/problems/validation-error",
+                "title": "Validation error",
+                "status": 400,
+                "detail": "invalid JSON body",
+            },
+            media_type="application/problem+json",
+        )
+
+    body_dict: dict[str, Any] = parsed if isinstance(parsed, dict) else {}  # type: ignore[assignment]
+    delivery_id: str = str(body_dict.get("deliveryId") or "unknown")
+    item_id_raw = body_dict.get("itemId")
+    item_id: str | None = str(item_id_raw) if item_id_raw else None
+    dedupe_key = f"lifecycle:{item_id or 'unknown'}:{delivery_id}"
+
+    stmt = (
+        _pg_insert(WebhookEvent)
+        .values(
+            run_id=None,
+            step_id=None,
+            event_type=WebhookEventType.LIFECYCLE_ITEM_TRANSITIONED.value,
+            engine_run_id=f"lifecycle:{item_id or 'unknown'}",
+            payload=parsed if isinstance(parsed, dict) else {},
+            signature_ok=sig_ok,
+            source=WebhookSource.ENGINE.value,
+            dedupe_key=dedupe_key,
+        )
+        .on_conflict_do_nothing(index_elements=["dedupe_key"])
+        .returning(WebhookEvent)
+    )
+    result = await db.execute(stmt)
+    row: WebhookEvent | None = result.scalar_one_or_none()
+    if row is None:
+        existing: WebhookEvent | None = await db.scalar(
+            select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
+        )
+        wh_event = existing
+    else:
+        wh_event = row
+    await db.commit()
+
+    if not sig_ok:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "type": "https://orchestrator.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "invalid lifecycle webhook signature",
+            },
+            media_type="application/problem+json",
+        )
+
+    # Parse into the typed event for reactor dispatch.  Malformed body is
+    # logged but not an error — the event row is already persisted for
+    # forensics.
+    try:
+        event = lifecycle_reactor.LifecycleWebhookEvent.model_validate(parsed)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "lifecycle webhook body did not parse; skipping reactor",
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=202,
+            content={"data": {"received": True, "eventId": str(wh_event.id) if wh_event else None, "reacted": False}},
+        )
+
+    # Flip workflow ids mapping so reactor can resolve name from id.
+    workflow_name_by_id = {wid: name for name, wid in workflow_ids.items()}
+    await lifecycle_reactor.handle_transition(
+        db, event, workflow_name_by_id=workflow_name_by_id
+    )
+    await db.commit()
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "data": {
+                "received": True,
+                "eventId": str(wh_event.id) if wh_event else None,
+                "reacted": True,
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
