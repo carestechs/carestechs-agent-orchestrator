@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.webhook_auth import sign_body
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.lifecycle import declarations, reactor
-from app.modules.ai.models import Task, WebhookEvent, WorkItem
+from app.modules.ai.models import PendingSignalContext, Task, WebhookEvent, WorkItem
 
 pytestmark = pytest.mark.asyncio(loop_scope="function")
 
@@ -172,6 +172,95 @@ class TestHandleTransition:
         # (the engine-side state change doesn't mirror back).
         await db_session.refresh(wi)
         assert wi.status == WorkItemStatus.IN_PROGRESS.value
+
+
+class TestCorrelationConsumption:
+    async def test_reactor_deletes_matching_context_row(
+        self, db_session: AsyncSession
+    ) -> None:
+        wi_engine_id = uuid.uuid4()
+        task_engine_id = uuid.uuid4()
+        wi = await _seed_work_item(
+            db_session, engine_item_id=wi_engine_id, status=WorkItemStatus.IN_PROGRESS
+        )
+        await _seed_task(
+            db_session,
+            wi_id=wi.id,
+            engine_item_id=task_engine_id,
+            status=TaskStatus.IMPL_REVIEW,
+            ref="T-CORR",
+        )
+
+        corr = uuid.uuid4()
+        db_session.add(
+            PendingSignalContext(
+                correlation_id=corr,
+                signal_name="approve-review",
+                payload={"taskId": "T-CORR", "actorRole": "admin"},
+            )
+        )
+        await db_session.commit()
+
+        task_workflow_id = uuid.uuid4()
+        event = reactor.LifecycleWebhookEvent(
+            delivery_id=uuid.uuid4(),
+            event_type="item.transitioned",
+            tenant_id=uuid.uuid4(),
+            workflow_id=task_workflow_id,
+            item_id=task_engine_id,
+            timestamp=datetime.now(UTC),
+            data=reactor.LifecycleWebhookData(
+                from_status="impl_review",
+                to_status="done",
+                triggered_by=f"user:admin orchestrator-corr:{corr}",
+            ),
+        )
+        mapping = {task_workflow_id: declarations.TASK_WORKFLOW_NAME}
+        await reactor.handle_transition(
+            db_session, event, workflow_name_by_id=mapping
+        )
+        await db_session.commit()
+
+        # Context row deleted after consumption.
+        remaining = await db_session.scalar(
+            select(PendingSignalContext).where(
+                PendingSignalContext.correlation_id == corr
+            )
+        )
+        assert remaining is None
+
+    async def test_reactor_no_correlation_is_no_op(
+        self, db_session: AsyncSession
+    ) -> None:
+        wi_engine_id = uuid.uuid4()
+        task_engine_id = uuid.uuid4()
+        wi = await _seed_work_item(
+            db_session, engine_item_id=wi_engine_id, status=WorkItemStatus.IN_PROGRESS
+        )
+        await _seed_task(
+            db_session,
+            wi_id=wi.id,
+            engine_item_id=task_engine_id,
+            status=TaskStatus.DONE,
+            ref="T-NC",
+        )
+        task_workflow_id = uuid.uuid4()
+        event = reactor.LifecycleWebhookEvent(
+            delivery_id=uuid.uuid4(),
+            event_type="item.transitioned",
+            tenant_id=uuid.uuid4(),
+            workflow_id=task_workflow_id,
+            item_id=task_engine_id,
+            timestamp=datetime.now(UTC),
+            data=reactor.LifecycleWebhookData(
+                from_status="impl_review", to_status="done", triggered_by=None
+            ),
+        )
+        mapping = {task_workflow_id: declarations.TASK_WORKFLOW_NAME}
+        # Should not raise.
+        await reactor.handle_transition(
+            db_session, event, workflow_name_by_id=mapping
+        )
 
 
 class TestWebhookEndpoint:
