@@ -34,7 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.lifecycle import declarations, work_items
-from app.modules.ai.models import Task, WorkItem
+from app.modules.ai.lifecycle.engine_client import extract_correlation_id
+from app.modules.ai.models import PendingSignalContext, Task, WorkItem
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,12 @@ async def handle_transition(
             )
             return
 
+    # Consume any correlation context recorded at signal time.  Observability
+    # only for now — the row is logged + deleted.  A future phase will use
+    # the payload to write auxiliary rows (Approval, TaskAssignment, etc.)
+    # reactively rather than inline in the signal adapter.
+    await _consume_correlation(db, event.data.triggered_by)
+
     to_status = event.data.to_status
     if workflow_name == declarations.TASK_WORKFLOW_NAME:
         await _handle_task_transition(db, event.item_id, to_status)
@@ -106,6 +113,41 @@ async def handle_transition(
         )
     else:
         logger.debug("lifecycle webhook for unrecognised workflow %s", workflow_name)
+
+
+async def _consume_correlation(
+    db: AsyncSession, triggered_by: str | None
+) -> None:
+    """Parse the correlation UUID out of ``triggered_by``, look up the
+    matching ``PendingSignalContext`` row, log it, and delete.
+
+    No-ops when the correlation is absent or the row was already consumed
+    (replayed webhook).  Aux-row writes based on this payload are
+    intentionally deferred — this step only proves the end-to-end loop
+    closes.
+    """
+    corr = extract_correlation_id(triggered_by)
+    if corr is None:
+        return
+    row = await db.scalar(
+        select(PendingSignalContext).where(
+            PendingSignalContext.correlation_id == corr
+        )
+    )
+    if row is None:
+        logger.debug(
+            "no pending_signal_context for correlation %s (already consumed?)",
+            corr,
+        )
+        return
+    logger.info(
+        "reactor consumed correlation %s (signal=%s payload=%s)",
+        corr,
+        row.signal_name,
+        row.payload,
+    )
+    await db.delete(row)
+    await db.flush()
 
 
 async def _infer_workflow_from_item(
