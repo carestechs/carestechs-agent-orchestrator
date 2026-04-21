@@ -1,6 +1,16 @@
 # FEAT-006 rc2 — Architectural Position (post-merge)
 
-**Status:** Accepted · **Date:** 2026-04-19 · **Supersedes:** the aux-write-flip plan sketched in `plans/plan-T-131-reduce-state-columns.md` + `plans/plan-T-133-pending-signal-context.md`.
+> **⚠️ SUPERSEDED BY [FEAT-008](feat-008-engine-as-authority.md) · 2026-04-21**
+>
+> The conclusion below ("rc2-phase-2 as currently merged is the end state")
+> was reasoned under the unstated premise that the flow engine is a passive
+> mirror and cross-tool consumers would never need the orchestrator's rich
+> audit data.  FEAT-008 inverts the premise to match the stakeholder-definition
+> vision: the engine is the authoritative private backend, aux-row writes
+> move to the reactor, and effectors become first-class.  Read this document
+> for historical context only — do not cite it in review.
+
+**Status:** Superseded · **Date:** 2026-04-19 · **Supersedes:** the aux-write-flip plan sketched in `plans/plan-T-131-reduce-state-columns.md` + `plans/plan-T-133-pending-signal-context.md`.
 
 ## The question
 
