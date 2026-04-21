@@ -12,7 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.ai.enums import ApprovalDecision, TaskStatus, WorkItemStatus
-from app.modules.ai.models import Approval, Task, TaskAssignment, WorkItem
+from app.modules.ai.models import Approval, Task, TaskAssignment
+from tests.integration._reactor_helpers import (
+    await_task_status,
+    await_work_item_status,
+)
 
 pytestmark = pytest.mark.asyncio(loop_scope="function")
 
@@ -63,9 +67,11 @@ async def test_feat006_full_lifecycle(
     )
     assert r.status_code == 202
 
-    # Verify W2 fired
-    wi = await db_session.scalar(select(WorkItem).where(WorkItem.id == wi_id))
-    assert wi is not None and wi.status == WorkItemStatus.IN_PROGRESS.value
+    # Verify W2 fired.
+    wi = await await_work_item_status(
+        db_session, wi_id, WorkItemStatus.IN_PROGRESS.value
+    )
+    assert wi is not None
 
     # S6 — reject B, then re-approve (rejection doesn't advance)
     r = await client.post(
@@ -186,8 +192,7 @@ async def test_feat006_full_lifecycle(
     assert r.status_code == 202
 
     # W5 should have fired (A=done, B=done, C=deferred). Expect work item=ready.
-    await db_session.refresh(wi)
-    assert wi.status == WorkItemStatus.READY.value
+    await await_work_item_status(db_session, wi_id, WorkItemStatus.READY.value)
 
     # S4 — close
     r = await client.post(
@@ -196,15 +201,12 @@ async def test_feat006_full_lifecycle(
         headers=_h(api_key),
     )
     assert r.status_code == 202, r.text
-    await db_session.refresh(wi)
-    assert wi.status == WorkItemStatus.CLOSED.value
+    await await_work_item_status(db_session, wi_id, WorkItemStatus.CLOSED.value)
 
     # Terminal-state assertions on child entities.
     for t in (task_a, task_b):
-        await db_session.refresh(t)
-        assert t.status == TaskStatus.DONE.value
-    await db_session.refresh(task_c)
-    assert task_c.status == TaskStatus.DEFERRED.value
+        await await_task_status(db_session, t.id, TaskStatus.DONE.value)
+    await await_task_status(db_session, task_c.id, TaskStatus.DEFERRED.value)
 
     # Assignment counts.
     assignments = (
