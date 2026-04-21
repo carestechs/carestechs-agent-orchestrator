@@ -197,25 +197,29 @@ async def approve_task(
     actor: str,
     engine: FlowEngineLifecycleClient | None = None,
     correlation_id: uuid.UUID | None = None,
+    skip_aux_write: bool = False,
 ) -> Task:
     """T2+T4: ``proposed -> approved`` then immediately ``approved -> assigning``.
 
-    Writes an ``Approval(stage=proposed, decision=approve)`` row.  Caller is
-    expected to fire :func:`work_items.maybe_advance_to_in_progress` after
-    this returns.
+    Writes an ``Approval(stage=proposed, decision=approve)`` row unless
+    *skip_aux_write* is True — the caller (signal adapter) then enqueues
+    a ``PendingAuxWrite`` and the reactor materializes on webhook arrival
+    (FEAT-008/T-167).  Caller is expected to fire
+    :func:`work_items.maybe_advance_to_in_progress` after this returns.
     """
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.PROPOSED.value:
         raise _forbidden(task, TaskStatus.APPROVED.value)
-    _record_approval(
-        db,
-        task_id=task_id,
-        stage=ApprovalStage.PROPOSED,
-        decision=ApprovalDecision.APPROVE,
-        decided_by=actor,
-        decided_by_role=ActorRole.ADMIN,
-        feedback=None,
-    )
+    if not skip_aux_write:
+        _record_approval(
+            db,
+            task_id=task_id,
+            stage=ApprovalStage.PROPOSED,
+            decision=ApprovalDecision.APPROVE,
+            decided_by=actor,
+            decided_by_role=ActorRole.ADMIN,
+            feedback=None,
+        )
     # T4 is inline: approved -> assigning without a separate hop.  Mirror
     # both states to the engine so the audit shows the double hop.
     task.status = TaskStatus.ASSIGNING.value
@@ -277,11 +281,17 @@ async def assign_task(
     assigned_by: str,
     engine: FlowEngineLifecycleClient | None = None,
     correlation_id: uuid.UUID | None = None,
-) -> tuple[Task, TaskAssignment]:
+    skip_aux_write: bool = False,
+) -> tuple[Task, TaskAssignment | None]:
     """T5: ``assigning -> planning``.  Inserts a new TaskAssignment row.
 
     If an active assignment already exists (reassignment), it is superseded
-    in the same transaction (partial-unique index is preserved).
+    in the same transaction (partial-unique index is preserved).  When
+    *skip_aux_write* is True (FEAT-008/T-167 engine-present path), the
+    new ``TaskAssignment`` row is deferred to the reactor and only the
+    supersede of the prior active row happens inline.  The returned
+    ``TaskAssignment`` is ``None`` in that case — the caller fetches via
+    ``await_reactor`` once the webhook lands.
     """
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.ASSIGNING.value:
@@ -292,13 +302,15 @@ async def assign_task(
         prior.superseded_at = datetime.now(UTC)
         await db.flush()
 
-    assignment = TaskAssignment(
-        task_id=task_id,
-        assignee_type=assignee_type.value,
-        assignee_id=assignee_id,
-        assigned_by=assigned_by,
-    )
-    db.add(assignment)
+    assignment: TaskAssignment | None = None
+    if not skip_aux_write:
+        assignment = TaskAssignment(
+            task_id=task_id,
+            assignee_type=assignee_type.value,
+            assignee_id=assignee_id,
+            assigned_by=assigned_by,
+        )
+        db.add(assignment)
     task.status = TaskStatus.PLANNING.value
     await db.flush()
     await _mirror_to_engine(
@@ -309,7 +321,8 @@ async def assign_task(
         actor=assigned_by,
     )
     await db.refresh(task)
-    await db.refresh(assignment)
+    if assignment is not None:
+        await db.refresh(assignment)
     return task, assignment
 
 
@@ -378,21 +391,23 @@ async def approve_plan(
     solo_dev: bool,
     engine: FlowEngineLifecycleClient | None = None,
     correlation_id: uuid.UUID | None = None,
+    skip_aux_write: bool = False,
 ) -> Task:
     """T7: ``plan_review -> implementing``."""
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.PLAN_REVIEW.value:
         raise _forbidden(task, TaskStatus.IMPLEMENTING.value)
     await _matrix_or_forbidden(db, task, ApprovalStage.PLAN, actor_role, solo_dev=solo_dev)
-    _record_approval(
-        db,
-        task_id=task_id,
-        stage=ApprovalStage.PLAN,
-        decision=ApprovalDecision.APPROVE,
-        decided_by=actor,
-        decided_by_role=actor_role,
-        feedback=None,
-    )
+    if not skip_aux_write:
+        _record_approval(
+            db,
+            task_id=task_id,
+            stage=ApprovalStage.PLAN,
+            decision=ApprovalDecision.APPROVE,
+            decided_by=actor,
+            decided_by_role=actor_role,
+            feedback=None,
+        )
     task.status = TaskStatus.IMPLEMENTING.value
     await db.flush()
     await _mirror_to_engine(
@@ -489,21 +504,23 @@ async def approve_review(
     solo_dev: bool,
     engine: FlowEngineLifecycleClient | None = None,
     correlation_id: uuid.UUID | None = None,
+    skip_aux_write: bool = False,
 ) -> Task:
     """T10: ``impl_review -> done``."""
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.IMPL_REVIEW.value:
         raise _forbidden(task, TaskStatus.DONE.value)
     await _matrix_or_forbidden(db, task, ApprovalStage.IMPL, actor_role, solo_dev=solo_dev)
-    _record_approval(
-        db,
-        task_id=task_id,
-        stage=ApprovalStage.IMPL,
-        decision=ApprovalDecision.APPROVE,
-        decided_by=actor,
-        decided_by_role=actor_role,
-        feedback=None,
-    )
+    if not skip_aux_write:
+        _record_approval(
+            db,
+            task_id=task_id,
+            stage=ApprovalStage.IMPL,
+            decision=ApprovalDecision.APPROVE,
+            decided_by=actor,
+            decided_by_role=actor_role,
+            feedback=None,
+        )
     task.status = TaskStatus.DONE.value
     await db.flush()
     await _mirror_to_engine(

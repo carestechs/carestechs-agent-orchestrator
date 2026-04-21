@@ -32,6 +32,7 @@ from app.modules.ai.github.pr_urls import parse_pr_url
 from app.modules.ai.lifecycle import idempotency, tasks, work_items
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
+    PendingAuxWrite,
     PendingSignalContext,
     Task,
     TaskAssignment,
@@ -177,6 +178,34 @@ async def _with_correlation(
     )
     await db.flush()
     return corr
+
+
+def _enqueue_aux(
+    db: AsyncSession,
+    *,
+    correlation_id: uuid.UUID,
+    signal_name: str,
+    entity_id: uuid.UUID,
+    entity_type: str,
+    aux_type: str,
+    fields: Mapping[str, Any],
+) -> None:
+    """Append a ``PendingAuxWrite`` for the reactor to materialize on webhook
+    (FEAT-008/T-167).
+
+    Same transaction as the signal's idempotency key + state transition;
+    committed together by the adapter.  Payload carries enough to rebuild
+    the target aux row — the reactor dispatches on ``aux_type``.
+    """
+    db.add(
+        PendingAuxWrite(
+            correlation_id=correlation_id,
+            signal_name=signal_name,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            payload={"aux_type": aux_type, **dict(fields)},
+        )
+    )
 
 
 async def _reload_work_item(db: AsyncSession, work_item_id: uuid.UUID) -> WorkItem:
@@ -396,8 +425,28 @@ async def approve_task_signal(
         payload={"taskId": str(task_id), "actor": actor},
     )
     task = await tasks.approve_task(
-        db, task_id, actor=actor, engine=engine, correlation_id=corr
+        db,
+        task_id,
+        actor=actor,
+        engine=engine,
+        correlation_id=corr,
+        skip_aux_write=engine is not None,
     )
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="approve-task",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="approval",
+            fields={
+                "stage": "proposed",
+                "decision": "approve",
+                "decided_by": actor,
+                "decided_by_role": ActorRole.ADMIN.value,
+            },
+        )
     await work_items.maybe_advance_to_in_progress(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
@@ -444,8 +493,15 @@ async def assign_task_signal(
     assignee_id: str,
     actor: str,
     engine: FlowEngineLifecycleClient | None = None,
-) -> tuple[Task, TaskAssignment, bool]:
-    """S7: admin assigns the task.  ``assigning -> planning``."""
+) -> tuple[Task, TaskAssignment | None, bool]:
+    """S7: admin assigns the task.  ``assigning -> planning``.
+
+    Returns the ``TaskAssignment`` row when it was written inline
+    (engine-absent fallback), or ``None`` when the assignment is
+    deferred to the reactor (FEAT-008/T-167 engine-present path) —
+    callers poll via :func:`tests.integration._reactor_helpers.await_reactor`
+    to observe the materialized row.
+    """
     payload = {
         "assigneeType": assignee_type.value,
         "assigneeId": assignee_id,
@@ -456,13 +512,15 @@ async def assign_task_signal(
     )
     if not is_new:
         task = await _reload_task(db, task_id)
+        # Replay path may legitimately see no active assignment row under
+        # engine-present mode if the reactor hasn't materialized it yet
+        # (T-167 outbox). Callers treat ``None`` as "assignment pending".
         active = await db.scalar(
             select(TaskAssignment).where(
                 TaskAssignment.task_id == task_id,
                 TaskAssignment.superseded_at.is_(None),
             )
         )
-        assert active is not None, "idempotent replay must find an active assignment"
         return task, active, False
 
     corr = await _with_correlation(
@@ -482,8 +540,28 @@ async def assign_task_signal(
         assigned_by=actor,
         engine=engine,
         correlation_id=corr,
+        skip_aux_write=engine is not None,
     )
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="assign-task",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="task_assignment",
+            fields={
+                "assignee_type": assignee_type.value,
+                "assignee_id": assignee_id,
+                "assigned_by": actor,
+            },
+        )
     await db.commit()
+    if engine is not None:
+        # The TaskAssignment row lands via the reactor on webhook arrival.
+        # Signal callers that need a concrete row should poll via
+        # ``await_reactor`` against the active-assignment index.
+        assert assignment is None
     return task, assignment, True
 
 
@@ -553,14 +631,29 @@ async def submit_plan_signal(
     task = await tasks.submit_plan(
         db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
     )
-    db.add(
-        TaskPlan(
-            task_id=task_id,
-            plan_path=plan_path,
-            plan_sha=plan_sha,
-            submitted_by=actor,
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="submit-plan",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="task_plan",
+            fields={
+                "plan_path": plan_path,
+                "plan_sha": plan_sha,
+                "submitted_by": actor,
+            },
         )
-    )
+    else:
+        db.add(
+            TaskPlan(
+                task_id=task_id,
+                plan_path=plan_path,
+                plan_sha=plan_sha,
+                submitted_by=actor,
+            )
+        )
     await db.commit()
     return task, True
 
@@ -606,7 +699,23 @@ async def approve_plan_signal(
         solo_dev=solo_dev,
         engine=engine,
         correlation_id=corr,
+        skip_aux_write=engine is not None,
     )
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="approve-plan",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="approval",
+            fields={
+                "stage": "plan",
+                "decision": "approve",
+                "decided_by": actor,
+                "decided_by_role": actor_role.value,
+            },
+        )
     await db.commit()
     return task, True
 
@@ -696,15 +805,31 @@ async def submit_implementation_signal(
     task = await tasks.submit_implementation(
         db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
     )
-    db.add(
-        TaskImplementation(
-            task_id=task_id,
-            pr_url=pr_url,
-            commit_sha=commit_sha,
-            summary=summary,
-            submitted_by=actor,
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="submit-implementation",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="task_implementation",
+            fields={
+                "pr_url": pr_url,
+                "commit_sha": commit_sha,
+                "summary": summary,
+                "submitted_by": actor,
+            },
         )
-    )
+    else:
+        db.add(
+            TaskImplementation(
+                task_id=task_id,
+                pr_url=pr_url,
+                commit_sha=commit_sha,
+                summary=summary,
+                submitted_by=actor,
+            )
+        )
     await db.commit()
 
     if pr_url is not None and github is not None:
@@ -756,7 +881,23 @@ async def approve_review_signal(
         solo_dev=solo_dev,
         engine=engine,
         correlation_id=corr,
+        skip_aux_write=engine is not None,
     )
+    if engine is not None:
+        _enqueue_aux(
+            db,
+            correlation_id=corr,
+            signal_name="approve-review",
+            entity_id=task_id,
+            entity_type="task",
+            aux_type="approval",
+            fields={
+                "stage": "impl",
+                "decision": "approve",
+                "decided_by": actor,
+                "decided_by_role": actor_role.value,
+            },
+        )
     await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
 

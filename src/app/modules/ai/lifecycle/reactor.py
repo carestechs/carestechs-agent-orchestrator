@@ -35,7 +35,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.lifecycle import declarations, work_items
 from app.modules.ai.lifecycle.engine_client import extract_correlation_id
-from app.modules.ai.models import PendingSignalContext, Task, WorkItem
+from app.modules.ai.models import (
+    Approval,
+    PendingAuxWrite,
+    PendingSignalContext,
+    Task,
+    TaskAssignment,
+    TaskImplementation,
+    TaskPlan,
+    WorkItem,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +103,17 @@ async def handle_transition(
             )
             return
 
-    # Consume any correlation context recorded at signal time.  Observability
-    # only for now — the row is logged + deleted.  A future phase will use
-    # the payload to write auxiliary rows (Approval, TaskAssignment, etc.)
-    # reactively rather than inline in the signal adapter.
+    # FEAT-008/T-167: materialize any outbox-queued aux row for this
+    # correlation before firing derivations — downstream work that reads
+    # aux rows (W5 via child-task counts, effectors that inspect latest
+    # Approval/TaskImplementation) expects them already committed.
+    corr = extract_correlation_id(event.data.triggered_by)
+    if corr is not None:
+        await _materialize_aux(db, corr)
+
+    # Consume the signal-context row recorded at signal time.  Logged +
+    # deleted; payload is used by the outbox materialization above when
+    # the correlation matched.
     await _consume_correlation(db, event.data.triggered_by)
 
     to_status = event.data.to_status
@@ -113,6 +129,90 @@ async def handle_transition(
         )
     else:
         logger.debug("lifecycle webhook for unrecognised workflow %s", workflow_name)
+
+
+async def _materialize_aux(
+    db: AsyncSession, correlation_id: uuid.UUID
+) -> None:
+    """Materialize an outbox-queued aux row (FEAT-008/T-167).
+
+    The signal adapter enqueued a ``PendingAuxWrite`` inside the same
+    transaction that committed the idempotency key + engine mirror. On
+    the engine's ``item.transitioned`` webhook arrival, this function
+    locks that row (``FOR UPDATE SKIP LOCKED``), builds the target aux
+    row from ``payload['aux_type']``, inserts it, deletes the outbox
+    row, and flushes so the rest of the reactor sees the write.
+
+    Idempotent on duplicate webhook delivery: the second arrival finds
+    no row (already deleted) and no-ops.
+
+    Replayed/unknown correlation ids (engine replay after outbox purge,
+    or a correlation the orchestrator never enqueued) also no-op — they
+    are logged at debug for forensics.
+    """
+    pending = await db.scalar(
+        select(PendingAuxWrite)
+        .where(PendingAuxWrite.correlation_id == correlation_id)
+        .with_for_update(skip_locked=True)
+    )
+    if pending is None:
+        logger.debug(
+            "no pending_aux_write for correlation %s (already materialized?)",
+            correlation_id,
+        )
+        return
+    aux_row = _build_aux_row(pending)
+    if aux_row is not None:
+        db.add(aux_row)
+    else:
+        logger.warning(
+            "pending_aux_write %s has unknown aux_type=%r; dropping",
+            correlation_id,
+            pending.payload.get("aux_type"),
+        )
+    await db.delete(pending)
+    await db.flush()
+
+
+def _build_aux_row(
+    pending: PendingAuxWrite,
+) -> Approval | TaskAssignment | TaskPlan | TaskImplementation | None:
+    """Dispatch on ``payload['aux_type']`` to construct the target row."""
+    payload = pending.payload
+    aux_type = payload.get("aux_type")
+    entity_id = pending.entity_id
+    if aux_type == "approval":
+        return Approval(
+            task_id=entity_id,
+            stage=payload["stage"],
+            decision=payload["decision"],
+            decided_by=payload["decided_by"],
+            decided_by_role=payload["decided_by_role"],
+            feedback=payload.get("feedback"),
+        )
+    if aux_type == "task_assignment":
+        return TaskAssignment(
+            task_id=entity_id,
+            assignee_type=payload["assignee_type"],
+            assignee_id=payload["assignee_id"],
+            assigned_by=payload["assigned_by"],
+        )
+    if aux_type == "task_plan":
+        return TaskPlan(
+            task_id=entity_id,
+            plan_path=payload["plan_path"],
+            plan_sha=payload["plan_sha"],
+            submitted_by=payload["submitted_by"],
+        )
+    if aux_type == "task_implementation":
+        return TaskImplementation(
+            task_id=entity_id,
+            pr_url=payload.get("pr_url"),
+            commit_sha=payload["commit_sha"],
+            summary=payload["summary"],
+            submitted_by=payload["submitted_by"],
+        )
+    return None
 
 
 async def _consume_correlation(
