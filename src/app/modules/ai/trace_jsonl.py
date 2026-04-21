@@ -25,6 +25,7 @@ from typing import Any, cast
 import aiofiles
 
 from app.modules.ai.schemas import (
+    EffectorCallDto,
     PolicyCallDto,
     RunSignalDto,
     StepDto,
@@ -78,6 +79,33 @@ class JsonlTraceStore:
             },
         )
 
+    async def record_effector_call(
+        self, entity_id: uuid.UUID, call: EffectorCallDto
+    ) -> None:
+        """Append an effector-call trace under ``effectors/<entity_id>.jsonl``.
+
+        Separate directory keeps effector fan-out from contending with
+        per-run stream readers; the file layout mirrors run traces so
+        the same inspection tooling works.
+        """
+        record = {
+            "kind": "effector_call",
+            "data": call.model_dump(mode="json", by_alias=True),
+        }
+        path = self._effector_path(entity_id)
+        lock = await self._lock_for(entity_id)
+        line = json.dumps(record, default=str) + "\n"
+        async with lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            newly_created = not path.exists()
+            async with aiofiles.open(path, "a", encoding="utf-8") as f:
+                await f.write(line)
+            if newly_created:
+                try:
+                    os.chmod(path, 0o600)
+                except OSError as exc:  # pragma: no cover — best-effort hardening
+                    logger.warning("chmod 0600 failed for %s: %s", path, exc)
+
     async def open_run_stream(
         self, run_id: uuid.UUID
     ) -> AsyncIterator[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]:
@@ -116,6 +144,9 @@ class JsonlTraceStore:
 
     def _path(self, run_id: uuid.UUID) -> Path:
         return self._dir / f"{run_id}.jsonl"
+
+    def _effector_path(self, entity_id: uuid.UUID) -> Path:
+        return self._dir / "effectors" / f"{entity_id}.jsonl"
 
     async def _lock_for(self, run_id: uuid.UUID) -> asyncio.Lock:
         async with self._locks_guard:

@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from app.modules.ai.schemas import (
+    EffectorCallDto,
     PolicyCallDto,
     RunSignalDto,
     StepDto,
@@ -50,6 +51,18 @@ class TraceStore(Protocol):
         self, run_id: uuid.UUID, signal: RunSignalDto
     ) -> None:
         """Persist an operator-injected signal trace entry (FEAT-005)."""
+        ...
+
+    async def record_effector_call(
+        self, entity_id: uuid.UUID, call: EffectorCallDto
+    ) -> None:
+        """Persist an effector-call trace entry (FEAT-008).
+
+        Keyed on ``entity_id`` (work item or task) rather than run id —
+        effectors fire on lifecycle transitions that may have no
+        associated run. The JSONL writer stores these under
+        ``<trace_dir>/effectors/<entity_id>.jsonl``.
+        """
         ...
 
     async def open_run_stream(
@@ -101,6 +114,11 @@ class NoopTraceStore:
         self, run_id: uuid.UUID, signal: RunSignalDto
     ) -> None:
         """Accept and discard an operator-signal trace entry (FEAT-005)."""
+
+    async def record_effector_call(
+        self, entity_id: uuid.UUID, call: EffectorCallDto
+    ) -> None:
+        """Accept and discard an effector-call trace entry (FEAT-008)."""
 
     async def open_run_stream(
         self, run_id: uuid.UUID
