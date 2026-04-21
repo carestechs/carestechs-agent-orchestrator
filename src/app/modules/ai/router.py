@@ -28,12 +28,14 @@ from app.core.webhook_auth import require_engine_signature, require_flow_engine_
 from app.modules.ai import repository, service
 from app.modules.ai.dependencies import (
     get_engine_client,
+    get_github_checks_client_dep,
     get_lifecycle_engine_client,
     get_lifecycle_workflow_ids,
     require_actor_role,
 )
 from app.modules.ai.engine_client import FlowEngineClient
 from app.modules.ai.enums import ActorRole, WebhookEventType, WebhookSource
+from app.modules.ai.github.checks import GitHubChecksClient
 from app.modules.ai.lifecycle import reactor as lifecycle_reactor
 from app.modules.ai.lifecycle import service as lifecycle_service
 from app.modules.ai.lifecycle.declarations import WORK_ITEM_WORKFLOW_NAME
@@ -554,6 +556,7 @@ async def submit_implementation(
     db: Annotated[AsyncSession, Depends(get_db_session)],
     role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
+    github: Annotated[GitHubChecksClient, Depends(get_github_checks_client_dep)],
 ) -> TaskSignalResponse:
     """S11 (agent path) — submit an implementation for review."""
     del role
@@ -565,6 +568,7 @@ async def submit_implementation(
         summary=body.summary,
         actor="admin",
         engine=engine,
+        github=github,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -583,6 +587,7 @@ async def approve_review(
     ],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
+    github: Annotated[GitHubChecksClient, Depends(get_github_checks_client_dep)],
 ) -> TaskSignalResponse:
     """S12 — approve review.  Fires W5 derivation."""
     del body
@@ -593,6 +598,7 @@ async def approve_review(
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
         engine=engine,
+        github=github,
     )
     return _task_envelope(task, already_received=not is_new)
 
@@ -611,6 +617,7 @@ async def reject_review(
     ],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
+    github: Annotated[GitHubChecksClient, Depends(get_github_checks_client_dep)],
 ) -> TaskSignalResponse:
     """S13 — reject review with feedback."""
     task, is_new = await lifecycle_service.reject_review_signal(
@@ -621,6 +628,7 @@ async def reject_review(
         actor_role=role,
         solo_dev=settings.solo_dev_mode,
         engine=engine,
+        github=github,
     )
     return _task_envelope(task, already_received=not is_new)
 

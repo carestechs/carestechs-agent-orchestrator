@@ -40,6 +40,9 @@ def run_checks() -> list[CheckResult]:
     # -- 6. Agents dir -----------------------------------------------------
     results.append(_check_agents_dir())
 
+    # -- 7. GitHub merge-gating strategy (FEAT-007) ------------------------
+    results.append(_check_github_strategy())
+
     return results
 
 
@@ -134,6 +137,36 @@ def _check_agents_dir() -> CheckResult:
         "agents_dir",
         "ok",
         f"{agents_dir} loaded {len(records)} agent definition(s)",
+    )
+
+
+def _check_github_strategy() -> CheckResult:
+    """Report the resolved GitHub Checks strategy (App > PAT > Noop).
+
+    FEAT-007 intentionally degrades to a no-op when no credentials are
+    configured — that's composition integrity (AD-9), not a failure.  This
+    check surfaces which path is active so operators can confirm their env
+    matches their intent.
+    """
+    try:
+        from app.config import Settings
+
+        settings = Settings()  # type: ignore[call-arg]
+    except Exception as exc:
+        return CheckResult("github_checks", "fail", f"config did not load: {exc}")
+
+    if settings.github_app_id and settings.github_private_key:
+        return CheckResult(
+            "github_checks",
+            "ok",
+            f"Merge-gating: GitHub App (id {settings.github_app_id})",
+        )
+    if settings.github_pat is not None:
+        return CheckResult("github_checks", "ok", "Merge-gating: PAT")
+    return CheckResult(
+        "github_checks",
+        "warn",
+        "Merge-gating: no-op (set GITHUB_PAT or GITHUB_APP_ID+GITHUB_PRIVATE_KEY to enable)",
     )
 
 

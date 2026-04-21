@@ -13,6 +13,7 @@ modules; these handle the idempotency + commit boundary.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -20,8 +21,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import AppError, NotFoundError, ValidationError
 from app.modules.ai.enums import ActorRole, AssigneeType, WorkItemType
+from app.modules.ai.github.checks import (
+    NOOP_CHECK_ID,
+    GitHubChecksClient,
+    NoopGitHubChecksClient,
+)
+from app.modules.ai.github.pr_urls import parse_pr_url
 from app.modules.ai.lifecycle import idempotency, tasks, work_items
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
@@ -32,6 +39,120 @@ from app.modules.ai.models import (
     TaskPlan,
     WorkItem,
 )
+
+logger = logging.getLogger(__name__)
+
+
+async def _post_create_check(
+    db: AsyncSession,
+    *,
+    github: GitHubChecksClient,
+    task_id: uuid.UUID,
+    pr_url: str,
+    commit_sha: str,
+) -> None:
+    """Register the ``orchestrator/impl-review`` check for *pr_url*.
+
+    Non-fatal: AD-1 says the state machine is authoritative.  A transient
+    GitHub failure leaves ``github_check_id`` NULL; approve/reject paths
+    short-circuit on the NULL and move on.
+
+    When the client is a no-op (no GitHub credentials configured), the
+    URL is not parsed — the merge-gate is degraded, and fake or test URLs
+    must not fail the signal.
+    """
+    if isinstance(github, NoopGitHubChecksClient):
+        impl = await _latest_task_implementation(db, task_id)
+        if impl is not None:
+            impl.github_check_id = NOOP_CHECK_ID
+            await db.commit()
+        return
+
+    try:
+        ref = parse_pr_url(pr_url)
+    except ValidationError:
+        # Malformed URL with a real client configured is the caller's
+        # problem; bubble it up so the signal handler returns 400.
+        raise
+    try:
+        check_id = await github.create_check(
+            owner=ref.owner, repo=ref.repo, head_sha=commit_sha
+        )
+    except AppError as exc:
+        logger.warning(
+            "github check create failed; state machine continues",
+            extra={
+                "task_id": str(task_id),
+                "repo": ref.slug,
+                "error_code": exc.code,
+                "error": str(exc),
+            },
+        )
+        return
+
+    impl = await _latest_task_implementation(db, task_id)
+    if impl is None:
+        return
+    impl.github_check_id = check_id
+    await db.commit()
+
+
+async def _post_update_check(
+    db: AsyncSession,
+    *,
+    github: GitHubChecksClient,
+    task_id: uuid.UUID,
+    conclusion: str,
+) -> None:
+    """Flip the latest task's check to ``success`` or ``failure``.
+
+    Silently no-ops when no check_id was stored (missing ``pr_url`` or
+    noop-client path).  Non-fatal on transport errors.
+    """
+    impl = await _latest_task_implementation(db, task_id)
+    if impl is None or impl.github_check_id is None or impl.pr_url is None:
+        return
+    if impl.github_check_id == NOOP_CHECK_ID or isinstance(
+        github, NoopGitHubChecksClient
+    ):
+        return
+    try:
+        ref = parse_pr_url(impl.pr_url)
+    except ValidationError:
+        logger.warning(
+            "stored pr_url is invalid; skipping check update",
+            extra={"task_id": str(task_id), "pr_url": impl.pr_url},
+        )
+        return
+    try:
+        await github.update_check(
+            owner=ref.owner,
+            repo=ref.repo,
+            check_id=impl.github_check_id,
+            conclusion=conclusion,  # type: ignore[arg-type]
+        )
+    except AppError as exc:
+        logger.warning(
+            "github check update failed; state machine continues",
+            extra={
+                "task_id": str(task_id),
+                "check_id": impl.github_check_id,
+                "conclusion": conclusion,
+                "error_code": exc.code,
+                "error": str(exc),
+            },
+        )
+
+
+async def _latest_task_implementation(
+    db: AsyncSession, task_id: uuid.UUID
+) -> TaskImplementation | None:
+    return await db.scalar(
+        select(TaskImplementation)
+        .where(TaskImplementation.task_id == task_id)
+        .order_by(TaskImplementation.submitted_at.desc())
+        .limit(1)
+    )
 
 
 async def _with_correlation(
@@ -546,10 +667,13 @@ async def submit_implementation_signal(
     summary: str,
     actor: str,
     engine: FlowEngineLifecycleClient | None = None,
+    github: GitHubChecksClient | None = None,
 ) -> tuple[Task, bool]:
     """S11 (agent path): submit an implementation for review.
 
     Inserts ``TaskImplementation`` and advances ``implementing -> impl_review``.
+    When *pr_url* + *github* are supplied, registers the merge-gate check
+    after the transition commits (non-fatal).
     """
     payload = {"prUrl": pr_url, "commitSha": commit_sha, "summary": summary}
     key = idempotency.compute_signal_key(task_id, "submit-implementation", payload)
@@ -582,6 +706,16 @@ async def submit_implementation_signal(
         )
     )
     await db.commit()
+
+    if pr_url is not None and github is not None:
+        await _post_create_check(
+            db,
+            github=github,
+            task_id=task_id,
+            pr_url=pr_url,
+            commit_sha=commit_sha,
+        )
+
     return task, True
 
 
@@ -593,6 +727,7 @@ async def approve_review_signal(
     actor_role: ActorRole,
     solo_dev: bool,
     engine: FlowEngineLifecycleClient | None = None,
+    github: GitHubChecksClient | None = None,
 ) -> tuple[Task, bool]:
     """S12: approve implementation review; fires W5."""
     key = idempotency.compute_signal_key(
@@ -624,6 +759,12 @@ async def approve_review_signal(
     )
     await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
+
+    if github is not None:
+        await _post_update_check(
+            db, github=github, task_id=task_id, conclusion="success"
+        )
+
     return task, True
 
 
@@ -636,6 +777,7 @@ async def reject_review_signal(
     actor_role: ActorRole,
     solo_dev: bool,
     engine: FlowEngineLifecycleClient | None = None,
+    github: GitHubChecksClient | None = None,
 ) -> tuple[Task, bool]:
     """S13: reject implementation review with feedback."""
     payload = {"feedback": feedback, "actorRole": actor_role.value}
@@ -666,4 +808,10 @@ async def reject_review_signal(
         correlation_id=corr,
     )
     await db.commit()
+
+    if github is not None:
+        await _post_update_check(
+            db, github=github, task_id=task_id, conclusion="failure"
+        )
+
     return task, True
