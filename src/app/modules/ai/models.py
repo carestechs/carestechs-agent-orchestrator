@@ -586,3 +586,35 @@ class PendingSignalContext(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class PendingAuxWrite(Base):
+    """Outbox row capturing aux-row intent at signal-commit time (FEAT-008).
+
+    The signal adapter enqueues one of these inside its transaction, the
+    engine's ``item.transitioned`` webhook triggers the reactor to look
+    up by ``correlation_id``, materialize the target aux row (Approval /
+    TaskAssignment / TaskPlan / TaskImplementation) from ``payload``, and
+    delete this row. Unresolved rows are the recovery surface for
+    ``reconcile-aux`` (T-170) when the engine webhook is lost.
+
+    Keyed ``unique(correlation_id)`` so a retrying signal adapter
+    idempotently converges on a single outbox row.
+    """
+
+    __tablename__ = "pending_aux_writes"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    correlation_id: Mapped[uuid.UUID] = mapped_column(nullable=False, unique=True)
+    signal_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_pending_aux_writes_entity_id", "entity_id"),
+        Index("ix_pending_aux_writes_enqueued_at", "enqueued_at"),
+    )
