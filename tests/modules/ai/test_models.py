@@ -24,6 +24,7 @@ from app.modules.ai.enums import (
 )
 from app.modules.ai.models import (
     Approval,
+    PendingAuxWrite,
     PolicyCall,
     Run,
     RunMemory,
@@ -467,3 +468,47 @@ class TestApproval:
         fk = next(iter(Approval.__table__.foreign_keys))
         assert fk.column.table.name == "tasks"
         assert fk.ondelete == "RESTRICT"
+
+
+# ---------------------------------------------------------------------------
+# FEAT-008 — PendingAuxWrite (outbox)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingAuxWrite:
+    def test_table_name(self) -> None:
+        assert _table(PendingAuxWrite) == "pending_aux_writes"
+
+    def test_columns(self) -> None:
+        expected = {
+            "id",
+            "correlation_id",
+            "signal_name",
+            "entity_type",
+            "entity_id",
+            "payload",
+            "enqueued_at",
+        }
+        assert _column_names(PendingAuxWrite) == expected
+
+    def test_correlation_id_is_unique(self) -> None:
+        uniques = [
+            c
+            for c in PendingAuxWrite.__table__.constraints
+            if c.__class__.__name__ == "UniqueConstraint"
+        ]
+        # Engine may coalesce the declared unique into a UNIQUE INDEX.
+        unique_by_constraint = any(
+            {col.name for col in c.columns} == {"correlation_id"}  # type: ignore[attr-defined]
+            for c in uniques
+        )
+        unique_by_index = any(
+            idx.unique and {col.name for col in idx.columns} == {"correlation_id"}
+            for idx in PendingAuxWrite.__table__.indexes
+        )
+        assert unique_by_constraint or unique_by_index
+
+    def test_has_entity_and_enqueued_indexes(self) -> None:
+        names = {idx.name for idx in PendingAuxWrite.__table__.indexes}
+        assert "ix_pending_aux_writes_entity_id" in names
+        assert "ix_pending_aux_writes_enqueued_at" in names
