@@ -120,6 +120,22 @@ class WebhookEventDto(BaseModel):
     processed_at: datetime | None = None
 
 
+class EffectorCallDto(BaseModel):
+    """Trace entry for one effector fire (FEAT-008)."""
+
+    model_config = _CAMEL_CONFIG
+
+    effector_name: str
+    entity_type: Literal["work_item", "task"]
+    entity_id: uuid.UUID
+    transition: str
+    status: Literal["ok", "error", "skipped"]
+    duration_ms: int
+    error_code: str | None = None
+    detail: str | None = None
+    emitted_at: datetime
+
+
 class AgentDto(BaseModel):
     model_config = _CAMEL_CONFIG
 
