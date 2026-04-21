@@ -111,6 +111,12 @@ async def handle_transition(
     if corr is not None:
         await _materialize_aux(db, corr)
 
+    # FEAT-008/T-169: write the local status cache from the engine's
+    # authoritative state. Fired for every webhook (correlation or not)
+    # so engine-initiated transitions outside an orchestrator signal
+    # still converge.
+    await _update_status_cache(db, workflow_name, event)
+
     # Consume the signal-context row recorded at signal time.  Logged +
     # deleted; payload is used by the outbox materialization above when
     # the correlation matched.
@@ -129,6 +135,49 @@ async def handle_transition(
         )
     else:
         logger.debug("lifecycle webhook for unrecognised workflow %s", workflow_name)
+
+
+async def _update_status_cache(
+    db: AsyncSession,
+    workflow_name: str,
+    event: LifecycleWebhookEvent,
+) -> None:
+    """Write the engine's ``to_status`` onto the local cache row (T-169).
+
+    Lookup by ``engine_item_id`` — both ``tasks`` and ``work_items``
+    carry it (FEAT-006 rc2). Cache miss is logged and skipped; it can
+    happen if the engine emits events for items the orchestrator never
+    created (should not happen under the architecture, but cheap to
+    guard).
+    """
+    to_status = event.data.to_status
+    if to_status is None:
+        return
+    if workflow_name == declarations.TASK_WORKFLOW_NAME:
+        task = await db.scalar(
+            select(Task).where(Task.engine_item_id == event.item_id)
+        )
+        if task is None:
+            logger.info(
+                "status cache miss for task engine_item_id=%s; skipping",
+                event.item_id,
+            )
+            return
+        task.status = to_status
+    elif workflow_name == declarations.WORK_ITEM_WORKFLOW_NAME:
+        wi = await db.scalar(
+            select(WorkItem).where(WorkItem.engine_item_id == event.item_id)
+        )
+        if wi is None:
+            logger.info(
+                "status cache miss for work_item engine_item_id=%s; skipping",
+                event.item_id,
+            )
+            return
+        wi.status = to_status
+    else:
+        return
+    await db.flush()
 
 
 async def _materialize_aux(

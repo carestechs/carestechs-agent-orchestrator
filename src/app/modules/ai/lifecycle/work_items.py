@@ -156,7 +156,8 @@ async def lock_work_item(
     if wi.status != WorkItemStatus.IN_PROGRESS.value:
         raise _forbidden(wi, WorkItemStatus.LOCKED)
     wi.locked_from = wi.status
-    wi.status = WorkItemStatus.LOCKED.value
+    if engine is None:
+        wi.status = WorkItemStatus.LOCKED.value
     await db.flush()
     await _mirror_to_engine(
         wi, WorkItemStatus.LOCKED, engine=engine, correlation_id=correlation_id, actor=actor
@@ -184,7 +185,8 @@ async def unlock_work_item(
         raise _forbidden(wi, WorkItemStatus.IN_PROGRESS)
     # locked_from recorded the prior state; we always return to in_progress
     # in v1 since lock is only reachable from there.
-    wi.status = WorkItemStatus.IN_PROGRESS.value
+    if engine is None:
+        wi.status = WorkItemStatus.IN_PROGRESS.value
     wi.locked_from = None
     await db.flush()
     await _mirror_to_engine(
@@ -215,7 +217,8 @@ async def close_work_item(
     wi = await _load_locked(db, work_item_id)
     if wi.status != WorkItemStatus.READY.value:
         raise _forbidden(wi, WorkItemStatus.CLOSED)
-    wi.status = WorkItemStatus.CLOSED.value
+    if engine is None:
+        wi.status = WorkItemStatus.CLOSED.value
     wi.closed_at = datetime.now(UTC)
     wi.closed_by = actor
     await db.flush()
@@ -251,6 +254,10 @@ async def maybe_advance_to_in_progress(
     wi = await _load_locked(db, work_item_id)
     if wi.status != WorkItemStatus.OPEN.value:
         return False
+    # FIXME(FEAT-008/T-169): derivation still writes status inline under
+    # both engine-present and engine-absent. Moving it to the reactor
+    # means issuing the engine transition from reactor-side and waiting
+    # for the return webhook — a bigger refactor deferred to a follow-on.
     wi.status = WorkItemStatus.IN_PROGRESS.value
     await db.flush()
     await _mirror_to_engine(
@@ -306,6 +313,7 @@ async def maybe_advance_to_ready(
     if non_terminal:
         return False
 
+    # FIXME(FEAT-008/T-169): derivation stays inline — see maybe_advance_to_in_progress.
     wi.status = WorkItemStatus.READY.value
     await db.flush()
     await _mirror_to_engine(

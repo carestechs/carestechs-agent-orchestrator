@@ -168,10 +168,11 @@ class TestHandleTransition:
         )
         mapping = {wi_workflow_id: declarations.WORK_ITEM_WORKFLOW_NAME}
         await reactor.handle_transition(db_session, event, workflow_name_by_id=mapping)
-        # No derivation; wi.status unchanged on orchestrator side
-        # (the engine-side state change doesn't mirror back).
+        # FEAT-008/T-169: the reactor now updates the status cache from the
+        # engine's authoritative to_status, even for work items (no
+        # derivation fired, but the cache converges).
         await db_session.refresh(wi)
-        assert wi.status == WorkItemStatus.IN_PROGRESS.value
+        assert wi.status == "locked"
 
 
 class TestCorrelationConsumption:
