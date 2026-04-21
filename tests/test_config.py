@@ -76,6 +76,9 @@ class TestSettingsFields:
             "lifecycle_max_corrections",
             "solo_dev_mode",
             "github_webhook_secret",
+            "github_pat",
+            "github_app_id",
+            "github_private_key",
             "flow_engine_lifecycle_base_url",
             "flow_engine_tenant_api_key",
             "log_level",
@@ -295,6 +298,63 @@ class TestAnthropicValidation:
                     anthropic_timeout_seconds=-1,
                 )
             )
+
+
+class TestGitHubCredentialValidation:
+    """T-140: the ``_validate_github_credentials`` model_validator branch."""
+
+    # Explicit ``None`` overrides defeat local ``.env`` leakage — pydantic-settings
+    # still merges the dotenv source under init kwargs, so we need to set each
+    # GitHub field to ``None`` at call time, not rely on ``monkeypatch.delenv``.
+
+    def test_no_credentials_is_valid(self) -> None:
+        s = _make_settings(
+            github_pat=None, github_app_id=None, github_private_key=None,
+        )
+        assert s.github_pat is None
+        assert s.github_app_id is None
+        assert s.github_private_key is None
+
+    def test_pat_only_is_valid(self) -> None:
+        s = _make_settings(
+            github_pat="ghp_token", github_app_id=None, github_private_key=None,
+        )
+        assert s.github_pat is not None
+        assert s.github_pat.get_secret_value() == "ghp_token"
+
+    def test_app_credentials_together_is_valid(self) -> None:
+        s = _make_settings(
+            github_pat=None,
+            github_app_id="12345",
+            github_private_key="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
+        )
+        assert s.github_app_id == "12345"
+        assert s.github_private_key is not None
+
+    def test_app_id_without_private_key_raises(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _make_settings(
+                github_pat=None, github_app_id="12345", github_private_key=None,
+            )
+        assert "github_app_id" in str(exc_info.value).lower()
+
+    def test_private_key_without_app_id_raises(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _make_settings(
+                github_pat=None,
+                github_app_id=None,
+                github_private_key="-----BEGIN RSA PRIVATE KEY-----",
+            )
+        assert "github_private_key" in str(exc_info.value).lower()
+
+    def test_pat_and_app_both_configured_raises(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _make_settings(
+                github_pat="ghp_token",
+                github_app_id="12345",
+                github_private_key="-----BEGIN RSA PRIVATE KEY-----",
+            )
+        assert "not both" in str(exc_info.value).lower()
 
 
 class TestDependencyOverride:

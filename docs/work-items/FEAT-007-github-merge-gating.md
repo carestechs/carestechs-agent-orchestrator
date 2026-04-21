@@ -12,7 +12,7 @@
 | **ID** | FEAT-007 |
 | **Name** | GitHub Merge-Gating + Regression Insurance |
 | **Target Version** | v0.6.0 |
-| **Status** | Not Started |
+| **Status** | Delivered — v0.6.0 |
 | **Priority** | High |
 | **Requested By** | Tech Lead |
 | **Date Created** | 2026-04-19 |
@@ -48,7 +48,6 @@ When a task transitions to `impl_review` (either by the `/tasks/{id}/implementat
 ### 4.2 Excluded
 
 - **GitHub App installation UX.** Operators configure via env vars; no web flow.
-- **Multi-repo support.** v1 binds to a single `GITHUB_REPO` ("owner/repo").
 - **Automatic PR merge after approval.** The orchestrator only flips the check; GitHub's branch protection merges.
 - **Retention/cleanup of stale checks.** If a task is deferred after `impl_review`, the check stays as whatever state it was last set to.
 
@@ -58,7 +57,7 @@ When a task transitions to `impl_review` (either by the `/tasks/{id}/implementat
 
 - **AC-1**: `GitHubChecksClient` protocol + three implementations land in `src/app/modules/ai/github/checks.py`.
 - **AC-2**: Factory returns `HttpxGitHubChecksClient(AppAuthStrategy)` when `GITHUB_APP_ID` + `GITHUB_PRIVATE_KEY` set; `PatAuthStrategy` when `GITHUB_PAT` set; `NoopGitHubChecksClient` otherwise.
-- **AC-3**: `POST /api/v1/tasks/{id}/implementation` creates an `orchestrator/impl-review` check when the payload carries a `prUrl` and a client is configured.
+- **AC-3**: `POST /api/v1/tasks/{id}/implementation` creates an `orchestrator/impl-review` check when the payload carries a `prUrl` and a client is configured. The target `owner/repo` is parsed from `prUrl` per task — a single credential fans out to every repo the PAT (or App installation) can access.
 - **AC-4**: `POST /.../review/approve` resolves the check to `conclusion=success` within 5 s; `/review/reject` resolves to `conclusion=failure`.
 - **AC-5**: With `NoopGitHubChecksClient`, all FEAT-006 endpoints continue to function unchanged.
 - **AC-6**: T-123 composition-integrity test runs the full 14-signal flow with stub LLM + noop GitHub and asserts zero outbound HTTP calls.
@@ -104,7 +103,7 @@ None.
 ## 10. Constraints
 
 - **AD-9 composition integrity (AC-6).** The system must run without GitHub credentials configured.
-- **Single-repo v1.** No multi-repo fan-out.
+- **Multi-repo by default.** `owner/repo` is parsed per-task from the PR URL; the configured credential (PAT or App installation) must have `repo` scope on every target repo. No per-repo env vars.
 - **No retention logic.** Check-run rows accumulate in GitHub; acceptable for v1.
 - **Credentials in env vars only.** No secrets rotation UX; operator restarts the service to roll credentials.
 

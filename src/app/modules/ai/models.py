@@ -19,6 +19,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    String,
     Text,
     UniqueConstraint,
     func,
@@ -521,6 +522,13 @@ class TaskImplementation(Base):
     submitted_by: Mapped[str] = mapped_column(Text, nullable=False)
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # FEAT-007: GitHub check-run id posted for this implementation.  NULL
+    # when no ``pr_url`` was supplied; the noop sentinel (``"noop"``) is
+    # stored when the Checks client is degraded, so later ``update_check``
+    # paths can short-circuit without a credential lookup.
+    github_check_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
     )
 
     __table_args__ = (

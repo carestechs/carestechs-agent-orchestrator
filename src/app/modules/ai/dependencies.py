@@ -15,6 +15,7 @@ from app.modules.ai.engine_client import FlowEngineClient
 from app.modules.ai.enums import ActorRole
 
 if TYPE_CHECKING:
+    from app.modules.ai.github.checks import GitHubChecksClient
     from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 
 
@@ -55,6 +56,20 @@ def get_lifecycle_engine_client(
 def get_lifecycle_workflow_ids(request: Request) -> dict[str, uuid.UUID]:
     """Return the cached flow-engine workflow IDs (``{name: uuid}``)."""
     return getattr(request.app.state, "lifecycle_workflow_ids", {}) or {}
+
+
+def get_github_checks_client_dep(request: Request) -> GitHubChecksClient:
+    """Return the Checks client resolved at startup (App > PAT > Noop).
+
+    Fallback to a fresh ``NoopGitHubChecksClient`` if startup didn't run —
+    lets tests that bypass the lifespan still inject without crashing.
+    """
+    from app.modules.ai.github.checks import NoopGitHubChecksClient
+
+    client = getattr(request.app.state, "github_checks_client", None)
+    if client is None:
+        return NoopGitHubChecksClient()
+    return client
 
 
 def require_actor_role(

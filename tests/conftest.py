@@ -283,6 +283,25 @@ def webhook_signer(webhook_secret: str) -> Callable[[bytes], str]:
     return _sign
 
 
+@pytest.fixture(scope="session")
+def fake_rsa_pem() -> str:
+    """Generate a throwaway 2048-bit RSA PEM key (FEAT-007 tests).
+
+    Shared across ``tests/core`` and ``tests/modules/ai/github`` so tests
+    that exercise App-auth never touch a real GitHub credential.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return pem.decode()
+
+
 @pytest.fixture
 def stub_policy_factory() -> Callable[..., StubLLMProvider]:
     """Factory for scripted ``StubLLMProvider`` instances.

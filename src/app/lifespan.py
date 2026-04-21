@@ -89,6 +89,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # engine up still boot.
     await _bootstrap_lifecycle_workflows(app, session_factory)
 
+    # FEAT-007: resolve the GitHub Checks client (App > PAT > Noop).
+    _bootstrap_github_checks_client(app)
+
     try:
         yield
     finally:
@@ -98,8 +101,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await engine_client.aclose()
             except Exception:
                 logger.warning("lifecycle engine client close failed", exc_info=True)
+        github_http = getattr(app.state, "github_http_client", None)
+        if github_http is not None:
+            try:
+                await github_http.aclose()
+            except Exception:
+                logger.warning("github http client close failed", exc_info=True)
         await supervisor.shutdown(grace=5.0)
         logger.info("supervisor drained on shutdown")
+
+
+def _bootstrap_github_checks_client(app: FastAPI) -> None:
+    """Resolve the Checks client once and stash it on app state."""
+    from app.config import get_settings
+    from app.core.github import (
+        get_github_checks_client,
+        make_shared_http_client,
+        resolved_strategy,
+    )
+
+    http = make_shared_http_client()
+    client = get_github_checks_client(get_settings(), http)
+    app.state.github_http_client = http
+    app.state.github_checks_client = client
+    logger.info("github checks strategy: %s", resolved_strategy(client))
 
 
 async def _bootstrap_lifecycle_workflows(

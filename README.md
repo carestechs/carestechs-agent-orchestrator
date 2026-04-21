@@ -133,6 +133,61 @@ for the flow definition and
 [`docs/work-items/FEAT-005-lifecycle-agent.md`](docs/work-items/FEAT-005-lifecycle-agent.md)
 for the design.
 
+### GitHub Merge-Gating (FEAT-007)
+
+When credentials are configured, the orchestrator posts an
+`orchestrator/impl-review` GitHub check for every task PR and flips it to
+`success` or `failure` on review approve/reject. Paired with a branch
+protection rule requiring that check, reviewer approval becomes the merge
+gate — no second click on GitHub.
+
+**Credentials.** Configure exactly one strategy; the factory resolves
+`App > PAT > Noop`:
+
+```bash
+# Single-maintainer setups — simplest.
+export GITHUB_PAT=ghp_...            # classic PAT with `repo` scope
+
+# Multi-user orgs — GitHub App (Checks: write, Pull requests: read).
+export GITHUB_APP_ID=12345
+export GITHUB_PRIVATE_KEY=@file:/absolute/path/to/app.pem
+```
+
+`orchestrator doctor` prints the resolved strategy
+(`github_checks: Merge-gating: PAT` / `App (id …)` / `no-op`). No
+`GITHUB_REPO` is needed — the target repo is derived per task from the
+PR URL, so one credential covers every repo it has `repo` scope on.
+
+**Branch protection.** Under *GitHub → Settings → Rules → Rulesets* on
+`main`, enable:
+
+- ✅ *Require a pull request before merging*
+- ✅ *Require status checks to pass* → add **`orchestrator/impl-review`**
+- ✅ *Block force pushes*
+- ✅ *Restrict deletions*
+
+Leave the rest off (linear history, merge queue, deployments, signed
+commits, code scanning) — they're orthogonal to the gate.
+
+> **Gotcha:** the `orchestrator/impl-review` check only appears in the
+> status-check picker *after* the orchestrator has posted it at least
+> once. Open a throwaway PR, run it through `submit_implementation` +
+> `approve_review`, then add the check to the ruleset.
+
+**Known limits.**
+
+- *Force-merge bypass.* Admins with bypass permission can merge without
+  the gate. FEAT-006's audit trail records the approval, but FEAT-007
+  cannot prevent the merge itself.
+- *PR reopened after approval.* The check is not reset — if a reviewer
+  already approved, the old `success` check stays.
+- *Transient GitHub 5xx.* The state machine always commits first; a
+  failed check call logs a structured warning and moves on. Operators
+  see a trace entry; the PR's check may be stale.
+
+See [`docs/work-items/FEAT-007-github-merge-gating.md`](docs/work-items/FEAT-007-github-merge-gating.md)
+for the full design + acceptance criteria.
+
 ### Tests
 
 ```bash

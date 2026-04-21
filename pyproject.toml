@@ -24,6 +24,7 @@ dependencies = [
     "aiofiles>=23,<25",
     "jsonschema>=4,<5",
     "anthropic>=0.40,<1",
+    "pyjwt[crypto]>=2.9,<3",
 ]
 
 [project.scripts]

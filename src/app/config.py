@@ -94,8 +94,17 @@ class Settings(BaseSettings):
     # when False a `dev` other than the implementer is expected.
     solo_dev_mode: bool = True
 
-    # -- GitHub integration (FEAT-006) ------------------------------------
+    # -- GitHub integration (FEAT-006 webhook ingress + FEAT-007 merge gating) --
     github_webhook_secret: SecretStr | None = None
+
+    # FEAT-007: GitHub Checks API credentials.  Configure exactly one of
+    # ``github_pat`` (classic PAT with ``repo`` scope) OR the App pair
+    # (``github_app_id`` + ``github_private_key``).  When neither is set the
+    # Checks client resolves to a no-op — FEAT-006 endpoints keep working,
+    # they just don't flip a GitHub merge gate.
+    github_pat: SecretStr | None = None
+    github_app_id: str | None = None
+    github_private_key: SecretStr | None = None
 
     # -- Flow-engine lifecycle surface (FEAT-006 rc2) ---------------------
     # Points at the same flow engine as ``engine_base_url``; separate field
@@ -127,6 +136,30 @@ class Settings(BaseSettings):
             )
         if self.llm_model is None or not self.llm_model.strip():
             self.llm_model = "claude-opus-4-7"
+        return self
+
+    @model_validator(mode="after")
+    def _validate_github_credentials(self) -> Settings:
+        """Reject half-set App creds and "both PAT and App" configurations.
+
+        FEAT-007's factory resolves the Checks client in strict priority
+        order (App > PAT > Noop).  A misconfiguration here would silently
+        pick the wrong strategy, so we fail at construction instead.
+        """
+        has_pat = self.github_pat is not None
+        app_id = self.github_app_id
+        has_app_id = app_id is not None and app_id.strip() != ""
+        has_app_key = self.github_private_key is not None
+        has_app = has_app_id and has_app_key
+
+        if has_app_id != has_app_key:
+            raise ValueError(
+                "github_app_id and github_private_key must be configured together"
+            )
+        if has_pat and has_app:
+            raise ValueError(
+                "configure GITHUB_PAT or GITHUB_APP_ID+GITHUB_PRIVATE_KEY, not both"
+            )
         return self
 
     @classmethod
