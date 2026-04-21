@@ -18,14 +18,14 @@ import pytest
 import respx
 from fastapi import FastAPI
 from httpx import AsyncClient
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.modules.ai.dependencies import get_github_checks_client_dep
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.github.checks import NoopGitHubChecksClient
-from app.modules.ai.models import Task, WorkItem
+from app.modules.ai.models import Task
+from tests.integration._reactor_helpers import await_work_item_status
 
 pytestmark = pytest.mark.asyncio(loop_scope="function")
 
@@ -116,9 +116,7 @@ async def test_feat005_and_feat006_routes_together(
         assert "api.github.com" not in hosts
 
     # Final state sanity: approval fired W2, work item is in_progress.
-    wi = await db_session.scalar(
-        select(WorkItem).where(WorkItem.id == wi_id)
+    wi = await await_work_item_status(
+        db_session, wi_id, WorkItemStatus.IN_PROGRESS.value
     )
     assert wi is not None
-    await db_session.refresh(wi)
-    assert wi.status == WorkItemStatus.IN_PROGRESS.value

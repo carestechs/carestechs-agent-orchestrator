@@ -19,7 +19,8 @@ from app.core.github import get_github_checks_client, make_shared_http_client
 from app.modules.ai.dependencies import get_github_checks_client_dep
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.github.checks import NOOP_CHECK_ID, NoopGitHubChecksClient
-from app.modules.ai.models import Task, TaskImplementation, WorkItem
+from app.modules.ai.models import Task, TaskImplementation
+from tests.integration._reactor_helpers import await_work_item_status
 
 pytestmark = pytest.mark.asyncio(loop_scope="function")
 
@@ -161,10 +162,10 @@ async def test_full_lifecycle_without_github_credentials(
             assert r.status_code == 202, r.text
 
         # W5 derivation should now have fired (both tasks done, no third).
-        wi = await db_session.scalar(select(WorkItem).where(WorkItem.id == wi_id))
+        wi = await await_work_item_status(
+            db_session, wi_id, WorkItemStatus.READY.value
+        )
         assert wi is not None
-        await db_session.refresh(wi)
-        assert wi.status == WorkItemStatus.READY.value
 
         # S4 — close.
         r = await client.post(
