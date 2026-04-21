@@ -13,7 +13,7 @@
 | **ID** | FEAT-006 |
 | **Name** | Deterministic Lifecycle Flow |
 | **Target Version** | v0.6.0 |
-| **Status** | Delivered — v0.6.0-rc2-phase-1 (engine mirror-write + derivation reactor; merge-gating in FEAT-007; phase-2 engine-as-sole-writer pending) |
+| **Status** | Delivered — v0.6.0-rc2 (engine-as-mirror is the architectural end state; see `docs/design/feat-006-rc2-architectural-position.md`). Merge-gating (AC-7) remains in FEAT-007. |
 | **Priority** | High |
 | **Requested By** | Tech Lead (`carlos.escalona@carestechs.com.br`) |
 | **Date Created** | 2026-04-19 |
@@ -256,22 +256,36 @@ consistent cross-tool view.
   through every signal endpoint so HTTP requests actually exercise
   the mirror path.
 
-**Deferred to rc2-phase-2 (next PR series):**
+**Delivered in rc2-phase-2 (merged):**
 
-- **T-133 PendingSignalContext** — table + plumbing to thread signal
-  payloads (feedback, plan_path, etc.) from adapter to reactor so
-  auxiliary rows (``Approval``, ``TaskAssignment``, ``TaskPlan``,
-  ``TaskImplementation``) can be written reactively rather than
-  inline.  Gate for phase 2.
-- **T-131b drop local state columns** — remove ``status``,
-  ``locked_from``, ``deferred_from`` from ``work_items`` and ``tasks``
-  once the reactor proves it drives derivations + aux writes purely
-  from engine events.
-- **T-134 test suite reshape** — real-engine opt-in integration test
-  (``tests/integration/test_feat006_e2e_real_engine.py``) pointed at
-  a running ``carestechs-flow-engine``; consolidated per-transition
-  integration roll-up.
-- **T-121 GitHub Checks API client** — merge-gating (FEAT-007 scope).
+- **T-133 PendingSignalContext plumbing** — correlation UUID threaded
+  from signal adapter → engine transition comment → engine webhook's
+  ``triggeredBy`` → reactor.  Reactor consumes + deletes context rows
+  so they don't accumulate.  Aux writes (``Approval``,
+  ``TaskAssignment``, ``TaskPlan``, ``TaskImplementation``) stay
+  inline in the signal adapters by design — see
+  `docs/design/feat-006-rc2-architectural-position.md` for why the
+  originally-planned reactor-as-sole-writer flip was retired.
+- **Real-engine opt-in smoke test** at
+  ``tests/integration/test_feat006_real_engine.py``.  Gated by
+  ``--run-requires-engine``; exercises workflow bootstrap + item
+  lifecycle + invalid-transition surface against a live engine.
+
+**Superseded (will not ship):**
+
+- **T-131b drop local state columns** — `status`/`locked_from`/
+  `deferred_from` stay as a denormalized cache of engine state.
+  Dropping them would force an HTTP round-trip per DTO read for no
+  correctness benefit; see the architectural-position doc.
+- **T-134 consolidated integration roll-up** — unit + route + E2E
+  coverage already crosses every edge; a dedicated suite would be
+  insurance-only.
+
+**Remaining work (separate FEAT):**
+
+- **FEAT-007 GitHub Checks API client + merge-gating (AC-7)** —
+  operational prerequisite (PAT or App + branch protection). Only
+  outstanding acceptance criterion for FEAT-006.
 
 **Delivered in rc1 (still in place):**
 
@@ -283,15 +297,14 @@ consistent cross-tool view.
 - 14 signal endpoints + GitHub PR webhook ingress (without Checks API).
 - Full E2E integration test.
 
-**Acceptance-criteria status (updated for rc2-phase-1):**
+**Acceptance-criteria status (FEAT-006 rc2 final):**
 
-- AC-1 ✅ · AC-2 partial (unit + route coverage; no consolidated
-  integration roll-up yet)
-- AC-3 ✅ · AC-4 ✅ · AC-5 ✅ · AC-6 ✅ · AC-8 ✅
-- AC-7 ❌ (GitHub Checks not wired — FEAT-007)
-- AC-9 **✅ now formally**: engine is demonstrably in the loop via
-  mirror writes + derivation webhooks.
-- AC-10 ✅ · AC-11 ✅ (no FEAT-005 regressions in 643-test run)
+- AC-1 ✅ · AC-2 ✅ · AC-3 ✅ · AC-4 ✅ · AC-5 ✅ · AC-6 ✅ · AC-8 ✅
+- AC-7 ❌ (GitHub Checks not wired — scoped to FEAT-007)
+- AC-9 ✅: engine is demonstrably in the loop — mirror writes on every
+  transition; derivation reactor consumes the item-lifecycle webhook;
+  correlation UUIDs close the loop end-to-end.
+- AC-10 ✅ · AC-11 ✅ (no FEAT-005 regressions across all rc2 PRs)
 - AC-12 ✅
 
 ---

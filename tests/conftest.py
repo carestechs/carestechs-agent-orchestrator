@@ -78,17 +78,35 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Run tests marked @pytest.mark.live (hits real LLM/engine).",
     )
+    parser.addoption(
+        "--run-requires-engine",
+        action="store_true",
+        default=False,
+        help="Run tests marked @pytest.mark.requires_engine (hits a running flow-engine).",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "requires_engine: opt-in tests that require a running carestechs-flow-engine",
+    )
 
 
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    if config.getoption("--run-live"):
-        return
     skip_live = pytest.mark.skip(reason="live test: opt in with --run-live")
+    skip_engine = pytest.mark.skip(
+        reason="requires_engine: opt in with --run-requires-engine"
+    )
+    run_live = config.getoption("--run-live")
+    run_engine = config.getoption("--run-requires-engine")
     for item in items:
-        if "live" in item.keywords:
+        if "live" in item.keywords and not run_live:
             item.add_marker(skip_live)
+        if "requires_engine" in item.keywords and not run_engine:
+            item.add_marker(skip_engine)
 
 
 # ---------------------------------------------------------------------------

@@ -204,13 +204,17 @@ uv run ruff check .
 
 The test harness creates a unique `orchestrator_test_<uuid>` database per session and drops it at the end — safe to run alongside dev.
 
-Opt-in live smoke tests (off by default):
+**Opt-in live tests:**
 
 ```bash
-# FEAT-007: verify PAT scope + GitHub API shape against a scratch PR.
-export GITHUB_PAT=ghp_...
-export GITHUB_SMOKE_PR_URL=https://github.com/you/scratch/pull/1
-uv run pytest --run-live tests/contract/test_github_checks_live.py
+# Real Anthropic API (FEAT-003 contract test).
+ANTHROPIC_API_KEY=sk-... uv run pytest -m live --run-live
+
+# Real flow-engine (FEAT-006 rc2 smoke test).
+# Requires a running carestechs-flow-engine + a tenant API key.
+TEST_FLOW_ENGINE_BASE_URL=http://localhost:5000 \
+TEST_FLOW_ENGINE_TENANT_KEY=<tenant-key> \
+uv run pytest -m requires_engine --run-requires-engine
 ```
 
 ## Project Layout
