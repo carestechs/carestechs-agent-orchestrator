@@ -92,6 +92,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # FEAT-007: resolve the GitHub Checks client (App > PAT > Noop).
     _bootstrap_github_checks_client(app)
 
+    # FEAT-008/T-171: build the effector registry + exhaustiveness check.
+    _bootstrap_effector_registry(app)
+
     try:
         yield
     finally:
@@ -109,6 +112,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 logger.warning("github http client close failed", exc_info=True)
         await supervisor.shutdown(grace=5.0)
         logger.info("supervisor drained on shutdown")
+
+
+def _bootstrap_effector_registry(app: FastAPI) -> None:
+    """Build the effector registry, populate exemptions, validate coverage.
+
+    FEAT-008/T-171: every declared transition must have a registered
+    effector or a ``no_effector`` exemption with a ≥10-char reason. A
+    gap raises ``RuntimeError`` at startup with the uncovered transitions
+    listed — the failure message tells the developer exactly where to
+    add the registration or exemption.
+    """
+    from app.modules.ai.lifecycle.effectors.bootstrap import (
+        register_all_effectors,
+    )
+    from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
+    from app.modules.ai.lifecycle.effectors.validation import (
+        format_uncovered_error,
+        validate_effector_coverage,
+    )
+    from app.modules.ai.trace import get_trace_store
+
+    trace = get_trace_store()
+    registry = EffectorRegistry(trace=trace)
+    register_all_effectors(registry, trace=trace)
+
+    result = validate_effector_coverage(registry)
+    if result.uncovered:
+        raise RuntimeError(format_uncovered_error(result))
+
+    app.state.effector_registry = registry
+    logger.info(
+        "effector coverage: %d covered, %d exempt",
+        len(result.covered),
+        len(result.exempt),
+    )
 
 
 def _bootstrap_github_checks_client(app: FastAPI) -> None:
