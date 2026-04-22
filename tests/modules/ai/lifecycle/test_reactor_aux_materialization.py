@@ -103,7 +103,10 @@ async def test_engine_present_signal_writes_outbox_not_aux(
         github=None,
     )
     assert is_new
-    assert returned.status == TaskStatus.DONE.value
+    # FEAT-008/T-169: status stays at its pre-signal value until the
+    # reactor updates the cache on webhook arrival — stale-read window
+    # documented in the ADR.
+    assert returned.status == TaskStatus.IMPL_REVIEW.value
 
     approvals = await db_session.scalar(
         select(func.count())

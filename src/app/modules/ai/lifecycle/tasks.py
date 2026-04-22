@@ -222,7 +222,10 @@ async def approve_task(
         )
     # T4 is inline: approved -> assigning without a separate hop.  Mirror
     # both states to the engine so the audit shows the double hop.
-    task.status = TaskStatus.ASSIGNING.value
+    # FEAT-008/T-169: status write is reactor-managed under engine-present;
+    # the inline write here is the engine-absent fallback.
+    if engine is None:
+        task.status = TaskStatus.ASSIGNING.value
     await db.flush()
     await _mirror_to_engine(
         task, TaskStatus.APPROVED, engine=engine, correlation_id=correlation_id, actor=actor
@@ -311,7 +314,8 @@ async def assign_task(
             assigned_by=assigned_by,
         )
         db.add(assignment)
-    task.status = TaskStatus.PLANNING.value
+    if engine is None:
+        task.status = TaskStatus.PLANNING.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -347,7 +351,8 @@ async def submit_plan(
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.PLANNING.value:
         raise _forbidden(task, TaskStatus.PLAN_REVIEW.value)
-    task.status = TaskStatus.PLAN_REVIEW.value
+    if engine is None:
+        task.status = TaskStatus.PLAN_REVIEW.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -408,7 +413,8 @@ async def approve_plan(
             decided_by_role=actor_role,
             feedback=None,
         )
-    task.status = TaskStatus.IMPLEMENTING.value
+    if engine is None:
+        task.status = TaskStatus.IMPLEMENTING.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -447,7 +453,8 @@ async def reject_plan(
         decided_by_role=actor_role,
         feedback=feedback,
     )
-    task.status = TaskStatus.PLANNING.value
+    if engine is None:
+        task.status = TaskStatus.PLANNING.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -477,7 +484,8 @@ async def submit_implementation(
     task = await _load_locked(db, task_id)
     if task.status != TaskStatus.IMPLEMENTING.value:
         raise _forbidden(task, TaskStatus.IMPL_REVIEW.value)
-    task.status = TaskStatus.IMPL_REVIEW.value
+    if engine is None:
+        task.status = TaskStatus.IMPL_REVIEW.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -521,7 +529,8 @@ async def approve_review(
             decided_by_role=actor_role,
             feedback=None,
         )
-    task.status = TaskStatus.DONE.value
+    if engine is None:
+        task.status = TaskStatus.DONE.value
     await db.flush()
     await _mirror_to_engine(
         task, TaskStatus.DONE, engine=engine, correlation_id=correlation_id, actor=actor
@@ -556,7 +565,8 @@ async def reject_review(
         decided_by_role=actor_role,
         feedback=feedback,
     )
-    task.status = TaskStatus.IMPLEMENTING.value
+    if engine is None:
+        task.status = TaskStatus.IMPLEMENTING.value
     await db.flush()
     await _mirror_to_engine(
         task,
@@ -592,7 +602,8 @@ async def defer_task(
     if task.status in _TERMINAL:
         raise _forbidden(task, TaskStatus.DEFERRED.value)
     task.deferred_from = task.status
-    task.status = TaskStatus.DEFERRED.value
+    if engine is None:
+        task.status = TaskStatus.DEFERRED.value
     await db.flush()
     await _mirror_to_engine(
         task,
