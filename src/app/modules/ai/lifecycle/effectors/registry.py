@@ -45,6 +45,70 @@ def build_transition_key(
     return f"{entity_type}:{from_state}->{to_state}"
 
 
+async def dispatch_effector(
+    effector: Effector,
+    ctx: EffectorContext,
+    trace: TraceStore,
+) -> EffectorResult:
+    """Fire a single effector, emit its ``effector_call`` trace, and return.
+
+    Mirrors :meth:`EffectorRegistry.fire_all`'s per-effector firing loop
+    for call sites that need to dispatch an effector constructed on-the-fly
+    (e.g. a signal adapter that pulls the GitHub client from per-request
+    DI and can't register permanently at lifespan). Guarantees the same
+    trace shape as the registry, so observability stays uniform.
+
+    :class:`~app.core.exceptions.ValidationError` is re-raised unchanged —
+    it signals a caller-data defect (e.g. malformed PR URL) that the
+    FastAPI handler maps to 400. Every other exception is captured as
+    an ``error`` result so the rest of the signal flow is not disturbed.
+    """
+    from app.core.exceptions import ValidationError
+
+    start = time.monotonic()
+    try:
+        result = await effector.fire(ctx)
+    except ValidationError:
+        raise
+    except Exception as exc:
+        result = EffectorResult(
+            effector_name=effector.name,
+            status="error",
+            duration_ms=int((time.monotonic() - start) * 1000),
+            error_code="effector-exception",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        logger.exception(
+            "effector raised",
+            extra={
+                "effector": effector.name,
+                "entity_id": str(ctx.entity_id),
+            },
+        )
+    dto = EffectorCallDto(
+        effector_name=result.effector_name,
+        entity_type=ctx.entity_type,
+        entity_id=ctx.entity_id,
+        transition=ctx.transition,
+        status=result.status,
+        duration_ms=result.duration_ms,
+        error_code=result.error_code,
+        detail=result.detail,
+        emitted_at=datetime.now(UTC),
+    )
+    try:
+        await trace.record_effector_call(ctx.entity_id, dto)
+    except Exception:
+        logger.exception(
+            "effector trace emit failed",
+            extra={
+                "effector": result.effector_name,
+                "entity_id": str(ctx.entity_id),
+            },
+        )
+    return result
+
+
 class EffectorRegistry:
     """In-process registry + dispatcher for lifecycle effectors."""
 
