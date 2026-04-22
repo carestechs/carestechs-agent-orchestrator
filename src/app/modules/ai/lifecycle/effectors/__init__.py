@@ -28,6 +28,7 @@ from app.modules.ai.lifecycle.effectors.context import (
 from app.modules.ai.lifecycle.effectors.registry import (
     EffectorRegistry,
     build_transition_key,
+    dispatch_effector,
 )
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "EffectorResult",
     "EffectorStatus",
     "build_transition_key",
+    "dispatch_effector",
     "iter_no_effector_exemptions",
     "no_effector",
 ]
