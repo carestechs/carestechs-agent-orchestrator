@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import logging
 
+from app.modules.ai.lifecycle.effectors.assignment import (
+    RequestAssignmentEffector,
+)
 from app.modules.ai.lifecycle.effectors.base import no_effector
 from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
 from app.modules.ai.trace import TraceStore
@@ -68,11 +71,21 @@ def register_all_effectors(
     this function, and reflecting real state is cheaper than making it
     re-entrant.
     """
-    del registry, trace  # no permanent registrations in v1; see module doc
-
+    _register_permanent_effectors(registry)
     _register_work_item_exemptions()
     _register_task_exemptions()
-    logger.info("effector bootstrap: no permanent registrations; exemptions recorded")
+    logger.info(
+        "effector bootstrap: %d key(s) registered, exemptions recorded",
+        len(registry.registered_keys()),
+    )
+    del trace  # retained by the registry already
+
+
+def _register_permanent_effectors(registry: EffectorRegistry) -> None:
+    # T4 entry (approved → assigning): structured log naming the task that
+    # needs an assignee. Pluggable transport — future Slack / email
+    # effectors register against the same key.
+    registry.register("task:entry:assigning", RequestAssignmentEffector())
 
 
 def _register_work_item_exemptions() -> None:
@@ -94,13 +107,8 @@ def _register_task_exemptions() -> None:
     # T2 — approve: ingress; the follow-up T4 (approved→assigning) carries the
     # assignment-request effector (T-163 once registered). Until then, exempt.
     no_effector("task:proposed->approved", _INGRESS_ONLY)
-    # T4 — approved→assigning: the assignment-request effector lands in T-163.
-    # Until then, the admin-driven assign signal is the actual outbound.
-    no_effector(
-        "task:approved->assigning",
-        "exempt until T-163 registers the request-assignment effector; "
-        "today the admin assign signal is the outbound surface",
-    )
+    # T4 — approved→assigning: covered by the RequestAssignmentEffector
+    # registered on task:entry:assigning (T-163).
     # T5 — assign (assigning→planning): the signal itself is the action; no
     # downstream notification effector in v1.
     no_effector("task:assigning->planning", _ADMIN_ONLY_NO_EXTERNAL)
