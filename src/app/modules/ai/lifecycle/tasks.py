@@ -601,7 +601,6 @@ async def defer_task(
     task = await _load_locked(db, task_id)
     if task.status in _TERMINAL:
         raise _forbidden(task, TaskStatus.DEFERRED.value)
-    task.deferred_from = task.status
     if engine is None:
         task.status = TaskStatus.DEFERRED.value
     await db.flush()

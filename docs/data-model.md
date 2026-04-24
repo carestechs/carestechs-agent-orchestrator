@@ -207,7 +207,6 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | title | text | Required | Human-readable title. |
 | source_path | text | Nullable | Path to the originating markdown brief, if any. |
 | status | enum `WorkItemStatus` | Required, default `open` | See enum. |
-| locked_from | enum `WorkItemStatus` | Nullable | State active before a lock (always `in_progress` in v1). |
 | opened_by | text | Required | Actor id (admin) who opened the work item. |
 | closed_at | timestamptz | Nullable | Set when `status=closed`. |
 | closed_by | text | Nullable | Admin who closed the work item. |
@@ -222,7 +221,7 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 - `status` transitions: `open → in_progress → ready → closed`, plus `in_progress ⇄ locked`. Any other transition is rejected at the service layer.
 - `in_progress` is derived from child-task state (first task approved). `ready` is derived from "all child tasks in a terminal state (`done` or `deferred`)". Both derivations fire idempotently.
 - `closed_at` and `closed_by` are set together or neither.
-- `locked_from` is set on lock, cleared on unlock.
+- Lock/unlock is an in_progress ⇄ locked round-trip; prior-state tracking is owned by the flow engine's transition history (FEAT-008/T-168 dropped the local `locked_from` cache).
 - Closing from any state other than `ready` returns `409 Conflict`.
 
 ---
@@ -240,7 +239,6 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | status | enum `TaskStatus` | Required, default `proposed` | See enum. |
 | proposer_type | enum `ActorType` | Required | `admin`, `agent` (who drafted the task). |
 | proposer_id | text | Required | Actor id (e.g., admin id or agent ref). |
-| deferred_from | enum `TaskStatus` | Nullable | State active before deferral. Audit. |
 | created_at | timestamptz | Required, Auto | Record creation timestamp. |
 | updated_at | timestamptz | Required, Auto | Last state change. |
 
@@ -251,7 +249,7 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 **Business Rules:**
 - `status` transitions are enforced at the service layer. Allowed forward edges: `proposed → approved → assigning → planning → plan_review → implementing → impl_review → done`. Allowed rejection edges: `plan_review → planning`, `impl_review → implementing`, `proposed → proposed` (revision). Allowed deferral edge: any non-terminal → `deferred` (admin only).
 - Rejection iterations are unbounded in v1; iteration count is reconstructable from the `Approval` table.
-- `deferred_from` is set on transition to `deferred` and never cleared; `deferred` is terminal for the W5 derivation.
+- Deferral is terminal for the W5 derivation; prior-state tracking is owned by the flow engine's transition history (FEAT-008/T-168 dropped the local `deferred_from` cache).
 - Assignment history is tracked in `TaskAssignment`, not on this entity; querying "current assignee" uses the latest `TaskAssignment` row for the task.
 
 ---
@@ -409,7 +407,7 @@ None — single-module project in v1.
 
 ### WorkItemStatus
 
-> *Used by: `WorkItem.status`, `WorkItem.locked_from` — introduced by FEAT-006.*
+> *Used by: `WorkItem.status` — introduced by FEAT-006.*
 
 | Value | Description |
 |-------|-------------|
@@ -421,7 +419,7 @@ None — single-module project in v1.
 
 ### TaskStatus
 
-> *Used by: `Task.status`, `Task.deferred_from` — introduced by FEAT-006.*
+> *Used by: `Task.status` — introduced by FEAT-006.*
 
 | Value | Description |
 |-------|-------------|
@@ -503,6 +501,7 @@ None — single-module project in v1.
 
 ## Changelog
 
+- 2026-04-24 — FEAT-008/T-168 — Dropped `WorkItem.locked_from` and `Task.deferred_from`. Under engine-as-authority (FEAT-008), prior-state tracking is owned by the flow engine's transition history. Migration `a1e4d58c9033` drops both columns; pre-flight fails loudly on currently-locked or deferred rows so operators resolve before upgrading. WorkItem unlock always returns to `in_progress` (v1 invariant: lock only reachable from `in_progress`).
 - 2026-04-19 — FEAT-006 rc2-phase-1 — `WorkItem` and `Task` gained a nullable `engine_item_id uuid UNIQUE` column pointing at the flow-engine item that mirrors the orchestrator row. New `EngineWorkflow` table caches the engine's workflow IDs (PK `name`, `engine_workflow_id`). `WebhookEventType` extended with `lifecycle_item_transitioned` to cover inbound engine state-change events; `WebhookEvent.run_id` is now nullable (GitHub + lifecycle webhooks correlate to tasks / items, not runs). Engine is the shared cross-tool view of state; orchestrator remains the authoritative writer in phase 1. Phase 2 will drop the local `status`/`locked_from`/`deferred_from` columns once the webhook reactor proves it can drive derivations purely from engine events.
 - 2026-04-19 — FEAT-006 — Added `WorkItem`, `Task`, `TaskAssignment`, `Approval` entities for the deterministic lifecycle flow. Added enums `WorkItemType`, `WorkItemStatus`, `TaskStatus`, `ActorType`, `ActorRole`, `AssigneeType`, `ApprovalStage`, `ApprovalDecision`, and `WebhookSource`. Extended `WebhookEvent` with a `source` column (`engine` default; `github` for GitHub PR webhooks) and added `github_pr_opened` / `github_pr_closed` values to `WebhookEventType`. Derived transitions (W2, W5, T4) documented as orchestrator-internal; the flow engine remains logic-free per AD-1.
 - 2026-04-18 — FEAT-005 — Added `RunSignal` entity (operator-injected signals, unique `dedupe_key` derived from `(run_id, name, task_id)`, persist-first-then-wake contract). Noted that lifecycle-agent steps legitimately have `engine_run_id=NULL` (local-tool path — no engine dispatch).

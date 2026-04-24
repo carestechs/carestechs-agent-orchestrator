@@ -255,7 +255,6 @@ class WorkItemDto(BaseModel):
     title: str
     source_path: str | None = None
     status: WorkItemStatus
-    locked_from: WorkItemStatus | None = None
     opened_by: str
     closed_at: datetime | None = None
     closed_by: str | None = None
@@ -297,7 +296,6 @@ class TaskDto(BaseModel):
     status: TaskStatus
     proposer_type: ActorType
     proposer_id: str
-    deferred_from: TaskStatus | None = None
     current_assignment: TaskAssignmentDto | None = None
     created_at: datetime
     updated_at: datetime

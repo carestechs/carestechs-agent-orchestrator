@@ -122,7 +122,6 @@ class TestLockUnlock:
         self, client: AsyncClient, api_key: str, db_session: AsyncSession
     ) -> None:
         wi = await _seed_wi(db_session, status=WorkItemStatus.LOCKED)
-        wi.locked_from = WorkItemStatus.IN_PROGRESS.value
         await db_session.commit()
         resp = await client.post(
             f"/api/v1/work-items/{wi.id}/unlock",

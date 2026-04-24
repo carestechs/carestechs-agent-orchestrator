@@ -777,7 +777,6 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | title | string | No | Human-readable title |
 | sourcePath | string | Yes | Path to originating markdown brief |
 | status | enum `WorkItemStatus` | No | Current state |
-| lockedFrom | enum `WorkItemStatus` | Yes | State active before lock |
 | openedBy | string | No | Admin actor id |
 | closedAt | timestamptz | Yes | Set when `status=closed` |
 | closedBy | string | Yes | Admin who closed |
@@ -795,7 +794,6 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | status | enum `TaskStatus` | No | Current state |
 | proposerType | enum `ActorType` | No | `admin`, `agent` |
 | proposerId | string | No | Actor id who proposed |
-| deferredFrom | enum `TaskStatus` | Yes | State prior to deferral |
 | currentAssignment | object `TaskAssignmentDto` | Yes | Active assignment, if any |
 | createdAt | timestamptz | No | Record creation |
 | updatedAt | timestamptz | No | Last state change |
@@ -884,6 +882,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-04-24 — FEAT-008/T-168 — `WorkItemDto` drops `lockedFrom`; `TaskDto` drops `deferredFrom`. Prior-state tracking moved to the flow engine's transition history under engine-as-authority.
 - 2026-04-19 — FEAT-006 rc2-phase-1 — New `POST /hooks/engine/lifecycle/item-transitioned` webhook receives state-change events from the flow engine when an item transitions. Signature verification via new `require_flow_engine_signature` dependency (`X-FlowEngine-Signature: sha256=<hex>`, keyed by `ENGINE_WEBHOOK_SECRET`). Bad signatures persist the event with `signatureOk=false` and return 401. On valid delivery the orchestrator persists a `WebhookEvent(source='engine', event_type='lifecycle_item_transitioned')` and dispatches derivations (W2 on task→approved; W5 on task→done/deferred). Idempotent on `lifecycle:<itemId>:<deliveryId>`. Body mirrors the engine's `item.transitioned` webhook shape (`deliveryId`, `eventType`, `tenantId`, `workflowId`, `itemId`, `timestamp`, `data: {fromStatus, toStatus, triggeredBy}`).
 - 2026-04-19 — FEAT-006 — Added 14 lifecycle-flow signal endpoints (S1-S14) across `/api/v1/work-items/...` and `/api/v1/tasks/...` and a GitHub PR webhook at `/hooks/github/pr`. All signal endpoints are idempotent, return `202 Accepted`, and require `X-Actor-Role: admin | dev` as declared on each endpoint (v1 is self-asserted; proper per-user auth is a follow-up). Added `WorkItemDto`, `TaskDto`, `TaskAssignmentDto`, `ApprovalDto` under Shared DTOs. GitHub webhook uses `X-Hub-Signature-256` with `GITHUB_WEBHOOK_SECRET`; missing/invalid signature → `401`, event persisted with `signatureOk=false`.
 - 2026-04-18 — FEAT-005 — `POST /runs/{id}/signals` is live: operator-injected signals (v1: `name="implementation-complete"`), persist-first-then-wake, idempotent on `(run_id, name, task_id)`. Added `RunSignalDto` under Shared DTOs. Trace stream surfaces a new `kind=operator_signal` entry (filterable via `?kind=operator_signal`).
