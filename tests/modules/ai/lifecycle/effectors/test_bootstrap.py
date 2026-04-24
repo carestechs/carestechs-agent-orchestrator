@@ -35,3 +35,8 @@ def _boot() -> EffectorRegistry:
 def test_request_assignment_registered_on_entry_assigning() -> None:
     reg = _boot()
     assert "task:entry:assigning" in reg.registered_keys()
+
+
+def test_generate_tasks_registered_on_work_item_entry_open() -> None:
+    reg = _boot()
+    assert "work_item:entry:open" in reg.registered_keys()

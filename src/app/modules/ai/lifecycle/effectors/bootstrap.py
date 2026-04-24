@@ -25,6 +25,9 @@ from app.modules.ai.lifecycle.effectors.assignment import (
 )
 from app.modules.ai.lifecycle.effectors.base import no_effector
 from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
+from app.modules.ai.lifecycle.effectors.task_generation import (
+    GenerateTasksEffector,
+)
 from app.modules.ai.trace import TraceStore
 
 logger = logging.getLogger(__name__)
@@ -42,9 +45,7 @@ _INGRESS_ONLY = (
     "ingress-only transition — the signal itself is the outbound effect, "
     "downstream transitions own the user-visible side effects"
 )
-_TERMINAL_STATE = (
-    "terminal state; post-completion notification surfaces are a separate FEAT"
-)
+_TERMINAL_STATE = "terminal state; post-completion notification surfaces are a separate FEAT"
 _ADMIN_ONLY_NO_EXTERNAL = (
     "admin-only transition with no external side effect in v1; "
     "future Slack/audit effector can replace this exemption"
@@ -86,6 +87,10 @@ def _register_permanent_effectors(registry: EffectorRegistry) -> None:
     # needs an assignee. Pluggable transport — future Slack / email
     # effectors register against the same key.
     registry.register("task:entry:assigning", RequestAssignmentEffector())
+    # S1 entry (work-item creation): deterministic seed-task generator.
+    # Fires on ``work_item:entry:open``; an LLM-backed generator replaces
+    # this under the same key when it lands.
+    registry.register("work_item:entry:open", GenerateTasksEffector())
 
 
 def _register_work_item_exemptions() -> None:

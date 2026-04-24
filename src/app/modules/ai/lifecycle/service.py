@@ -34,6 +34,9 @@ from app.modules.ai.lifecycle.effectors.github import (
     GitHubCheckCreateEffector,
     GitHubCheckUpdateEffector,
 )
+from app.modules.ai.lifecycle.effectors.task_generation import (
+    GenerateTasksEffector,
+)
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
     PendingAuxWrite,
@@ -99,10 +102,7 @@ async def _dispatch_github_check_update(
     T10 / T11 target states differ (``done`` vs ``implementing``); the
     effector is constructed with the right conclusion per caller.
     """
-    to_state = (
-        TaskStatus.DONE.value if conclusion == "success"
-        else TaskStatus.IMPLEMENTING.value
-    )
+    to_state = TaskStatus.DONE.value if conclusion == "success" else TaskStatus.IMPLEMENTING.value
     transition = "T10" if conclusion == "success" else "T11"
     effector = GitHubCheckUpdateEffector(github=github, conclusion=conclusion)
     ctx = EffectorContext(
@@ -182,19 +182,26 @@ async def _reload_work_item(db: AsyncSession, work_item_id: uuid.UUID) -> WorkIt
 # ---------------------------------------------------------------------------
 
 
-async def dispatch_task_generation(work_item: WorkItem) -> None:
-    """Placeholder seam for future agent-driven task generation.
+async def _dispatch_task_generation(db: AsyncSession, *, work_item_id: uuid.UUID) -> None:
+    """Fire the GenerateTasksEffector for a freshly-opened work item.
 
-    The follow-up FEAT wires a specific task-generation agent here; in v1
-    opening a work item only records the intent.
+    FEAT-008/T-164: replaces the log-only ``dispatch_task_generation``
+    stub. Runs deterministically (no LLM, no brief parsing); an
+    LLM-backed generator will replace this under the same registry key
+    (``work_item:entry:open``) when it lands.
     """
-    import logging
-
-    logging.getLogger(__name__).info(
-        "task-generation dispatched for work_item %s (%s)",
-        work_item.id,
-        work_item.external_ref,
+    effector = GenerateTasksEffector()
+    ctx = EffectorContext(
+        entity_type="work_item",
+        entity_id=work_item_id,
+        from_state=None,
+        to_state="open",
+        transition="S1",
+        correlation_id=None,
+        db=db,
+        settings=get_settings(),
     )
+    await dispatch_effector(effector, ctx, get_trace_store())
 
 
 async def open_work_item_signal(
@@ -220,14 +227,10 @@ async def open_work_item_signal(
     }
     sentinel_id = uuid.uuid5(uuid.NAMESPACE_OID, f"work-item:{external_ref}")
     key = idempotency.compute_signal_key(sentinel_id, "open-work-item", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=sentinel_id, signal_name="open-work-item"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=sentinel_id, signal_name="open-work-item")
 
     if not is_new:
-        existing = await db.scalar(
-            select(WorkItem).where(WorkItem.external_ref == external_ref)
-        )
+        existing = await db.scalar(select(WorkItem).where(WorkItem.external_ref == external_ref))
         if existing is None:
             # Extremely unlikely: key recorded but row absent.  Treat as new.
             is_new = True
@@ -245,7 +248,7 @@ async def open_work_item_signal(
         engine_workflow_id=engine_workflow_id,
     )
     await db.commit()
-    await dispatch_task_generation(wi)
+    await _dispatch_task_generation(db, work_item_id=wi.id)
     return wi, True
 
 
@@ -273,9 +276,7 @@ async def _guarded_work_item_signal(
     current WorkItem row — the entity is the caller's source of truth.
     """
     key = idempotency.compute_signal_key(work_item_id, signal_name, payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=work_item_id, signal_name=signal_name
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=work_item_id, signal_name=signal_name)
     if not is_new:
         return await _reload_work_item(db, work_item_id), False
 
@@ -375,9 +376,7 @@ async def approve_task_signal(
     approved task in a work item.
     """
     key = idempotency.compute_signal_key(task_id, "approve-task", {})
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="approve-task"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="approve-task")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -425,9 +424,7 @@ async def reject_task_signal(
     """S6: admin rejects a proposed task with non-empty feedback."""
     payload = {"feedback": feedback}
     key = idempotency.compute_signal_key(task_id, "reject-task", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="reject-task"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="reject-task")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -440,9 +437,7 @@ async def reject_task_signal(
         signal_name="reject-task",
         payload={"taskId": str(task_id), "feedback": feedback},
     )
-    task = await tasks.reject_task_proposal(
-        db, task_id, actor=actor, feedback=feedback
-    )
+    task = await tasks.reject_task_proposal(db, task_id, actor=actor, feedback=feedback)
     await db.commit()
     return task, True
 
@@ -469,9 +464,7 @@ async def assign_task_signal(
         "assigneeId": assignee_id,
     }
     key = idempotency.compute_signal_key(task_id, "assign-task", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="assign-task"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="assign-task")
     if not is_new:
         task = await _reload_task(db, task_id)
         # Replay path may legitimately see no active assignment row under
@@ -538,9 +531,7 @@ async def defer_task_signal(
     """S14: admin defers a non-terminal task.  Fires W5 derivation."""
     payload = {"reason": reason}
     key = idempotency.compute_signal_key(task_id, "defer-task", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="defer-task"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="defer-task")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -549,9 +540,7 @@ async def defer_task_signal(
         signal_name="defer-task",
         payload={"taskId": str(task_id), "reason": reason},
     )
-    task = await tasks.defer_task(
-        db, task_id, actor=actor, reason=reason, engine=engine, correlation_id=corr
-    )
+    task = await tasks.defer_task(db, task_id, actor=actor, reason=reason, engine=engine, correlation_id=corr)
     await work_items.maybe_advance_to_ready(db, task.work_item_id, engine=engine)
     await db.commit()
     return task, True
@@ -574,9 +563,7 @@ async def submit_plan_signal(
     """S8: submit a plan.  Inserts a ``TaskPlan`` row and advances state."""
     payload = {"planPath": plan_path, "planSha": plan_sha}
     key = idempotency.compute_signal_key(task_id, "submit-plan", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="submit-plan"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="submit-plan")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -590,9 +577,7 @@ async def submit_plan_signal(
             "submittedBy": actor,
         },
     )
-    task = await tasks.submit_plan(
-        db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
-    )
+    task = await tasks.submit_plan(db, task_id, submitted_by=actor, engine=engine, correlation_id=corr)
     if engine is not None:
         _enqueue_aux(
             db,
@@ -635,12 +620,8 @@ async def approve_plan_signal(
     matrix-mismatch 409 (wrong role) with the *correct* role is not
     short-circuited by the first attempt.
     """
-    key = idempotency.compute_signal_key(
-        task_id, "approve-plan", {"actorRole": actor_role.value}
-    )
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="approve-plan"
-    )
+    key = idempotency.compute_signal_key(task_id, "approve-plan", {"actorRole": actor_role.value})
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="approve-plan")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -695,9 +676,7 @@ async def reject_plan_signal(
     """S10: reject plan with feedback."""
     payload = {"feedback": feedback, "actorRole": actor_role.value}
     key = idempotency.compute_signal_key(task_id, "reject-plan", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="reject-plan"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="reject-plan")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -748,9 +727,7 @@ async def submit_implementation_signal(
     """
     payload = {"prUrl": pr_url, "commitSha": commit_sha, "summary": summary}
     key = idempotency.compute_signal_key(task_id, "submit-implementation", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="submit-implementation"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="submit-implementation")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -764,9 +741,7 @@ async def submit_implementation_signal(
             "summary": summary,
         },
     )
-    task = await tasks.submit_implementation(
-        db, task_id, submitted_by=actor, engine=engine, correlation_id=corr
-    )
+    task = await tasks.submit_implementation(db, task_id, submitted_by=actor, engine=engine, correlation_id=corr)
     if engine is not None:
         _enqueue_aux(
             db,
@@ -816,12 +791,8 @@ async def approve_review_signal(
     github: GitHubChecksClient | None = None,
 ) -> tuple[Task, bool]:
     """S12: approve implementation review; fires W5."""
-    key = idempotency.compute_signal_key(
-        task_id, "approve-review", {"actorRole": actor_role.value}
-    )
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="approve-review"
-    )
+    key = idempotency.compute_signal_key(task_id, "approve-review", {"actorRole": actor_role.value})
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="approve-review")
     if not is_new:
         return await _reload_task(db, task_id), False
 
@@ -888,9 +859,7 @@ async def reject_review_signal(
     """S13: reject implementation review with feedback."""
     payload = {"feedback": feedback, "actorRole": actor_role.value}
     key = idempotency.compute_signal_key(task_id, "reject-review", payload)
-    is_new, _ = await idempotency.check_and_record(
-        db, key=key, entity_id=task_id, signal_name="reject-review"
-    )
+    is_new, _ = await idempotency.check_and_record(db, key=key, entity_id=task_id, signal_name="reject-review")
     if not is_new:
         return await _reload_task(db, task_id), False
 

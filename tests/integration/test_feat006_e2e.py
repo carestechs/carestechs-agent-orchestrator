@@ -6,6 +6,8 @@ against real Postgres.  Verifies final state + audit counts.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -25,27 +27,8 @@ def _h(api_key: str, role: str = "admin") -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "X-Actor-Role": role}
 
 
-async def _seed_task(
-    db: AsyncSession, work_item_id, ref: str, *, title: str = "task"
-) -> Task:
-    t = Task(
-        work_item_id=work_item_id,
-        external_ref=ref,
-        title=title,
-        status=TaskStatus.PROPOSED.value,
-        proposer_type="admin",
-        proposer_id="admin",
-    )
-    db.add(t)
-    await db.commit()
-    await db.refresh(t)
-    return t
-
-
-async def test_feat006_full_lifecycle(
-    client: AsyncClient, api_key: str, db_session: AsyncSession
-) -> None:
-    # S1 — open work item
+async def test_feat006_full_lifecycle(client: AsyncClient, api_key: str, db_session: AsyncSession) -> None:
+    # S1 — open work item (task-generation effector seeds 3 FEAT-scaffold tasks)
     r = await client.post(
         "/api/v1/work-items",
         json={"externalRef": "FEAT-E2E", "type": "FEAT", "title": "E2E"},
@@ -54,10 +37,12 @@ async def test_feat006_full_lifecycle(
     assert r.status_code == 202, r.text
     wi_id = r.json()["data"]["id"]
 
-    # Seed tasks directly (task-generation is a stub in v1).
-    task_a = await _seed_task(db_session, wi_id, "T-a", title="A")
-    task_b = await _seed_task(db_session, wi_id, "T-b", title="B")
-    task_c = await _seed_task(db_session, wi_id, "T-c", title="C (will defer)")
+    # FEAT-008/T-164: tasks are now effector-generated on open.
+    generated = list(
+        await db_session.scalars(select(Task).where(Task.work_item_id == uuid.UUID(wi_id)).order_by(Task.external_ref))
+    )
+    assert len(generated) == 3, [t.external_ref for t in generated]
+    task_a, task_b, task_c = generated
 
     # S5 — approve A (fires T4 + W2)
     r = await client.post(
@@ -68,9 +53,7 @@ async def test_feat006_full_lifecycle(
     assert r.status_code == 202
 
     # Verify W2 fired.
-    wi = await await_work_item_status(
-        db_session, wi_id, WorkItemStatus.IN_PROGRESS.value
-    )
+    wi = await await_work_item_status(db_session, wi_id, WorkItemStatus.IN_PROGRESS.value)
     assert wi is not None
 
     # S6 — reject B, then re-approve (rejection doesn't advance)
@@ -209,9 +192,7 @@ async def test_feat006_full_lifecycle(
     await await_task_status(db_session, task_c.id, TaskStatus.DEFERRED.value)
 
     # Assignment counts.
-    assignments = (
-        await db_session.scalars(select(TaskAssignment))
-    ).all()
+    assignments = (await db_session.scalars(select(TaskAssignment))).all()
     assert len([a for a in assignments if a.superseded_at is None]) == 2
 
     # Approval audit — at minimum: 2 approve(proposed), 1 reject(proposed),
