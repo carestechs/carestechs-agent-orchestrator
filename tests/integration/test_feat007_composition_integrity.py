@@ -44,6 +44,20 @@ def force_solo_dev_and_noop_github(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
 
 
+async def _defer_generated_tasks(client: AsyncClient, api_key: str, db: AsyncSession, wi_id: str) -> None:
+    """Defer every auto-generated scaffold task (FEAT-008/T-164)."""
+    import uuid as _uuid
+
+    rows = list(await db.scalars(select(Task).where(Task.work_item_id == _uuid.UUID(wi_id))))
+    for row in rows:
+        r = await client.post(
+            f"/api/v1/tasks/{row.id}/defer",
+            json={"reason": "out of scope for this test"},
+            headers=_h(api_key),
+        )
+        assert r.status_code == 202, r.text
+
+
 async def _seed_task(db: AsyncSession, work_item_id, ref: str) -> Task:
     t = Task(
         work_item_id=work_item_id,
@@ -62,9 +76,7 @@ async def _seed_task(db: AsyncSession, work_item_id, ref: str) -> Task:
 async def test_full_lifecycle_without_github_credentials(
     app: FastAPI, client: AsyncClient, api_key: str, db_session: AsyncSession
 ) -> None:
-    app.dependency_overrides[get_github_checks_client_dep] = (
-        lambda: NoopGitHubChecksClient()
-    )
+    app.dependency_overrides[get_github_checks_client_dep] = lambda: NoopGitHubChecksClient()
 
     # Compile-time guarantee: the factory over a no-credential Settings
     # yields the no-op client.  Tighter than "lifespan happens to set
@@ -84,9 +96,7 @@ async def test_full_lifecycle_without_github_credentials(
 
     with respx.mock(assert_all_called=False) as mock:
         mock.route(host="api.github.com").mock(
-            side_effect=AssertionError(
-                "composition-integrity: GitHub must not be called"
-            )
+            side_effect=AssertionError("composition-integrity: GitHub must not be called")
         )
 
         # S1 — open work item, seed two tasks.
@@ -97,6 +107,12 @@ async def test_full_lifecycle_without_github_credentials(
         )
         assert r.status_code == 202, r.text
         wi_id = r.json()["data"]["id"]
+
+        # FEAT-008/T-164: opening the work item fires the task-generation
+        # effector (3 scaffold tasks).  This test has its own 2-task script;
+        # defer the scaffolds so W5 isn't blocked by their proposed state.
+        await _defer_generated_tasks(client, api_key, db_session, wi_id)
+
         task_a = await _seed_task(db_session, wi_id, "T-ci-a")
         task_b = await _seed_task(db_session, wi_id, "T-ci-b")
 
@@ -104,7 +120,8 @@ async def test_full_lifecycle_without_github_credentials(
         for task in (task_a, task_b):
             r = await client.post(
                 f"/api/v1/tasks/{task.id}/approve",
-                json={}, headers=_h(api_key),
+                json={},
+                headers=_h(api_key),
             )
             assert r.status_code == 202, r.text
 
@@ -126,7 +143,8 @@ async def test_full_lifecycle_without_github_credentials(
         assert r.status_code == 202
         r = await client.post(
             f"/api/v1/tasks/{task_a.id}/plan/approve",
-            json={}, headers=_h(api_key, role="dev"),
+            json={},
+            headers=_h(api_key, role="dev"),
         )
         assert r.status_code == 202
         r = await client.post(
@@ -137,7 +155,8 @@ async def test_full_lifecycle_without_github_credentials(
         assert r.status_code == 202
         r = await client.post(
             f"/api/v1/tasks/{task_b.id}/plan/approve",
-            json={}, headers=_h(api_key),
+            json={},
+            headers=_h(api_key),
         )
         assert r.status_code == 202
 
@@ -157,14 +176,13 @@ async def test_full_lifecycle_without_github_credentials(
             assert r.status_code == 202, r.text
             r = await client.post(
                 f"/api/v1/tasks/{task.id}/review/approve",
-                json={}, headers=_h(api_key),
+                json={},
+                headers=_h(api_key),
             )
             assert r.status_code == 202, r.text
 
         # W5 derivation should now have fired (both tasks done, no third).
-        wi = await await_work_item_status(
-            db_session, wi_id, WorkItemStatus.READY.value
-        )
+        wi = await await_work_item_status(db_session, wi_id, WorkItemStatus.READY.value)
         assert wi is not None
 
         # S4 — close.
@@ -176,16 +194,10 @@ async def test_full_lifecycle_without_github_credentials(
         assert r.status_code == 202, r.text
 
         hosts = [c.request.url.host for c in mock.calls]  # type: ignore[attr-defined]
-        assert "api.github.com" not in hosts, (
-            f"composition integrity breach: {hosts}"
-        )
+        assert "api.github.com" not in hosts, f"composition integrity breach: {hosts}"
 
     # Every implementation row stored the noop sentinel — the merge gate
     # is degraded, not broken.
-    impls = (
-        await db_session.scalars(
-            select(TaskImplementation).order_by(TaskImplementation.submitted_at)
-        )
-    ).all()
+    impls = (await db_session.scalars(select(TaskImplementation).order_by(TaskImplementation.submitted_at))).all()
     assert len(impls) >= 2
     assert all(i.github_check_id == NOOP_CHECK_ID for i in impls)
