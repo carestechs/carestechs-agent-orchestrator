@@ -286,7 +286,6 @@ class TestWorkItem:
             "title",
             "source_path",
             "status",
-            "locked_from",
             "engine_item_id",
             "opened_by",
             "closed_at",
@@ -298,7 +297,7 @@ class TestWorkItem:
 
     def test_status_check_includes_all_values(self) -> None:
         checks = _check_constraint_texts(WorkItem)
-        status_check = [c for c in checks if "status" in c and "locked_from" not in c]
+        status_check = [c for c in checks if c.strip().startswith("status IN")]
         assert len(status_check) == 1
         for v in WorkItemStatus:
             assert f"'{v.value}'" in status_check[0]
@@ -309,12 +308,6 @@ class TestWorkItem:
         assert len(type_check) == 1
         for v in WorkItemType:
             assert f"'{v.value}'" in type_check[0]
-
-    def test_locked_from_check_allows_null(self) -> None:
-        checks = _check_constraint_texts(WorkItem)
-        lf_check = [c for c in checks if "locked_from" in c]
-        assert len(lf_check) == 1
-        assert "locked_from IS NULL" in lf_check[0]
 
     def test_unique_external_ref(self) -> None:
         uqs = _unique_constraint_columns(WorkItem)
@@ -340,7 +333,6 @@ class TestTask:
             "engine_item_id",
             "proposer_type",
             "proposer_id",
-            "deferred_from",
             "created_at",
             "updated_at",
         }
@@ -363,12 +355,6 @@ class TestTask:
         assert len(pt_checks) == 1
         for v in ActorType:
             assert f"'{v.value}'" in pt_checks[0]
-
-    def test_deferred_from_allows_null(self) -> None:
-        checks = _check_constraint_texts(Task)
-        df_checks = [c for c in checks if "deferred_from" in c]
-        assert len(df_checks) == 1
-        assert "deferred_from IS NULL" in df_checks[0]
 
     def test_unique_work_item_and_external_ref(self) -> None:
         uqs = _unique_constraint_columns(Task)

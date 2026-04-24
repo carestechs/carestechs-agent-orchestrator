@@ -100,13 +100,11 @@ async def test_lock_then_unlock(db_session: AsyncSession) -> None:
     await db_session.commit()
     await db_session.refresh(wi)
     assert wi.status == WorkItemStatus.LOCKED.value
-    assert wi.locked_from == WorkItemStatus.IN_PROGRESS.value
 
     await wi_svc.unlock_work_item(db_session, wi.id, actor="admin")
     await db_session.commit()
     await db_session.refresh(wi)
     assert wi.status == WorkItemStatus.IN_PROGRESS.value
-    assert wi.locked_from is None
 
 
 @pytest.mark.asyncio

@@ -349,7 +349,6 @@ async def test_defer_from_each_non_terminal(
     await db_session.commit()
     await db_session.refresh(t)
     assert t.status == TaskStatus.DEFERRED.value
-    assert t.deferred_from == pre_status.value
 
 
 @pytest.mark.asyncio

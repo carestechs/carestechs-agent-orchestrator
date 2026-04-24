@@ -155,7 +155,6 @@ async def lock_work_item(
     wi = await _load_locked(db, work_item_id)
     if wi.status != WorkItemStatus.IN_PROGRESS.value:
         raise _forbidden(wi, WorkItemStatus.LOCKED)
-    wi.locked_from = wi.status
     if engine is None:
         wi.status = WorkItemStatus.LOCKED.value
     await db.flush()
@@ -183,11 +182,10 @@ async def unlock_work_item(
     wi = await _load_locked(db, work_item_id)
     if wi.status != WorkItemStatus.LOCKED.value:
         raise _forbidden(wi, WorkItemStatus.IN_PROGRESS)
-    # locked_from recorded the prior state; we always return to in_progress
-    # in v1 since lock is only reachable from there.
+    # V1: lock is only reachable from in_progress, so unlock always
+    # restores in_progress — no prior-state column needed (FEAT-008/T-168).
     if engine is None:
         wi.status = WorkItemStatus.IN_PROGRESS.value
-    wi.locked_from = None
     await db.flush()
     await _mirror_to_engine(
         wi,

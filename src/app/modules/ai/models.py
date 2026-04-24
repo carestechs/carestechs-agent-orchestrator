@@ -285,7 +285,6 @@ class WorkItem(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=WorkItemStatus.OPEN)
-    locked_from: Mapped[str | None] = mapped_column(Text, nullable=True)
     # FEAT-006 rc2 (T-131a): nullable for transition.  When the engine
     # client is configured, ``engine_item_id`` is populated at open-time
     # and every transition mirrors the local state change onto the engine.
@@ -305,12 +304,6 @@ class WorkItem(Base):
     __table_args__ = (
         _enum_check("status", WorkItemStatus),
         _enum_check("type", WorkItemType),
-        CheckConstraint(
-            "locked_from IS NULL OR locked_from IN ("
-            + ", ".join(f"'{v.value}'" for v in WorkItemStatus)
-            + ")",
-            name="ck_work_items_locked_from",
-        ),
         UniqueConstraint("external_ref", name="uq_work_items_external_ref"),
         Index("ix_work_items_status_updated_at", "status", updated_at.desc()),
     )
@@ -344,7 +337,6 @@ class Task(Base):
     )
     proposer_type: Mapped[str] = mapped_column(Text, nullable=False)
     proposer_id: Mapped[str] = mapped_column(Text, nullable=False)
-    deferred_from: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -355,12 +347,6 @@ class Task(Base):
     __table_args__ = (
         _enum_check("status", TaskStatus),
         _enum_check("proposer_type", ActorType),
-        CheckConstraint(
-            "deferred_from IS NULL OR deferred_from IN ("
-            + ", ".join(f"'{v.value}'" for v in TaskStatus)
-            + ")",
-            name="ck_tasks_deferred_from",
-        ),
         UniqueConstraint("work_item_id", "external_ref", name="uq_tasks_work_item_ref"),
         Index("ix_tasks_work_item_status", "work_item_id", "status"),
     )
