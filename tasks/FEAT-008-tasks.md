@@ -391,19 +391,60 @@ AC-12. The acceptance test FEAT-008 is judged against.
 
 ---
 
+### T-173: Reactor invokes `EffectorRegistry.fire_all` on every transition
+
+**Type:** Backend
+**Workflow:** standard
+**Complexity:** S
+**Dependencies:** T-161, T-163, T-164, T-167, T-169, T-171
+
+**Description:**
+Close the AC-5 invocation gap discovered after T-172. `EffectorRegistry.fire_all` exists (T-161) and `RequestAssignmentEffector` + `GenerateTasksEffector` are registered against permanent keys (T-163, T-164), but no call site invokes the registry — the only effectors that actually fire today are the per-request `dispatch_effector` sites (GitHub checks via T-162, and the duplicate task-generation dispatch in `service.py`). T-171's startup validator was satisfied by *registration*, not *invocation*, so the gap shipped silently.
+
+This task wires `fire_all` into the reactor so registration and invocation become equivalent: every `item.transitioned` webhook the reactor handles dispatches the registered effectors for the resolved transition key. Per-request GitHub dispatch is kept (still gated on DI-bound clients) and its `no_effector` exemption stays — `fire_all` will simply find nothing registered for those keys.
+
+**Rationale:**
+AC-3 + AC-5. Without this wire-up, "every transition fires an effector or is exempt" is a *static* claim (registration + exemption table), not a *runtime* one. Honoring the runtime contract makes the registry the single, observable surface for outbound effects and lets future effectors land via registration only — no hand-wired dispatch site per signal.
+
+**Acceptance Criteria:**
+- [ ] `handle_transition` accepts an `EffectorRegistry | None` (and a `Settings`) and, after the status-cache update + correlation consume, calls `registry.fire_all(ctx)` once per transition with `from_state` / `to_state` derived from the engine event.
+- [ ] Router (`/hooks/engine/lifecycle/item-transitioned`) passes `app.state.effector_registry` through. `None` is a graceful no-op (used by tests that don't need effector dispatch).
+- [ ] `RequestAssignmentEffector` fires on real `task:entry:assigning` webhooks — proven by an `effector_call` trace entry with `transition_key="task:approved->assigning"`.
+- [ ] Duplicate task-generation dispatch removed from `service.py` (`_dispatch_task_generation` and its call from the work-item open signal). Single fire path is now: signal → engine → webhook → reactor `fire_all` → `GenerateTasksEffector`.
+- [ ] Engine-absent fallback unchanged: when no webhook arrives, the registry is never invoked. `service.py` continues to write inline aux rows in that mode; task-generation in engine-absent mode is documented as deferred to a follow-on (or kept inline behind the same engine-presence gate as aux writes).
+- [ ] Unit test `tests/modules/ai/lifecycle/test_reactor_effector_dispatch.py`: register a recording effector against a synthetic key, deliver a synthetic webhook through `handle_transition`, assert `fire_all` was invoked exactly once with the expected `EffectorContext` fields populated (`from_state`, `to_state`, `correlation_id`).
+- [ ] Update `test_feat008_reactor_authoritative.py` to assert `RequestAssignmentEffector` produces an `effector_call` trace on the approve-task webhook (not just registration coverage).
+- [ ] Existing FEAT-006 / FEAT-007 / FEAT-008 test suites pass without modification beyond test-fixture wiring of the registry.
+
+**Files to Modify/Create:**
+- `src/app/modules/ai/lifecycle/reactor.py` — accept registry + settings, dispatch via `fire_all`.
+- `src/app/modules/ai/router.py` — thread `app.state.effector_registry` into the call.
+- `src/app/modules/ai/lifecycle/service.py` — remove `_dispatch_task_generation` (or rename + gate as engine-absent fallback).
+- `src/app/modules/ai/lifecycle/effectors/bootstrap.py` — drop the now-stale comment claiming task-generation dispatches from service.
+- `tests/modules/ai/lifecycle/test_reactor_effector_dispatch.py` — new.
+- `tests/modules/ai/lifecycle/test_reactor.py`, `test_reactor_aux_materialization.py`, `test_reactor_status_cache.py` — pass `registry=None` (no-op) where appropriate.
+- `tests/integration/test_feat008_reactor_authoritative.py` — extend invariant-3 coverage with runtime trace assertion.
+
+**Technical Notes:**
+- `EffectorContext.from_state` comes from `event.data.from_status`, which is `None` on `entry:` keys (engine emits `null` for the first transition into a state). The transition-key builder already handles that — pass it through unchanged.
+- Two existing direct-dispatch sites stay where they are: GitHub checks (T-162) need `GitHubChecksClient` from per-request DI, which the registry's lifespan-bound construction can't provide today. Their `no_effector` exemptions remain valid. A future task can migrate them to a DI-aware effector factory.
+- Test-side fixture: most reactor tests don't care about effector dispatch — give them `registry=None` to keep diffs small. Only the new dispatch test and `test_feat008_reactor_authoritative.py` build a real registry.
+
+---
+
 ## Summary
 
 | Type | Count |
 |------|-------|
-| Backend | 7 (T-161, T-162, T-163, T-164, T-167, T-169, T-170, T-171) |
+| Backend | 8 (T-161, T-162, T-163, T-164, T-167, T-169, T-170, T-171, T-173) |
 | Database | 2 (T-165, T-168) |
 | Testing | 2 (T-166, T-172) |
 | Documentation | 1 (T-160) |
-| **Total** | **13** |
+| **Total** | **14** |
 
-**Complexity:** 4 × S · 7 × M · 1 × L · 0 × XL · 1 × S (doc)
+**Complexity:** 5 × S · 7 × M · 1 × L · 0 × XL · 1 × S (doc)
 
-**Critical path:** T-161 → T-166 → T-167 → T-169 → T-172
+**Critical path:** T-161 → T-166 → T-167 → T-169 → T-172 → T-173
 
 **Risks & open questions:**
 - **T-167 is the only Large task** and the one most likely to surface subtle bugs around correlation-id matching, idempotency, and transaction boundaries. Allocate review time accordingly.

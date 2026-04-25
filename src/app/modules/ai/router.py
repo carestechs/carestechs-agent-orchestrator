@@ -689,6 +689,7 @@ async def receive_lifecycle_item_transitioned(
     workflow_ids: Annotated[
         dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)
     ],
+    settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> JSONResponse:
     """Ingest a flow-engine lifecycle webhook (state change on an item).
 
@@ -779,8 +780,17 @@ async def receive_lifecycle_item_transitioned(
 
     # Flip workflow ids mapping so reactor can resolve name from id.
     workflow_name_by_id = {wid: name for name, wid in workflow_ids.items()}
+    # FEAT-008/T-173: thread the lifespan-built effector registry into the
+    # reactor so registered effectors fire on every transition. ``getattr``
+    # default keeps tests that build a bare ``FastAPI()`` (no lifespan run)
+    # working — registry-less is a graceful no-op in the reactor.
+    registry = getattr(request.app.state, "effector_registry", None)
     await lifecycle_reactor.handle_transition(
-        db, event, workflow_name_by_id=workflow_name_by_id
+        db,
+        event,
+        workflow_name_by_id=workflow_name_by_id,
+        registry=registry,
+        settings=settings,
     )
     await db.commit()
 

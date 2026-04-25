@@ -189,6 +189,13 @@ async def _dispatch_task_generation(db: AsyncSession, *, work_item_id: uuid.UUID
     stub. Runs deterministically (no LLM, no brief parsing); an
     LLM-backed generator will replace this under the same registry key
     (``work_item:entry:open``) when it lands.
+
+    Direct dispatch is preserved (alongside T-173's reactor-driven
+    ``fire_all``) because the engine is not guaranteed to emit
+    ``item.transitioned`` for the initial entry into ``open`` — and even
+    when it does, mock-engine tests don't auto-fire webhooks. If the real
+    engine *does* emit an entry webhook, the effector's idempotency guard
+    (``status='skipped'`` when tasks already exist) absorbs the duplicate.
     """
     effector = GenerateTasksEffector()
     ctx = EffectorContext(
