@@ -3,7 +3,8 @@
 .env
 .env.*
 !.env.example
-.ai-framework
+# .ai-framework kept in image — agent YAMLs reference its prompt files,
+# validated at run-creation time.
 .ruff_cache
 .mypy_cache
 .pytest_cache

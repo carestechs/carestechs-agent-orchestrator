@@ -29,3 +29,4 @@ services:
 networks:
   infra:
     external: true
+    name: devtools-infra
