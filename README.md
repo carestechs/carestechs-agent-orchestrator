@@ -217,6 +217,29 @@ TEST_FLOW_ENGINE_TENANT_KEY=<tenant-key> \
 uv run pytest -m requires_engine --run-requires-engine
 ```
 
+## Operations
+
+### Reconciling lost webhooks
+
+If the flow engine drops an `item.transitioned` webhook, the orchestrator
+ends up with a `pending_aux_writes` row but no corresponding aux audit
+row (Approval, TaskAssignment, TaskPlan, TaskImplementation). Drain the
+backlog with:
+
+```bash
+uv run orchestrator reconcile-aux --since 24h
+uv run orchestrator reconcile-aux --since 24h --dry-run   # preview only
+```
+
+The command queries the engine for each pending row's current state. If
+the engine confirms the transition landed, the aux row is materialized
+and the pending row deleted. If the engine says the transition never
+landed, the pending row is preserved for operator triage. Idempotent —
+safe to run periodically (e.g. hourly from cron/systemd). Rejection
+signals materialize unconditionally; they have no engine-side state to
+verify against. Requires `FLOW_ENGINE_LIFECYCLE_BASE_URL` +
+`FLOW_ENGINE_TENANT_API_KEY` to be configured.
+
 ## Project Layout
 
 ```

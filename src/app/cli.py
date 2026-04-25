@@ -263,6 +263,105 @@ def serve(
         raise SystemExit(2) from exc
 
 
+@main.command("reconcile-aux")
+def reconcile_aux_cmd(
+    since: Annotated[
+        Optional[str],
+        typer.Option(
+            "--since",
+            help="Only scan outbox rows enqueued within this window (e.g. 24h, 7d, 15m). "
+            "Defaults to the full outbox.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report what would happen without writing to the database.",
+        ),
+    ] = False,
+) -> None:
+    """Drain orphan ``pending_aux_writes`` rows by querying engine state (FEAT-008/T-170).
+
+    Use when an ``item.transitioned`` webhook was lost (engine outage,
+    subscription misconfig) and aux audit rows (Approval, TaskAssignment,
+    etc.) are missing for otherwise-successful transitions. Safe to run
+    periodically; idempotent.
+    """
+    import asyncio
+
+    asyncio.run(_run_reconcile_aux(since=since, dry_run=dry_run))
+
+
+async def _run_reconcile_aux(*, since: Optional[str], dry_run: bool) -> None:
+    from app.config import get_settings
+    from app.core.database import get_engine, make_sessionmaker
+    from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
+    from app.modules.ai.lifecycle.reconciliation import (
+        format_report,
+        reconcile,
+    )
+
+    since_td = _parse_since(since) if since else None
+    settings = get_settings()
+    base_url = settings.flow_engine_lifecycle_base_url
+    api_key = settings.flow_engine_tenant_api_key
+    if base_url is None or api_key is None:
+        typer.echo(
+            "error: flow-engine is not configured (FLOW_ENGINE_LIFECYCLE_BASE_URL + "
+            "FLOW_ENGINE_TENANT_API_KEY); reconcile-aux requires a live engine.",
+            err=True,
+        )
+        raise SystemExit(2)
+
+    sessionmaker = make_sessionmaker(get_engine())
+    engine_client = FlowEngineLifecycleClient(
+        base_url=str(base_url),
+        api_key=api_key.get_secret_value(),
+    )
+    try:
+        async with sessionmaker() as db:
+            report = await reconcile(
+                db, engine_client, since=since_td, dry_run=dry_run
+            )
+    finally:
+        await engine_client.aclose()
+
+    typer.echo(format_report(report, dry_run=dry_run))
+    if report.errors:
+        raise SystemExit(2)
+
+
+def _parse_since(raw: str):
+    """Parse ``24h`` / ``7d`` / ``15m`` into a ``datetime.timedelta``."""
+    from datetime import timedelta
+
+    s = raw.strip().lower()
+    if not s or not s[-1].isalpha():
+        typer.echo(
+            f"error: --since expects Nh / Nd / Nm (e.g. 24h), got {raw!r}",
+            err=True,
+        )
+        raise SystemExit(1)
+    unit = s[-1]
+    try:
+        value = int(s[:-1])
+    except ValueError as exc:
+        typer.echo(f"error: --since expects a numeric prefix, got {raw!r}", err=True)
+        raise SystemExit(1) from exc
+    if value <= 0:
+        typer.echo(f"error: --since must be positive, got {raw!r}", err=True)
+        raise SystemExit(1)
+    if unit == "h":
+        return timedelta(hours=value)
+    if unit == "d":
+        return timedelta(days=value)
+    if unit == "m":
+        return timedelta(minutes=value)
+    typer.echo(f"error: --since unit must be h/d/m, got {raw!r}", err=True)
+    raise SystemExit(1)
+
+
 @main.command()
 def doctor() -> None:
     """Diagnose local setup: config, providers, engine, signing keys."""

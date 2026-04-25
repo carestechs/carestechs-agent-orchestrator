@@ -11,7 +11,7 @@ runner = CliRunner()
 
 # Mirrors docs/ui-specification.md → Command Inventory (Command | Subcommand).
 _COMMAND_INVENTORY: list[tuple[str, list[str]]] = [
-    ("orchestrator", ["run", "serve", "doctor", "runs", "agents"]),
+    ("orchestrator", ["run", "serve", "doctor", "reconcile-aux", "runs", "agents"]),
     ("runs", ["ls", "show", "cancel", "trace", "steps", "policy"]),
     ("agents", ["ls", "show"]),
 ]

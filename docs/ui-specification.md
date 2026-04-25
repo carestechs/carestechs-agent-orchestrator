@@ -64,6 +64,7 @@ The `orchestrator` command is declared in `pyproject.toml` via `[project.scripts
 | `orchestrator tasks mark-implemented <task> --run-id <id>` | Deliver an `implementation-complete` signal (FEAT-005) | `POST /api/v1/runs/{id}/signals` |
 | `orchestrator serve` | Start the FastAPI service (webhooks + control plane) in the foreground | — |
 | `orchestrator doctor` | Diagnose local setup: config, LLM provider reachability, engine reachability, webhook signing key presence | `GET /health` + local checks |
+| `orchestrator reconcile-aux [--since 24h] [--dry-run]` | Drain orphan `pending_aux_writes` rows by querying engine state (FEAT-008/T-170) | direct DB + flow-engine |
 
 ### Command Specifications
 
@@ -260,6 +261,7 @@ The CLI never writes configuration. All persistence is operator-controlled (env 
 
 ## Changelog
 
+- 2026-04-24 — FEAT-008/T-170 — `orchestrator reconcile-aux [--since Nh|Nd|Nm] [--dry-run]`: new admin CLI that drains orphan `pending_aux_writes` rows by querying engine state for each pending signal's target item. Materializes when the engine confirms the transition landed; preserves the pending row when the engine says it didn't (operator triage). Idempotent. Requires flow-engine configured. Exit codes: `0` clean, `2` errors during reconcile or engine not configured.
 - 2026-04-18 — FEAT-005 — `orchestrator tasks mark-implemented T-XXX --run-id <id>`: new CLI command for delivering operator-injected implementation-complete signals. Exit codes `0/1/2/3` align with the project's exit-code semantics (409 → `2` is distinct from other 4xx → `1`).
 - 2026-04-18 — FEAT-004 — `orchestrator runs trace` is now real: `--follow`, `--since`, `--kind` (repeatable), `--json`.  Exit-code table + NDJSON output format documented.  The `run --follow` alias remains reserved for a later convenience.
 - 2026-04-18 — FEAT-002 — `orchestrator run --wait` + `--wait-timeout` documented with exit-code table; `runs ls/show/cancel/steps/policy` and `agents ls/show` now make real HTTP calls (stubs retired). `runs trace` + `run --follow` remain deferred to FEAT-004 (trace streaming).
