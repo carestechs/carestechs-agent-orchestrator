@@ -106,6 +106,49 @@ class JsonlTraceStore:
                 except OSError as exc:  # pragma: no cover — best-effort hardening
                     logger.warning("chmod 0600 failed for %s: %s", path, exc)
 
+    async def read_effector_calls(
+        self, entity_id: uuid.UUID
+    ) -> list[EffectorCallDto]:
+        """Replay every effector-call trace for *entity_id* in insertion order.
+
+        Returns an empty list when no trace file exists yet (no fires
+        recorded for this entity). Skips malformed lines with a warning
+        rather than aborting the read — partial data is more useful than
+        none for the invariant-3 audit.
+        """
+        path = self._effector_path(entity_id)
+        if not path.is_file():
+            return []
+        out: list[EffectorCallDto] = []
+        async with aiofiles.open(path, encoding="utf-8") as f:
+            async for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    logger.warning(
+                        "skipping malformed effector trace line in %s", path
+                    )
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("kind") != "effector_call":
+                    continue
+                data = record.get("data")
+                if not isinstance(data, dict):
+                    continue
+                try:
+                    out.append(EffectorCallDto.model_validate(data))
+                except ValueError as exc:
+                    logger.warning(
+                        "skipping unrenderable effector trace entry in %s: %s",
+                        path,
+                        exc,
+                    )
+        return out
+
     async def open_run_stream(
         self, run_id: uuid.UUID
     ) -> AsyncIterator[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]:

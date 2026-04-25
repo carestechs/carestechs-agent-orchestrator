@@ -20,9 +20,12 @@ Invariants proved:
   pre-FEAT-008 inline-write path is preserved end-to-end. Runs in the
   default suite (no ``requires_engine`` mark).
 
-Invariant 3 ("every transition fires an effector or is exempt") is
-deferred — it depends on T-162 (GitHub check effector) and T-171
-(startup validator). A follow-on extends this module once those land.
+Invariant 3 ("every declared transition is covered by a registered
+effector or an explicit ``no_effector`` exemption") is now active. The
+runtime check mirrors T-171's startup validator and additionally
+asserts that every emitted ``effector_call`` trace carries a
+``transition_key`` so future audits can correlate runtime fires with
+the declarations.
 
 Do not weaken these assertions to make a flaky test pass —
 investigate the regression instead.
@@ -311,21 +314,94 @@ async def test_status_cache_updates_only_via_reactor(
 
 
 # ---------------------------------------------------------------------------
-# Invariant 3 (deferred): every transition fires an effector or is exempt
+# Invariant 3: every transition is covered by an effector or an exemption
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Deferred to T-172 follow-on: requires T-162 (GitHub effector) + "
-    "T-171 (startup validator + transition catalog) to be in place first."
-)
-async def test_every_transition_fires_an_effector() -> None:
-    """Placeholder.
+async def test_every_declared_transition_is_covered() -> None:
+    """For every transition in the declared workflows, assert coverage.
 
-    Once T-162 + T-171 land, this asserts that the ``effector_call`` trace
-    stream has an entry for every transition in the declared workflows,
-    or the transition is in ``iter_no_effector_exemptions()``.
+    Coverage means: at least one of (a) an effector registered on the
+    state-transition key, (b) an effector registered on the entry-state
+    key, (c) a ``no_effector(<key>, <reason>)`` exemption on either key.
+
+    Same shape as T-171's startup validator — re-asserted here at
+    runtime so a future PR that drops a registration *and* the matching
+    exemption fails this test alongside the startup boot. The two checks
+    are kept as siblings, not consolidated, because they fail at
+    different points in the lifecycle and surface different signals
+    (boot-blocking vs. test-suite-blocking).
     """
+    from app.modules.ai.lifecycle.effectors.base import (
+        _reset_exemptions_for_tests,
+    )
+    from app.modules.ai.lifecycle.effectors.bootstrap import (
+        register_all_effectors,
+    )
+    from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
+    from app.modules.ai.lifecycle.effectors.validation import (
+        format_uncovered_error,
+        validate_effector_coverage,
+    )
+
+    _reset_exemptions_for_tests()
+    try:
+        registry = EffectorRegistry(trace=AsyncMock())
+        register_all_effectors(registry, trace=AsyncMock())
+        result = validate_effector_coverage(registry)
+        assert not result.uncovered, format_uncovered_error(result)
+    finally:
+        _reset_exemptions_for_tests()
+
+
+async def test_effector_call_trace_includes_transition_key(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Smoke-test the new ``transition_key`` field on the trace DTO.
+
+    Fires a single effector via ``dispatch_effector`` against a
+    ``JsonlTraceStore`` and asserts the persisted line carries the
+    canonical key. This is the data the invariant-3 audit reads when
+    correlating runtime fires with declared transitions.
+    """
+    from app.modules.ai.lifecycle.effectors import EffectorContext
+    from app.modules.ai.lifecycle.effectors.context import EffectorResult
+    from app.modules.ai.lifecycle.effectors.registry import (
+        build_transition_key,
+        dispatch_effector,
+    )
+    from app.modules.ai.trace_jsonl import JsonlTraceStore
+
+    class _Stub:
+        name = "stub"
+
+        async def fire(self, ctx: EffectorContext) -> EffectorResult:
+            del ctx
+            return EffectorResult(
+                effector_name=self.name, status="ok", duration_ms=1
+            )
+
+    trace_dir = tmp_path_factory.mktemp("invariant3-trace")
+    trace = JsonlTraceStore(trace_dir)
+    entity_id = uuid.uuid4()
+    ctx = EffectorContext(
+        entity_type="task",
+        entity_id=entity_id,
+        from_state="approved",
+        to_state="assigning",
+        transition="T4",
+        correlation_id=None,
+        db=AsyncMock(),  # not used by stub
+        settings=AsyncMock(),
+    )
+
+    await dispatch_effector(_Stub(), ctx, trace)
+
+    entries = await trace.read_effector_calls(entity_id)
+    assert len(entries) == 1
+    expected_key = build_transition_key("task", "approved", "assigning")
+    assert entries[0].transition_key == expected_key
+    assert entries[0].transition == "T4"
 
 
 # ---------------------------------------------------------------------------
