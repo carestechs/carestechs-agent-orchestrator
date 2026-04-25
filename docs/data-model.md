@@ -206,7 +206,7 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | type | enum `WorkItemType` | Required | `FEAT`, `BUG`, `IMP`. |
 | title | text | Required | Human-readable title. |
 | source_path | text | Nullable | Path to the originating markdown brief, if any. |
-| status | enum `WorkItemStatus` | Required, default `open` | See enum. |
+| status | enum `WorkItemStatus` | Required, default `open` | Reactor-managed cache (FEAT-008): under engine-present mode, written only by the lifecycle reactor on `item.transitioned` arrival, never by signal adapters. See enum. |
 | opened_by | text | Required | Actor id (admin) who opened the work item. |
 | closed_at | timestamptz | Nullable | Set when `status=closed`. |
 | closed_by | text | Nullable | Admin who closed the work item. |
@@ -236,7 +236,7 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 | work_item_id | UUID | FK → WorkItem.id, Required | Parent work item. |
 | external_ref | text | Required | Human-facing id (e.g., `T-042`). Unique per work item. |
 | title | text | Required | Task title. |
-| status | enum `TaskStatus` | Required, default `proposed` | See enum. |
+| status | enum `TaskStatus` | Required, default `proposed` | Reactor-managed cache (FEAT-008): under engine-present mode, written only by the lifecycle reactor on `item.transitioned` arrival, never by signal adapters. See enum. |
 | proposer_type | enum `ActorType` | Required | `admin`, `agent` (who drafted the task). |
 | proposer_id | text | Required | Actor id (e.g., admin id or agent ref). |
 | created_at | timestamptz | Required, Auto | Record creation timestamp. |
@@ -301,6 +301,31 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 - Append-only. No decision is ever edited after insert.
 - `feedback` MUST be non-empty when `decision=reject`. The service layer returns `422` if the caller omits it.
 - The count of `reject` rows for a `(task_id, stage)` pair equals the rejection iteration count for that stage. No bound in v1.
+
+---
+
+### PendingAuxWrite
+
+> *Module: `ai` — Outbox row capturing aux-write intent for the lifecycle reactor. Introduced by FEAT-008/T-165 (engine-as-authority).*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK | Outbox row id (UUIDv7). |
+| correlation_id | UUID | Required, Unique | Correlation id encoded into the engine's `triggeredBy` (`orchestrator-corr:<uuid>`) at signal time; matched against the engine's `item.transitioned` webhook to materialize the aux row. |
+| signal_name | text | Required | Originating signal (e.g. `approve-task`, `submit-implementation`) — drives the expected target state during reconciliation. |
+| entity_id | UUID | Required | Local task or work-item id the aux row will reference. |
+| payload | jsonb | Required | Constructor arguments for the target aux row (`{aux_type: "approval"\|"task_assignment"\|"task_plan"\|"task_implementation", …}`). |
+| enqueued_at | timestamptz | Required, Auto | When the signal adapter committed the row. |
+| resolved_at | timestamptz | Nullable | Set when the reactor materializes the aux row and deletes the outbox row (kept on dry-runs by the reconciler). |
+
+**Indexes:**
+- UNIQUE on `correlation_id` — enforces one outbox row per signal commit and lets the reactor's `SELECT ... FOR UPDATE SKIP LOCKED` race with concurrent webhook deliveries safely.
+- BTREE on `enqueued_at` — drives the `reconcile-aux --since=24h` orphan scan.
+
+**Business Rules:**
+- Written by lifecycle signal adapters in the same transaction that commits the engine mirror under engine-present mode. Engine-absent mode does not write outbox rows (signal adapters fall back to inline aux writes).
+- Materialized + deleted by the reactor's `_materialize_aux(correlation_id)` step on matched webhook arrival. Idempotent on duplicate webhook delivery (second arrival finds no row).
+- `orchestrator reconcile-aux` is the operational backstop: scans the outbox for rows older than `--since`, queries the engine for the matching item, materializes if the engine confirms the expected target state, and deletes the outbox row. Skip-stale: rows whose engine state hasn't reached the expected target are left in place. Idempotent.
 
 ---
 
@@ -501,6 +526,7 @@ None — single-module project in v1.
 
 ## Changelog
 
+- 2026-04-25 — FEAT-008 (engine-as-authority is live) — `WorkItem.status` and `Task.status` reframed as reactor-managed caches: under engine-present mode the lifecycle reactor is the only writer; signal adapters return 202 with a possible stale-read window. New `PendingAuxWrite` entity (table `pending_aux_writes`) is the outbox that captures aux-write intent at signal commit and is drained by the reactor on matched `item.transitioned` webhook arrival. Aux rows (`Approval`, `TaskAssignment`, `TaskPlan`, `TaskImplementation`) are reactor-written under engine-present mode; engine-absent fallback preserves the pre-FEAT-008 inline path.
 - 2026-04-24 — FEAT-008/T-168 — Dropped `WorkItem.locked_from` and `Task.deferred_from`. Under engine-as-authority (FEAT-008), prior-state tracking is owned by the flow engine's transition history. Migration `a1e4d58c9033` drops both columns; pre-flight fails loudly on currently-locked or deferred rows so operators resolve before upgrading. WorkItem unlock always returns to `in_progress` (v1 invariant: lock only reachable from `in_progress`).
 - 2026-04-19 — FEAT-006 rc2-phase-1 — `WorkItem` and `Task` gained a nullable `engine_item_id uuid UNIQUE` column pointing at the flow-engine item that mirrors the orchestrator row. New `EngineWorkflow` table caches the engine's workflow IDs (PK `name`, `engine_workflow_id`). `WebhookEventType` extended with `lifecycle_item_transitioned` to cover inbound engine state-change events; `WebhookEvent.run_id` is now nullable (GitHub + lifecycle webhooks correlate to tasks / items, not runs). Engine is the shared cross-tool view of state; orchestrator remains the authoritative writer in phase 1. Phase 2 will drop the local `status`/`locked_from`/`deferred_from` columns once the webhook reactor proves it can drive derivations purely from engine events.
 - 2026-04-19 — FEAT-006 — Added `WorkItem`, `Task`, `TaskAssignment`, `Approval` entities for the deterministic lifecycle flow. Added enums `WorkItemType`, `WorkItemStatus`, `TaskStatus`, `ActorType`, `ActorRole`, `AssigneeType`, `ApprovalStage`, `ApprovalDecision`, and `WebhookSource`. Extended `WebhookEvent` with a `source` column (`engine` default; `github` for GitHub PR webhooks) and added `github_pr_opened` / `github_pr_closed` values to `WebhookEventType`. Derived transitions (W2, W5, T4) documented as orchestrator-internal; the flow engine remains logic-free per AD-1.

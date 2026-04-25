@@ -210,7 +210,7 @@ The test harness creates a unique `orchestrator_test_<uuid>` database per sessio
 # Real Anthropic API (FEAT-003 contract test).
 ANTHROPIC_API_KEY=sk-... uv run pytest -m live --run-live
 
-# Real flow-engine (FEAT-006 rc2 smoke test).
+# Real flow-engine (FEAT-006 / FEAT-008 smoke test).
 # Requires a running carestechs-flow-engine + a tenant API key.
 TEST_FLOW_ENGINE_BASE_URL=http://localhost:5000 \
 TEST_FLOW_ENGINE_TENANT_KEY=<tenant-key> \
@@ -218,6 +218,12 @@ uv run pytest -m requires_engine --run-requires-engine
 ```
 
 ## Operations
+
+The orchestrator's lifecycle subsystem follows the [engine-as-authority architecture](docs/design/feat-008-engine-as-authority.md): the flow engine owns work-item / task state, the orchestrator is the gateway + reactor, and the effector registry is the outbound surface for every transition. See `docs/ARCHITECTURE.md` § Lifecycle Subsystem for the full pipeline.
+
+### Effector observability
+
+Every transition fires the registered effectors via the lifecycle reactor. Each fire emits an `effector_call` trace entry into `<trace_dir>/effectors/<entity_id>.jsonl` (alongside the per-run JSONL streams under `<trace_dir>/<run_id>.jsonl`). Tail those files to audit which effectors fired for a given task or work item without correlating to a run id.
 
 ### Reconciling lost webhooks
 
