@@ -39,14 +39,27 @@ COPY --from=builder /build/src/ src/
 # migrations inside the container before the API starts serving.
 COPY alembic.ini .
 
+# Agent YAML definitions — the runtime resolves agentRef strings against
+# this directory. AGENTS_DIR defaults to the cwd-relative `agents/`.
+COPY agents/ ./agents/
+
+# Prompt templates referenced by agent YAMLs (e.g.
+# `.ai-framework/prompts/feature-tasks.md`). Without this the runtime
+# fails the agent prompt-path validation at run-creation time.
+COPY .ai-framework/ ./.ai-framework/
+
 # Entrypoint runs ``alembic upgrade head`` then execs the CMD. Lives under
 # /usr/local/bin so it's on PATH for any user. Set SKIP_MIGRATIONS=1 to
 # bypass the migration step (e.g. while debugging a broken migration).
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Activate the venv by prepending it to PATH.
+# Activate the venv by prepending it to PATH. PYTHONPATH points at the
+# copied source tree because uv installs the project as an editable .pth
+# pinned to the builder's /build/src path — the runtime stage moves the
+# tree to /home/appuser/src, so we set the import path explicitly.
 ENV PATH="/home/appuser/.venv/bin:$PATH" \
+    PYTHONPATH="/home/appuser/src" \
     PYTHONUNBUFFERED=1
 
 # Switch to non-root user.
@@ -55,4 +68,4 @@ USER appuser
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

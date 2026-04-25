@@ -16,7 +16,10 @@ if [ "${SKIP_MIGRATIONS:-0}" = "1" ]; then
     echo "entrypoint: SKIP_MIGRATIONS=1 — skipping alembic upgrade"
 else
     echo "entrypoint: running alembic upgrade head"
-    alembic upgrade head
+    # Invoke via `python -m` because the venv is built at /build/.venv in
+    # the Docker builder stage and copied to /home/appuser/.venv at runtime;
+    # script shebangs (`#!/build/.venv/bin/python`) are stale at runtime.
+    python -m alembic upgrade head
 fi
 
 exec "$@"
