@@ -432,6 +432,54 @@ AC-3 + AC-5. Without this wire-up, "every transition fires an effector or is exe
 
 ---
 
+### T-174: Documentation sweep — engine-as-authority is the live model
+
+**Type:** Documentation
+**Workflow:** standard
+**Complexity:** S
+**Dependencies:** T-160 (ADR), T-167, T-169, T-173 (load-bearing pivots)
+
+**Description:**
+The implementation tasks (T-161 through T-173) shipped engine-as-authority, but the project-level docs still describe pieces of the old "engine is a dead mirror" mental model from the FEAT-006 rc2 closeout. Walk every doc that talks about the orchestrator's role, state ownership, or webhook flow and align it with the model that actually runs in production now.
+
+In scope:
+- `docs/ARCHITECTURE.md` — narrative pass: orchestrator is gateway+reactor (not driver); effector registry is a first-class subsystem; status columns are reactor-managed caches; aux rows are written by the reactor on correlation-matched webhook; engine-absent fallback exists but is not the target shape. Add changelog entry.
+- `CLAUDE.md` — Patterns / Anti-Patterns sections need refreshed entries for the engine-authoritative path: signal adapters do not write status; effectors are registered at lifespan and fired by the reactor; per-request `dispatch_effector` is the exception (DI-bound clients) not the rule.
+- `docs/data-model.md` — confirm the `pending_aux_writes` table description, the demoted-to-cache wording on `status` columns, and the dropped `locked_from`/`deferred_from` notes are all coherent end-to-end. Changelog entry already present from T-168 — extend with the broader FEAT-008 framing if missing.
+- `docs/api-spec.md` — verify the "behavioral change: aux rows not synchronous" callout is documented near the affected endpoints and that no DTO field reference was missed.
+- `docs/stakeholder-definition.md` — the "Architectural Position" section that motivated FEAT-008 should reflect "this is now the live model", not "this is the target". Light edit.
+- `README.md` — operations section should mention `reconcile-aux` (already in from T-170) and link the FEAT-008 ADR (T-160) for the architecture rationale.
+
+Out of scope:
+- New feature documentation (Slack/email transport, LLM-backed task generation, cron `reconcile-aux`) — those are tracked as follow-on FEATs, not FEAT-008.
+- ADR rewrites — T-160 already shipped the FEAT-008 ADR; this task only links to it from the right places.
+
+**Rationale:**
+The doc maintenance discipline in CLAUDE.md (line "Documentation Maintenance Discipline" table) requires architectural shifts to be reflected in `ARCHITECTURE.md` + `CLAUDE.md` + the spec docs. FEAT-008 was the largest architectural shift in the project's history; the docs should be the source of truth a new contributor reaches for, and right now they are partially out of date. Closing this gap before the next FEAT lands is cheap; doing it later means the next FEAT's docs are written against a hybrid mental model.
+
+**Acceptance Criteria:**
+- [ ] `docs/ARCHITECTURE.md` updated with a new component callout for the effector registry + reactor dispatch, and a clear statement that the engine is the authoritative state owner. Changelog entry added.
+- [ ] `CLAUDE.md` Patterns / Anti-Patterns sections refreshed: at least one new pattern entry (effector registry as the outbound surface) and at least one anti-pattern entry (don't write status from signal adapters).
+- [ ] `docs/data-model.md` + `docs/api-spec.md` + `docs/stakeholder-definition.md` skimmed end-to-end; any reference to the orchestrator as "driver" or to status columns as authoritative is corrected. Changelog entries added where the rule applies.
+- [ ] `README.md` operations section links the FEAT-008 ADR for context and mentions effector observability (`effector_call` traces).
+- [ ] No code changes in this task — pure docs.
+- [ ] Reviewer can grep for "FEAT-006 rc2" and "engine is a mirror" and find no contradictory live claims.
+
+**Files to Modify/Create:**
+- `docs/ARCHITECTURE.md`
+- `CLAUDE.md`
+- `docs/data-model.md`
+- `docs/api-spec.md`
+- `docs/stakeholder-definition.md`
+- `README.md`
+
+**Technical Notes:**
+- Doc-only PR — typecheck/lint/tests are unaffected; the gate is reviewer-grade prose accuracy.
+- A grep pass for stale terms (`rc2`, `dead mirror`, `mirror only`, `inline aux`, `synchronous aux`) catches most drift in seconds. Use it to bound the search.
+- Changelog format follows `.ai-framework/guides/maintenance.md`. Date entries 2026-04-25 (today).
+
+---
+
 ## Summary
 
 | Type | Count |
@@ -439,12 +487,12 @@ AC-3 + AC-5. Without this wire-up, "every transition fires an effector or is exe
 | Backend | 8 (T-161, T-162, T-163, T-164, T-167, T-169, T-170, T-171, T-173) |
 | Database | 2 (T-165, T-168) |
 | Testing | 2 (T-166, T-172) |
-| Documentation | 1 (T-160) |
-| **Total** | **14** |
+| Documentation | 2 (T-160, T-174) |
+| **Total** | **15** |
 
-**Complexity:** 5 × S · 7 × M · 1 × L · 0 × XL · 1 × S (doc)
+**Complexity:** 6 × S · 7 × M · 1 × L · 0 × XL · 1 × S (doc)
 
-**Critical path:** T-161 → T-166 → T-167 → T-169 → T-172 → T-173
+**Critical path:** T-161 → T-166 → T-167 → T-169 → T-172 → T-173 → T-174
 
 **Risks & open questions:**
 - **T-167 is the only Large task** and the one most likely to surface subtle bugs around correlation-id matching, idempotency, and transaction boundaries. Allocate review time accordingly.
