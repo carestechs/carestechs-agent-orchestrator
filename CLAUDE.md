@@ -57,6 +57,14 @@ uv run ruff format .
 
 # New migration
 uv run alembic revision --autogenerate -m "describe the change"
+
+# Containerized — standalone (self-contained postgres bundled in compose)
+docker compose -f docker-compose.yml up -d --build
+
+# Containerized — DevTools umbrella (joins shared infra network at the parent
+# folder ~/Desktop/Repos/DevTools/; assumes `infra` network + `postgres`
+# container are already up). See ../devtools-umbrella.md.
+docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 ### Key Directories

@@ -1,37 +1,30 @@
+# Production compose under the DevTools umbrella.
+#
+# This file assumes the shared infra is already up — the external `infra`
+# network must exist (created by `~/Desktop/Repos/DevTools/infra/`) and
+# `postgres` must be reachable on it under the container name `postgres`.
+# Run the project standalone via `docker-compose.yml` (which brings up a
+# self-contained postgres) when you don't want the umbrella.
+#
+# See `~/Desktop/Repos/DevTools/devtools-umbrella.md` for the pattern.
 services:
-  orchestrator:
+  orchestrator-api:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: orchestrator-api
     env_file:
       - path: .env
         required: false
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - infra
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-orchestrator}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orchestrator}
-      POSTGRES_DB: ${POSTGRES_DB:-orchestrator}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orchestrator}"]
-      interval: 5s
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
       timeout: 3s
       retries: 5
+      start_period: 15s
     networks:
       - infra
-
-volumes:
-  pgdata:
+    restart: unless-stopped
 
 networks:
   infra:
