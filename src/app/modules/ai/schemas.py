@@ -129,6 +129,7 @@ class EffectorCallDto(BaseModel):
     entity_type: Literal["work_item", "task"]
     entity_id: uuid.UUID
     transition: str
+    transition_key: str
     status: Literal["ok", "error", "skipped"]
     duration_ms: int
     error_code: str | None = None
