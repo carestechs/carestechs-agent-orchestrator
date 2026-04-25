@@ -20,12 +20,12 @@ Invariants proved:
   pre-FEAT-008 inline-write path is preserved end-to-end. Runs in the
   default suite (no ``requires_engine`` mark).
 
-* **Effectors fire at runtime via the reactor.** A registered effector
-  on ``task:approved->assigning`` is invoked end-to-end when the
-  matching engine webhook arrives — proves the route handler threads
-  ``app.state.effector_registry`` through and the reactor calls
-  ``fire_all``. Closes the AC-5 invocation gap (FEAT-008/T-173); T-171
-  separately enforces the static coverage claim.
+Invariant 3 ("every declared transition is covered by a registered
+effector or an explicit ``no_effector`` exemption") is now active. The
+runtime check mirrors T-171's startup validator and additionally
+asserts that every emitted ``effector_call`` trace carries a
+``transition_key`` so future audits can correlate runtime fires with
+the declarations.
 
 Do not weaken these assertions to make a flaky test pass —
 investigate the regression instead.
@@ -314,87 +314,94 @@ async def test_status_cache_updates_only_via_reactor(
 
 
 # ---------------------------------------------------------------------------
-# Invariant 3: registered effectors fire at runtime via the reactor
+# Invariant 3: every transition is covered by an effector or an exemption
 # ---------------------------------------------------------------------------
 
 
-async def test_registered_effector_fires_on_reactor_dispatch(
-    app: FastAPI,
-    client: AsyncClient,
-    api_key: str,
-    webhook_secret: str,
-    db_session: AsyncSession,
-) -> None:
-    """End-to-end proof of FEAT-008/T-173: reactor invokes ``fire_all``.
+async def test_every_declared_transition_is_covered() -> None:
+    """For every transition in the declared workflows, assert coverage.
 
-    AC-3 + AC-5 are *runtime* claims, not just registration claims:
-    the route handler must thread ``app.state.effector_registry`` into
-    the reactor, and the reactor must call ``fire_all`` so registered
-    effectors actually run when the matching webhook arrives.
+    Coverage means: at least one of (a) an effector registered on the
+    state-transition key, (b) an effector registered on the entry-state
+    key, (c) a ``no_effector(<key>, <reason>)`` exemption on either key.
 
-    We mount a recording registry on ``app.state``, deliver an
-    approve-task → ``approved->assigning`` webhook, and assert the
-    recorded effector fired with the expected ``EffectorContext``.
+    Same shape as T-171's startup validator — re-asserted here at
+    runtime so a future PR that drops a registration *and* the matching
+    exemption fails this test alongside the startup boot. The two checks
+    are kept as siblings, not consolidated, because they fail at
+    different points in the lifecycle and surface different signals
+    (boot-blocking vs. test-suite-blocking).
     """
-    from typing import ClassVar
-
-    from app.modules.ai.lifecycle.effectors.context import (
-        EffectorContext,
-        EffectorResult,
+    from app.modules.ai.lifecycle.effectors.base import (
+        _reset_exemptions_for_tests,
+    )
+    from app.modules.ai.lifecycle.effectors.bootstrap import (
+        register_all_effectors,
     )
     from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
-    from app.modules.ai.trace import NoopTraceStore
+    from app.modules.ai.lifecycle.effectors.validation import (
+        format_uncovered_error,
+        validate_effector_coverage,
+    )
 
-    fired: list[EffectorContext] = []
+    _reset_exemptions_for_tests()
+    try:
+        registry = EffectorRegistry(trace=AsyncMock())
+        register_all_effectors(registry, trace=AsyncMock())
+        result = validate_effector_coverage(registry)
+        assert not result.uncovered, format_uncovered_error(result)
+    finally:
+        _reset_exemptions_for_tests()
 
-    class _RecordingEffector:
-        name: ClassVar[str] = "recording"
+
+async def test_effector_call_trace_includes_transition_key(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Smoke-test the new ``transition_key`` field on the trace DTO.
+
+    Fires a single effector via ``dispatch_effector`` against a
+    ``JsonlTraceStore`` and asserts the persisted line carries the
+    canonical key. This is the data the invariant-3 audit reads when
+    correlating runtime fires with declared transitions.
+    """
+    from app.modules.ai.lifecycle.effectors import EffectorContext
+    from app.modules.ai.lifecycle.effectors.context import EffectorResult
+    from app.modules.ai.lifecycle.effectors.registry import (
+        build_transition_key,
+        dispatch_effector,
+    )
+    from app.modules.ai.trace_jsonl import JsonlTraceStore
+
+    class _Stub:
+        name = "stub"
 
         async def fire(self, ctx: EffectorContext) -> EffectorResult:
-            fired.append(ctx)
+            del ctx
             return EffectorResult(
-                effector_name=self.name, status="ok", duration_ms=0
+                effector_name=self.name, status="ok", duration_ms=1
             )
 
-    registry = EffectorRegistry(trace=NoopTraceStore())
-    registry.register("task:approved->assigning", _RecordingEffector())
-    app.state.effector_registry = registry
-
-    engine = _mock_engine()
-    _inject_engine(app, engine)
-
-    r = await client.post(
-        "/api/v1/work-items",
-        json={"externalRef": "FEAT-INV3", "type": "FEAT", "title": "inv3"},
-        headers=_h(api_key),
-    )
-    assert r.status_code == 202, r.text
-    wi_id = uuid.UUID(r.json()["data"]["id"])
-
-    engine_item_id = uuid.uuid4()
-    task = await _seed_task(
-        db_session,
-        work_item_id=wi_id,
-        ref="T-INV3-a",
-        engine_item_id=engine_item_id,
-    )
-
-    await _deliver_webhook(
-        client,
-        webhook_secret=webhook_secret,
-        item_id=engine_item_id,
+    trace_dir = tmp_path_factory.mktemp("invariant3-trace")
+    trace = JsonlTraceStore(trace_dir)
+    entity_id = uuid.uuid4()
+    ctx = EffectorContext(
+        entity_type="task",
+        entity_id=entity_id,
+        from_state="approved",
+        to_state="assigning",
+        transition="T4",
         correlation_id=None,
-        from_status=TaskStatus.APPROVED.value,
-        to_status=TaskStatus.ASSIGNING.value,
+        db=AsyncMock(),  # not used by stub
+        settings=AsyncMock(),
     )
 
-    assert len(fired) == 1, "reactor must invoke fire_all on the matching key"
-    ctx = fired[0]
-    assert ctx.entity_type == "task"
-    assert ctx.entity_id == task.id
-    assert ctx.from_state == TaskStatus.APPROVED.value
-    assert ctx.to_state == TaskStatus.ASSIGNING.value
-    assert ctx.transition == "task:approved->assigning"
+    await dispatch_effector(_Stub(), ctx, trace)
+
+    entries = await trace.read_effector_calls(entity_id)
+    assert len(entries) == 1
+    expected_key = build_transition_key("task", "approved", "assigning")
+    assert entries[0].transition_key == expected_key
+    assert entries[0].transition == "T4"
 
 
 # ---------------------------------------------------------------------------

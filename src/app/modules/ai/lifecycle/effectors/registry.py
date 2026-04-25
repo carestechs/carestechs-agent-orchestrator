@@ -90,6 +90,9 @@ async def dispatch_effector(
         entity_type=ctx.entity_type,
         entity_id=ctx.entity_id,
         transition=ctx.transition,
+        transition_key=build_transition_key(
+            ctx.entity_type, ctx.from_state, ctx.to_state
+        ),
         status=result.status,
         duration_ms=result.duration_ms,
         error_code=result.error_code,
@@ -169,6 +172,9 @@ class EffectorRegistry:
             entity_type=ctx.entity_type,
             entity_id=ctx.entity_id,
             transition=ctx.transition,
+            transition_key=build_transition_key(
+                ctx.entity_type, ctx.from_state, ctx.to_state
+            ),
             status=result.status,
             duration_ms=result.duration_ms,
             error_code=result.error_code,

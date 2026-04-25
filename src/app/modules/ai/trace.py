@@ -65,6 +65,17 @@ class TraceStore(Protocol):
         """
         ...
 
+    async def read_effector_calls(
+        self, entity_id: uuid.UUID
+    ) -> list[EffectorCallDto]:
+        """Replay every effector-call trace for *entity_id* in insertion order.
+
+        Backs the FEAT-008/T-172 invariant-3 check, where the test
+        enumerates declared transitions and asserts each one either
+        produced an effector_call trace or is ``no_effector``-exempt.
+        """
+        ...
+
     async def open_run_stream(
         self, run_id: uuid.UUID
     ) -> AsyncIterator[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]:
@@ -119,6 +130,13 @@ class NoopTraceStore:
         self, entity_id: uuid.UUID, call: EffectorCallDto
     ) -> None:
         """Accept and discard an effector-call trace entry (FEAT-008)."""
+
+    async def read_effector_calls(
+        self, entity_id: uuid.UUID
+    ) -> list[EffectorCallDto]:
+        """Return an empty list — the noop backend has no data."""
+        del entity_id
+        return []
 
     async def open_run_stream(
         self, run_id: uuid.UUID
