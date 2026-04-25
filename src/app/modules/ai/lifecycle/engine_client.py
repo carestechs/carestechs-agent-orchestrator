@@ -240,6 +240,24 @@ class FlowEngineLifecycleClient:
         data: dict[str, Any] = payload.get("data") or {}
         return uuid.UUID(str(data["id"]))
 
+    async def get_item_state(self, item_id: uuid.UUID) -> str | None:
+        """Return the engine's current state for *item_id*, or ``None`` if
+        the engine doesn't know the item (404).
+
+        Used by the reconcile-aux CLI (FEAT-008/T-170) to distinguish
+        "webhook was lost, transition landed server-side" (reconcile) from
+        "transition never landed" (preserve pending row for operator).
+        """
+        resp = await self._request("GET", f"/api/items/{item_id}")
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            _raise_engine_error(resp, where="get_item_state")
+        payload: dict[str, Any] = resp.json()
+        data: dict[str, Any] = payload.get("data") or {}
+        state = data.get("status")
+        return str(state) if state is not None else None
+
     async def transition_item(
         self,
         *,

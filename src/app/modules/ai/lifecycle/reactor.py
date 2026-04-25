@@ -210,7 +210,7 @@ async def _materialize_aux(
             correlation_id,
         )
         return
-    aux_row = _build_aux_row(pending)
+    aux_row = build_aux_row(pending)
     if aux_row is not None:
         db.add(aux_row)
     else:
@@ -223,7 +223,7 @@ async def _materialize_aux(
     await db.flush()
 
 
-def _build_aux_row(
+def build_aux_row(
     pending: PendingAuxWrite,
 ) -> Approval | TaskAssignment | TaskPlan | TaskImplementation | None:
     """Dispatch on ``payload['aux_type']`` to construct the target row."""
