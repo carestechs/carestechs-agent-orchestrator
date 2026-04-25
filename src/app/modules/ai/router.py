@@ -8,7 +8,6 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import JSONResponse
 
@@ -40,7 +39,7 @@ from app.modules.ai.lifecycle import reactor as lifecycle_reactor
 from app.modules.ai.lifecycle import service as lifecycle_service
 from app.modules.ai.lifecycle.declarations import WORK_ITEM_WORKFLOW_NAME
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
-from app.modules.ai.models import Task, WebhookEvent, WorkItem
+from app.modules.ai.models import Task, WorkItem
 from app.modules.ai.schemas import (
     AgentDto,
     CancelRunRequest,
@@ -698,8 +697,6 @@ async def receive_lifecycle_item_transitioned(
     ``lifecycle_item_transitioned``).  On a valid signature, the reactor
     dispatches derivations (W2/W5).  Idempotent via the delivery id.
     """
-    from sqlalchemy.dialects.postgresql import insert as _pg_insert
-
     raw: bytes = request.state.raw_body
 
     import json as _json
@@ -724,30 +721,15 @@ async def receive_lifecycle_item_transitioned(
     item_id: str | None = str(item_id_raw) if item_id_raw else None
     dedupe_key = f"lifecycle:{item_id or 'unknown'}:{delivery_id}"
 
-    stmt = (
-        _pg_insert(WebhookEvent)
-        .values(
-            run_id=None,
-            step_id=None,
-            event_type=WebhookEventType.LIFECYCLE_ITEM_TRANSITIONED.value,
-            engine_run_id=f"lifecycle:{item_id or 'unknown'}",
-            payload=parsed if isinstance(parsed, dict) else {},
-            signature_ok=sig_ok,
-            source=WebhookSource.ENGINE.value,
-            dedupe_key=dedupe_key,
-        )
-        .on_conflict_do_nothing(index_elements=["dedupe_key"])
-        .returning(WebhookEvent)
+    wh_event = await repository.upsert_webhook_event(
+        db,
+        event_type=WebhookEventType.LIFECYCLE_ITEM_TRANSITIONED.value,
+        engine_run_id=f"lifecycle:{item_id or 'unknown'}",
+        payload=body_dict,
+        signature_ok=sig_ok,
+        source=WebhookSource.ENGINE.value,
+        dedupe_key=dedupe_key,
     )
-    result = await db.execute(stmt)
-    row: WebhookEvent | None = result.scalar_one_or_none()
-    if row is None:
-        existing: WebhookEvent | None = await db.scalar(
-            select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
-        )
-        wh_event = existing
-    else:
-        wh_event = row
     await db.commit()
 
     if not sig_ok:
@@ -887,36 +869,19 @@ async def receive_github_pr(
         else f"github:pr:unknown:{delivery_id or 'unknown'}"
     )
 
-    from sqlalchemy.dialects.postgresql import insert as _pg_insert
-
-    stmt = (
-        _pg_insert(WebhookEvent)
-        .values(
-            run_id=None,
-            step_id=None,
-            event_type=WebhookEventType.GITHUB_PR_OPENED.value,
-            engine_run_id=f"github:pr:{pr_number or 'unknown'}",
-            payload=parsed_dict if isinstance(parsed_dict, dict) else {},
-            signature_ok=sig_ok,
-            source=WebhookSource.GITHUB.value,
-            dedupe_key=dedupe_key,
-        )
-        .on_conflict_do_nothing(index_elements=["dedupe_key"])
-        .returning(WebhookEvent)
+    parsed_dict_typed: dict[str, Any] = (
+        parsed_dict if isinstance(parsed_dict, dict) else {}  # type: ignore[assignment]
     )
-    result = await db.execute(stmt)
-    row = result.scalar_one_or_none()
-    if row is None:
-        existing: WebhookEvent | None = await db.scalar(
-            select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
-        )
-        wh_event = existing if existing is not None else None  # type: ignore[assignment]
-    else:
-        wh_event = row
+    wh_event = await repository.upsert_webhook_event(
+        db,
+        event_type=WebhookEventType.GITHUB_PR_OPENED.value,
+        engine_run_id=f"github:pr:{pr_number or 'unknown'}",
+        payload=parsed_dict_typed,
+        signature_ok=sig_ok,
+        source=WebhookSource.GITHUB.value,
+        dedupe_key=dedupe_key,
+    )
     await db.commit()
-    if wh_event is None:
-        # Shouldn't happen: either insert succeeded or the conflicting row exists.
-        raise RuntimeError("webhook event persistence failed")
 
     if not sig_ok:
         return JSONResponse(
@@ -941,9 +906,7 @@ async def receive_github_pr(
 
     if ref is not None and event.action in {"opened", "reopened"}:
         # Find the task by external_ref.
-        task: Task | None = await db.scalar(
-            select(Task).where(Task.external_ref == ref)
-        )
+        task = await repository.get_task_by_external_ref(db, ref)
         if task is not None:
             matched_task_id = str(task.id)
             try:

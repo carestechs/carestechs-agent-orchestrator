@@ -16,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.ai.models import PolicyCall, Run, RunSignal, Step
+from app.modules.ai.models import PolicyCall, Run, RunSignal, Step, Task, WebhookEvent
 
 # ---------------------------------------------------------------------------
 # Runs
@@ -73,19 +73,12 @@ async def get_run_by_id(db: AsyncSession, run_id: uuid.UUID) -> Run | None:
 
 
 async def count_steps(db: AsyncSession, run_id: uuid.UUID) -> int:
-    result = await db.scalar(
-        select(func.count()).select_from(Step).where(Step.run_id == run_id)
-    )
+    result = await db.scalar(select(func.count()).select_from(Step).where(Step.run_id == run_id))
     return int(result or 0)
 
 
 async def latest_step(db: AsyncSession, run_id: uuid.UUID) -> Step | None:
-    return await db.scalar(
-        select(Step)
-        .where(Step.run_id == run_id)
-        .order_by(Step.step_number.desc())
-        .limit(1)
-    )
+    return await db.scalar(select(Step).where(Step.run_id == run_id).order_by(Step.step_number.desc()).limit(1))
 
 
 async def select_steps(
@@ -97,11 +90,7 @@ async def select_steps(
 ) -> list[Step]:
     offset = max(page - 1, 0) * page_size
     result = await db.execute(
-        select(Step)
-        .where(Step.run_id == run_id)
-        .order_by(Step.step_number.asc())
-        .limit(page_size)
-        .offset(offset)
+        select(Step).where(Step.run_id == run_id).order_by(Step.step_number.asc()).limit(page_size).offset(offset)
     )
     return list(result.scalars().all())
 
@@ -112,11 +101,7 @@ async def select_steps(
 
 
 async def count_policy_calls(db: AsyncSession, run_id: uuid.UUID) -> int:
-    result = await db.scalar(
-        select(func.count())
-        .select_from(PolicyCall)
-        .where(PolicyCall.run_id == run_id)
-    )
+    result = await db.scalar(select(func.count()).select_from(PolicyCall).where(PolicyCall.run_id == run_id))
     return int(result or 0)
 
 
@@ -192,9 +177,7 @@ async def create_run_signal(
     row = result.scalar_one_or_none()
     if row is not None:
         return row, True
-    existing = await db.scalar(
-        select(RunSignal).where(RunSignal.dedupe_key == dedupe_key)
-    )
+    existing = await db.scalar(select(RunSignal).where(RunSignal.dedupe_key == dedupe_key))
     assert existing is not None, "UNIQUE constraint guarantees this row exists"
     return existing, False
 
@@ -205,8 +188,58 @@ async def select_signals_for_run(
 ) -> list[RunSignal]:
     """Return all signals for *run_id*, ordered by ``received_at`` ascending."""
     result = await db.execute(
-        select(RunSignal)
-        .where(RunSignal.run_id == run_id)
-        .order_by(RunSignal.received_at.asc(), RunSignal.id.asc())
+        select(RunSignal).where(RunSignal.run_id == run_id).order_by(RunSignal.received_at.asc(), RunSignal.id.asc())
     )
     return list(result.scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# Webhook events (engine + GitHub)
+# ---------------------------------------------------------------------------
+
+
+async def upsert_webhook_event(
+    db: AsyncSession,
+    *,
+    event_type: str,
+    engine_run_id: str,
+    payload: dict[str, Any],
+    signature_ok: bool,
+    source: str,
+    dedupe_key: str,
+) -> WebhookEvent:
+    """Persist a webhook event idempotently on ``dedupe_key``.
+
+    Used by both the lifecycle engine handler and the GitHub PR handler:
+    they MUST persist the event for forensics before any conditional
+    routing on signature outcome (CLAUDE.md: "Pre-persist webhook
+    events"). Returns the inserted row, or — on conflict — the existing
+    row keyed by ``dedupe_key``.
+    """
+    stmt = (
+        pg_insert(WebhookEvent)
+        .values(
+            run_id=None,
+            step_id=None,
+            event_type=event_type,
+            engine_run_id=engine_run_id,
+            payload=payload,
+            signature_ok=signature_ok,
+            source=source,
+            dedupe_key=dedupe_key,
+        )
+        .on_conflict_do_nothing(index_elements=["dedupe_key"])
+        .returning(WebhookEvent)
+    )
+    result = await db.execute(stmt)
+    row = result.scalar_one_or_none()
+    if row is not None:
+        return row
+    existing = await db.scalar(select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key))
+    assert existing is not None, "UNIQUE constraint guarantees this row exists"
+    return existing
+
+
+async def get_task_by_external_ref(db: AsyncSession, external_ref: str) -> Task | None:
+    """Fetch a single ``Task`` by its operator-facing reference (e.g. ``T-042``)."""
+    return await db.scalar(select(Task).where(Task.external_ref == external_ref))

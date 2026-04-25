@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.core.database import get_db_session
 from app.core.llm import StubLLMProvider, ToolDefinition
 from app.core.webhook_auth import sign_body
@@ -93,13 +93,9 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     skip_live = pytest.mark.skip(reason="live test: opt in with --run-live")
-    skip_engine = pytest.mark.skip(
-        reason="requires_engine: opt in with --run-requires-engine"
-    )
+    skip_engine = pytest.mark.skip(reason="requires_engine: opt in with --run-requires-engine")
     run_live = config.getoption("--run-live")
     run_engine = config.getoption("--run-requires-engine")
     for item in items:
@@ -150,9 +146,43 @@ def test_database_url() -> Iterator[str]:
             pass
 
 
+# Env vars that the dev ``.env`` commonly sets and that can otherwise leak
+# into test ``Settings()`` constructions, masking the values the test
+# infrastructure intends. Cleared in ``_test_env`` before any other fixture
+# runs.
+_LEAKING_ENV_VARS = (
+    "LLM_MODEL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MAX_TOKENS",
+    "ANTHROPIC_TIMEOUT_SECONDS",
+    "ENGINE_API_KEY",
+    "GITHUB_REPO",
+    "GITHUB_PAT",
+    "GITHUB_APP_ID",
+    "GITHUB_PRIVATE_KEY",
+    "GITHUB_WEBHOOK_SECRET",
+    "FLOW_ENGINE_LIFECYCLE_BASE_URL",
+    "FLOW_ENGINE_TENANT_API_KEY",
+    "PUBLIC_BASE_URL",
+    "TRACE_BACKEND",
+    "TRACE_DIR",
+    "AGENTS_DIR",
+    "REPO_ROOT",
+    "LOG_LEVEL",
+    "LIFECYCLE_MAX_CORRECTIONS",
+)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _test_env(test_database_url: str) -> Iterator[None]:
-    """Populate env vars so ``Settings()`` picks up the test DB everywhere."""
+    """Populate env vars + isolate ``Settings()`` from the developer's ``.env``.
+
+    Without ``env_file=None`` the dev ``.env`` overrides any value the test
+    infrastructure does not explicitly set — e.g. ``LLM_MODEL`` /
+    ``ANTHROPIC_API_KEY`` leak into ``test_config``, and ``SOLO_DEV_MODE``
+    leaks into FEAT-006/007 e2e tests. Disabling the env file at the class
+    level for the test session is the smallest fix that restores isolation.
+    """
     prior: dict[str, str | None] = {}
     overrides = {
         "DATABASE_URL": test_database_url,
@@ -160,14 +190,25 @@ def _test_env(test_database_url: str) -> Iterator[None]:
         "ENGINE_WEBHOOK_SECRET": WEBHOOK_SECRET,
         "ENGINE_BASE_URL": ENGINE_BASE_URL,
         "LLM_PROVIDER": "stub",
+        # Solo mode is the default for integration tests — every signal in
+        # FEAT-006 e2e is performed by the same admin actor, so peer-review
+        # gating MUST be disabled by default. Test files that exercise the
+        # peer-review path can override per-test.
+        "SOLO_DEV_MODE": "true",
     }
     for key, value in overrides.items():
         prior[key] = os.environ.get(key)
         os.environ[key] = value
+    for key in _LEAKING_ENV_VARS:
+        prior[key] = os.environ.get(key)
+        os.environ.pop(key, None)
+    prior_env_file = Settings.model_config.get("env_file")
+    Settings.model_config["env_file"] = None
     get_settings.cache_clear()
     try:
         yield
     finally:
+        Settings.model_config["env_file"] = prior_env_file
         for key, original in prior.items():
             if original is None:
                 os.environ.pop(key, None)
@@ -191,9 +232,7 @@ def migrated(test_database_url: str, _test_env: None) -> None:
 
 
 @pytest_asyncio.fixture(loop_scope="function")
-async def engine(
-    migrated: None, test_database_url: str
-) -> AsyncIterator[AsyncEngine]:
+async def engine(migrated: None, test_database_url: str) -> AsyncIterator[AsyncEngine]:
     eng = create_async_engine(test_database_url, pool_pre_ping=True)
     try:
         yield eng
@@ -247,9 +286,7 @@ def app(db_session: AsyncSession) -> FastAPI:
 
 @pytest_asyncio.fixture(loop_scope="function")
 async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as c:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
 
 
