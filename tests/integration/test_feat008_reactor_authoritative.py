@@ -20,9 +20,12 @@ Invariants proved:
   pre-FEAT-008 inline-write path is preserved end-to-end. Runs in the
   default suite (no ``requires_engine`` mark).
 
-Invariant 3 ("every transition fires an effector or is exempt") is
-deferred — it depends on T-162 (GitHub check effector) and T-171
-(startup validator). A follow-on extends this module once those land.
+* **Effectors fire at runtime via the reactor.** A registered effector
+  on ``task:approved->assigning`` is invoked end-to-end when the
+  matching engine webhook arrives — proves the route handler threads
+  ``app.state.effector_registry`` through and the reactor calls
+  ``fire_all``. Closes the AC-5 invocation gap (FEAT-008/T-173); T-171
+  separately enforces the static coverage claim.
 
 Do not weaken these assertions to make a flaky test pass —
 investigate the regression instead.
@@ -311,21 +314,87 @@ async def test_status_cache_updates_only_via_reactor(
 
 
 # ---------------------------------------------------------------------------
-# Invariant 3 (deferred): every transition fires an effector or is exempt
+# Invariant 3: registered effectors fire at runtime via the reactor
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Deferred to T-172 follow-on: requires T-162 (GitHub effector) + "
-    "T-171 (startup validator + transition catalog) to be in place first."
-)
-async def test_every_transition_fires_an_effector() -> None:
-    """Placeholder.
+async def test_registered_effector_fires_on_reactor_dispatch(
+    app: FastAPI,
+    client: AsyncClient,
+    api_key: str,
+    webhook_secret: str,
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end proof of FEAT-008/T-173: reactor invokes ``fire_all``.
 
-    Once T-162 + T-171 land, this asserts that the ``effector_call`` trace
-    stream has an entry for every transition in the declared workflows,
-    or the transition is in ``iter_no_effector_exemptions()``.
+    AC-3 + AC-5 are *runtime* claims, not just registration claims:
+    the route handler must thread ``app.state.effector_registry`` into
+    the reactor, and the reactor must call ``fire_all`` so registered
+    effectors actually run when the matching webhook arrives.
+
+    We mount a recording registry on ``app.state``, deliver an
+    approve-task → ``approved->assigning`` webhook, and assert the
+    recorded effector fired with the expected ``EffectorContext``.
     """
+    from typing import ClassVar
+
+    from app.modules.ai.lifecycle.effectors.context import (
+        EffectorContext,
+        EffectorResult,
+    )
+    from app.modules.ai.lifecycle.effectors.registry import EffectorRegistry
+    from app.modules.ai.trace import NoopTraceStore
+
+    fired: list[EffectorContext] = []
+
+    class _RecordingEffector:
+        name: ClassVar[str] = "recording"
+
+        async def fire(self, ctx: EffectorContext) -> EffectorResult:
+            fired.append(ctx)
+            return EffectorResult(
+                effector_name=self.name, status="ok", duration_ms=0
+            )
+
+    registry = EffectorRegistry(trace=NoopTraceStore())
+    registry.register("task:approved->assigning", _RecordingEffector())
+    app.state.effector_registry = registry
+
+    engine = _mock_engine()
+    _inject_engine(app, engine)
+
+    r = await client.post(
+        "/api/v1/work-items",
+        json={"externalRef": "FEAT-INV3", "type": "FEAT", "title": "inv3"},
+        headers=_h(api_key),
+    )
+    assert r.status_code == 202, r.text
+    wi_id = uuid.UUID(r.json()["data"]["id"])
+
+    engine_item_id = uuid.uuid4()
+    task = await _seed_task(
+        db_session,
+        work_item_id=wi_id,
+        ref="T-INV3-a",
+        engine_item_id=engine_item_id,
+    )
+
+    await _deliver_webhook(
+        client,
+        webhook_secret=webhook_secret,
+        item_id=engine_item_id,
+        correlation_id=None,
+        from_status=TaskStatus.APPROVED.value,
+        to_status=TaskStatus.ASSIGNING.value,
+    )
+
+    assert len(fired) == 1, "reactor must invoke fire_all on the matching key"
+    ctx = fired[0]
+    assert ctx.entity_type == "task"
+    assert ctx.entity_id == task.id
+    assert ctx.from_state == TaskStatus.APPROVED.value
+    assert ctx.to_state == TaskStatus.ASSIGNING.value
+    assert ctx.transition == "task:approved->assigning"
 
 
 # ---------------------------------------------------------------------------

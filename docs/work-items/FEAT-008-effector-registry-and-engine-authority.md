@@ -12,7 +12,7 @@
 | **ID** | FEAT-008 |
 | **Name** | Effector Registry + Engine-as-Authority |
 | **Target Version** | v0.7.0 |
-| **Status** | Not Started |
+| **Status** | Completed |
 | **Priority** | High |
 | **Requested By** | Tech Lead (architectural drift detected post-FEAT-007) |
 | **Date Created** | 2026-04-21 |

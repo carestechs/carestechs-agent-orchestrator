@@ -26,14 +26,21 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.modules.ai.enums import TaskStatus, WorkItemStatus
 from app.modules.ai.lifecycle import declarations, work_items
+from app.modules.ai.lifecycle.effectors.context import EffectorContext
+from app.modules.ai.lifecycle.effectors.registry import (
+    EffectorRegistry,
+    build_transition_key,
+)
 from app.modules.ai.lifecycle.engine_client import extract_correlation_id
 from app.modules.ai.models import (
     Approval,
@@ -81,12 +88,20 @@ async def handle_transition(
     event: LifecycleWebhookEvent,
     *,
     workflow_name_by_id: dict[uuid.UUID, str] | None = None,
+    registry: EffectorRegistry | None = None,
+    settings: Settings | None = None,
 ) -> None:
     """Dispatch a lifecycle webhook to the appropriate derivation.
 
     *workflow_name_by_id* is a mapping the reactor uses to resolve which
     of the two workflows the item belongs to.  Supplied by the caller
     (the route handler) from ``app.state.lifecycle_workflow_ids``.
+
+    *registry* + *settings* are supplied by the route handler from
+    ``app.state.effector_registry`` + the cached settings (FEAT-008/T-173).
+    When either is ``None`` the reactor skips effector dispatch — keeps
+    test fixtures that don't care about effectors free of registry
+    boilerplate.
     """
     workflow_name = None
     if workflow_name_by_id is not None:
@@ -121,6 +136,15 @@ async def handle_transition(
     # deleted; payload is used by the outbox materialization above when
     # the correlation matched.
     await _consume_correlation(db, event.data.triggered_by)
+
+    # FEAT-008/T-173: dispatch registered effectors for this transition.
+    # Fires after the status-cache write so effectors observing the local
+    # row see the engine's authoritative state. Fires before W2/W5
+    # derivations so the originating transition's effectors run first.
+    if registry is not None and settings is not None:
+        await _dispatch_effectors(
+            db, event, workflow_name, registry, settings, corr
+        )
 
     to_status = event.data.to_status
     if workflow_name == declarations.TASK_WORKFLOW_NAME:
@@ -297,6 +321,64 @@ async def _consume_correlation(
     )
     await db.delete(row)
     await db.flush()
+
+
+async def _dispatch_effectors(
+    db: AsyncSession,
+    event: LifecycleWebhookEvent,
+    workflow_name: str,
+    registry: EffectorRegistry,
+    settings: Settings,
+    correlation_id: uuid.UUID | None,
+) -> None:
+    """Fire ``registry.fire_all`` for the transition resolved from *event*.
+
+    Looks up the local entity by ``engine_item_id`` to populate
+    :attr:`EffectorContext.entity_id` — effectors expect the *local* UUID,
+    not the engine's. Cache miss is logged + skipped (mirrors
+    :func:`_update_status_cache`).
+    """
+    to_status = event.data.to_status
+    from_status = event.data.from_status
+    if to_status is None:
+        return
+
+    entity_type: Literal["work_item", "task"]
+    if workflow_name == declarations.TASK_WORKFLOW_NAME:
+        entity_type = "task"
+        task = await db.scalar(
+            select(Task).where(Task.engine_item_id == event.item_id)
+        )
+        entity_id = task.id if task is not None else None
+    elif workflow_name == declarations.WORK_ITEM_WORKFLOW_NAME:
+        entity_type = "work_item"
+        wi = await db.scalar(
+            select(WorkItem).where(WorkItem.engine_item_id == event.item_id)
+        )
+        entity_id = wi.id if wi is not None else None
+    else:
+        return
+
+    if entity_id is None:
+        logger.info(
+            "effector dispatch: %s engine_item_id=%s not found locally; skipping",
+            entity_type,
+            event.item_id,
+        )
+        return
+
+    transition = build_transition_key(entity_type, from_status, to_status)
+    ctx = EffectorContext(
+        entity_type=entity_type,
+        entity_id=entity_id,
+        from_state=from_status,
+        to_state=to_status,
+        transition=transition,
+        correlation_id=correlation_id,
+        db=db,
+        settings=settings,
+    )
+    await registry.fire_all(ctx)
 
 
 async def _infer_workflow_from_item(
