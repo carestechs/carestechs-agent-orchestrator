@@ -217,6 +217,42 @@ TEST_FLOW_ENGINE_TENANT_KEY=<tenant-key> \
 uv run pytest -m requires_engine --run-requires-engine
 ```
 
+## Deployment
+
+Two supported shapes:
+
+- **Standalone** (default for solo dev): `docker compose up -d` from this
+  repo brings up a self-contained Postgres + the API. `.env` keeps its
+  `localhost` URLs. Nothing else required.
+- **DevTools umbrella**: when running alongside `carestechs-flow-engine`
+  (and other DevTools projects) under a shared Postgres + Docker network.
+  See [`devtools-umbrella.md`](../devtools-umbrella.md) at the parent
+  `~/Desktop/Repos/DevTools/` directory for the pattern. Under the
+  umbrella:
+
+  - `docker-compose.prod.yml` joins the external `infra` network and does
+    NOT bring up its own postgres; the shared cluster's
+    `agent_orchestrator` database is used instead.
+  - `.env` switches to umbrella values: `DATABASE_URL` host = `postgres`,
+    `ENGINE_BASE_URL` = `http://flowengine-api:8080`. The `.env.example`
+    carries both forms commented for switching.
+  - The container's entrypoint runs `alembic upgrade head` before starting
+    the API, so a cold boot against the shared cluster's empty database
+    is safe. Set `SKIP_MIGRATIONS=1` to bypass.
+  - The API is reachable from sibling containers as
+    `http://orchestrator-api:8000`. No host port binding under the
+    umbrella — the standalone `docker-compose.yml` is the path for direct
+    host access.
+
+Build + run under the umbrella (assumes the umbrella's `infra/` is up and
+the `infra` network exists):
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml logs -f orchestrator-api
+docker compose -f docker-compose.prod.yml exec orchestrator-api alembic current
+```
+
 ## Operations
 
 The orchestrator's lifecycle subsystem follows the [engine-as-authority architecture](docs/design/feat-008-engine-as-authority.md): the flow engine owns work-item / task state, the orchestrator is the gateway + reactor, and the effector registry is the outbound surface for every transition. See `docs/ARCHITECTURE.md` § Lifecycle Subsystem for the full pipeline.

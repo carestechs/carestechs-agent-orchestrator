@@ -35,9 +35,15 @@ COPY --from=builder /build/.venv .venv/
 # Copy the application source (needed if any runtime path references src/).
 COPY --from=builder /build/src/ src/
 
-# Alembic config lives at repo root; copy it so migrations can run inside the
-# container if needed.
+# Alembic config lives at repo root; copy it so the entrypoint can run
+# migrations inside the container before the API starts serving.
 COPY alembic.ini .
+
+# Entrypoint runs ``alembic upgrade head`` then execs the CMD. Lives under
+# /usr/local/bin so it's on PATH for any user. Set SKIP_MIGRATIONS=1 to
+# bypass the migration step (e.g. while debugging a broken migration).
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Activate the venv by prepending it to PATH.
 ENV PATH="/home/appuser/.venv/bin:$PATH" \
@@ -48,4 +54,5 @@ USER appuser
 
 EXPOSE 8000
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
