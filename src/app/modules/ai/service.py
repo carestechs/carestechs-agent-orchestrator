@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from app.config import Settings
     from app.core.llm import LLMProvider
     from app.modules.ai.engine_client import FlowEngineClient
+    from app.modules.ai.executors.registry import ExecutorRegistry
     from app.modules.ai.supervisor import RunSupervisor
     from app.modules.ai.trace import TraceStore
 
@@ -80,6 +81,7 @@ async def start_run(
     policy: LLMProvider,
     engine: FlowEngineClient,
     trace: TraceStore,
+    registry: ExecutorRegistry | None = None,
 ) -> RunSummaryDto:
     """Start a new agent run.  Returns immediately with the run summary.
 
@@ -121,17 +123,43 @@ async def start_run(
         await session.refresh(run)
 
     # 4. Spawn the supervised loop; the request returns immediately after.
-    def _factory(event: asyncio.Event) -> Any:
-        return run_loop(
-            run_id=run_id,
-            agent=agent,
-            policy=policy,
-            engine=engine,
-            trace=trace,
-            supervisor=supervisor,
-            session_factory=session_factory,
-            cancel_event=event,
-        )
+    if agent.flow.policy == "deterministic":
+        from app.modules.ai.runtime_deterministic import run_deterministic_loop
+
+        if registry is None:
+            raise ValueError(
+                f"agent {agent.ref!r} declares flow.policy='deterministic' but the "
+                "executor registry was not provided to start_run; the route is "
+                "responsible for threading app.state.executor_registry through"
+            )
+
+        captured_registry = registry  # narrow Optional → non-None for closure
+        captured_timeout = settings.executor_dispatch_timeout_seconds
+
+        def _factory(event: asyncio.Event) -> Any:
+            return run_deterministic_loop(
+                run_id=run_id,
+                agent=agent,
+                trace=trace,
+                supervisor=supervisor,
+                registry=captured_registry,
+                session_factory=session_factory,
+                cancel_event=event,
+                dispatch_timeout_seconds=captured_timeout,
+            )
+    else:
+
+        def _factory(event: asyncio.Event) -> Any:
+            return run_loop(
+                run_id=run_id,
+                agent=agent,
+                policy=policy,
+                engine=engine,
+                trace=trace,
+                supervisor=supervisor,
+                session_factory=session_factory,
+                cancel_event=event,
+            )
 
     supervisor.spawn(run_id, _factory)
 

@@ -1,6 +1,8 @@
 # FEAT-009 — Orchestrator as a Pure Orchestrator
 
-**Status:** Accepted · **Date:** 2026-04-26 · **Supersedes (in part):** the "Policy via tool calling" decision (shared ADR repo: `adrs/ai/policy-via-tool-calling.md`) — the runtime loop's *node selection* path. Per-call LLM tool-calling **inside individual executors** is unchanged.
+**Status:** Accepted · **Date:** 2026-04-26 · **Repositions (does not remove):** the "Policy via tool calling" decision (shared ADR repo: `adrs/ai/policy-via-tool-calling.md`). LLM-as-policy is preserved as an **opt-in mode** for agents declaring `flow.policy: llm`. Deterministic flow resolution becomes the default for agents declaring `flow.policy: deterministic`. Per-call LLM tool-calling **inside individual executors** is unchanged in either mode.
+
+> **Revision note (2026-04-26, mid-implementation):** the first draft framed the LLM-policy path as deprecated drift to be removed. That framing was tightened: LLM-policy is a *legitimate* mode for agents whose branches genuinely require model judgment, not a drift. What this FEAT lands is therefore *repositioning*, not removal — deterministic resolution is the default, LLM-policy is opt-in. The structural guard (T-228) polices the deterministic path only.
 
 ## Context
 

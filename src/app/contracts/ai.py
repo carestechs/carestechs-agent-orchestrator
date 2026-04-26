@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings
 from app.core.llm import LLMProvider
 from app.modules.ai.engine_client import FlowEngineClient
+from app.modules.ai.executors.registry import ExecutorRegistry
 from app.modules.ai.schemas import (
     AgentDto,
     CancelRunRequest,
@@ -45,6 +46,7 @@ class IAIService(Protocol):
         policy: LLMProvider,
         engine: FlowEngineClient,
         trace: TraceStore,
+        registry: ExecutorRegistry | None = None,
     ) -> RunSummaryDto: ...
 
     async def list_runs(
