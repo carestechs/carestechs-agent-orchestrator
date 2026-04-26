@@ -62,8 +62,28 @@ async def require_flow_engine_signature(
     """
     body: bytes = request.state.raw_body
     header = request.headers.get("x-flowengine-signature")
-    ok = verify_signature(
-        body, header, settings.engine_webhook_secret.get_secret_value()
-    )
+    ok = verify_signature(body, header, settings.engine_webhook_secret.get_secret_value())
+    request.state.signature_ok = ok
+    return ok
+
+
+async def require_executor_signature(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+) -> bool:
+    """FEAT-009 / T-216: verify ``X-Executor-Signature`` for ``/hooks/executors/*``.
+
+    Uses ``executor_dispatch_secret`` (single shared secret across remote
+    executors in v0.4.0; per-executor rotation is a future FEAT). When the
+    secret is unset the verification fails closed — operators must
+    configure ``EXECUTOR_DISPATCH_SECRET`` to enable remote dispatch.
+    Failure does not raise; the route decides how to respond.
+    """
+    body: bytes = request.state.raw_body
+    header = request.headers.get("x-executor-signature")
+    if settings.executor_dispatch_secret is None:
+        request.state.signature_ok = False
+        return False
+    ok = verify_signature(body, header, settings.executor_dispatch_secret.get_secret_value())
     request.state.signature_ok = ok
     return ok

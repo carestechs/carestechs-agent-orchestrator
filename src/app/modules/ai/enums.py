@@ -77,6 +77,9 @@ class WebhookEventType(StrEnum):
     GITHUB_PR_OPENED = "github_pr_opened"
     GITHUB_PR_CLOSED = "github_pr_closed"
     LIFECYCLE_ITEM_TRANSITIONED = "lifecycle_item_transitioned"
+    # FEAT-009 / T-216 — remote executor reported terminal dispatch state
+    # via /hooks/executors/{executor_id}.
+    EXECUTOR_DISPATCH_RESULT = "executor_dispatch_result"
 
 
 class WebhookSource(StrEnum):

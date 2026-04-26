@@ -58,9 +58,7 @@ AND re-reads ``Run.status`` when deciding whether to close the stream.
 Module-level so tests monkeypatch it to ~0.01 for speed."""
 
 
-_KIND_BY_TYPE: dict[
-    type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto], str
-] = {
+_KIND_BY_TYPE: dict[type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto], str] = {
     StepDto: "step",
     PolicyCallDto: "policy_call",
     WebhookEventDto: "webhook_event",
@@ -175,11 +173,7 @@ async def get_run(
 
     step_count = await repository.count_steps(db, run_id)
     last = await repository.latest_step(db, run_id)
-    last_dto = (
-        LastStepSummary.model_validate(last, from_attributes=True)
-        if last is not None
-        else None
-    )
+    last_dto = LastStepSummary.model_validate(last, from_attributes=True) if last is not None else None
 
     return RunDetailDto(
         id=run.id,
@@ -267,9 +261,7 @@ async def send_signal(
     if RunStatus(run.status) in _TERMINAL_STATUSES:
         raise ConflictError(f"run already terminal: {run.status}")
 
-    memory_row = await db.scalar(
-        select(RunMemory).where(RunMemory.run_id == run_id)
-    )
+    memory_row = await db.scalar(select(RunMemory).where(RunMemory.run_id == run_id))
     memory_data: dict[str, Any] = (memory_row.data if memory_row is not None else {}) or {}
     tasks_raw: Any = memory_data.get("tasks") or []
     known_task_ids: set[str] = set()
@@ -300,8 +292,74 @@ async def send_signal(
         except Exception:
             logger.warning("trace write failed for operator signal", exc_info=True)
         supervisor.deliver_signal(run_id, name, task_id, payload)
+        # FEAT-009 / T-217: if a human-executor dispatch is awaiting this
+        # signal, deliver to its future as well. Pre-FEAT-009 callers (no
+        # dispatch row in flight) hit a no-op; the legacy ``deliver_signal``
+        # path above is what wakes them.
+        await _deliver_to_human_dispatch(
+            db,
+            run_id=run_id,
+            signal_name=name,
+            task_id=task_id,
+            payload=payload,
+            supervisor=supervisor,
+        )
 
     return dto, created
+
+
+async def _deliver_to_human_dispatch(
+    db: AsyncSession,
+    *,
+    run_id: uuid.UUID,
+    signal_name: str,
+    task_id: str,
+    payload: dict[str, Any],
+    supervisor: RunSupervisor,
+) -> None:
+    """Deliver to the matching in-flight human-executor Dispatch (if any).
+
+    Looks up dispatches in ``dispatched`` state with ``mode='human'``
+    owned by ``run_id``.  If exactly one exists, mark it ``completed``
+    and call :meth:`RunSupervisor.deliver_dispatch`.  Multiple in-flight
+    human dispatches per run is a defensive log + no-op — under v0.1.0
+    there is at most one operator-pause active at any time, and PR 5's
+    loop swap is what threads precise pairing through.
+    """
+    from datetime import UTC, datetime
+
+    from app.modules.ai.enums import DispatchMode, DispatchState
+    from app.modules.ai.models import Dispatch
+    from app.modules.ai.schemas import DispatchEnvelope
+
+    rows = (
+        await db.scalars(
+            select(Dispatch).where(
+                Dispatch.run_id == run_id,
+                Dispatch.mode == DispatchMode.HUMAN,
+                Dispatch.state == DispatchState.DISPATCHED,
+            )
+        )
+    ).all()
+    if not rows:
+        return
+    if len(rows) > 1:
+        logger.warning(
+            "send_signal: %d in-flight human dispatches for run %s; "
+            "deferring delivery until PR 5 wires explicit pairing",
+            len(rows),
+            run_id,
+        )
+        return
+    dispatch = rows[0]
+    now = datetime.now(UTC)
+    dispatch.mark_completed(
+        at=now,
+        result={"signal_name": signal_name, "task_id": task_id, "payload": payload},
+    )
+    await db.commit()
+    envelope = DispatchEnvelope.model_validate(dispatch, from_attributes=True)
+    supervisor.deliver_dispatch(dispatch.dispatch_id, envelope)
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +402,7 @@ async def list_policy_calls(
         raise NotFoundError(f"run not found: {run_id}")
 
     total = await repository.count_policy_calls(db, run_id)
-    rows = await repository.select_policy_calls(
-        db, run_id, page=page, page_size=page_size
-    )
+    rows = await repository.select_policy_calls(db, run_id, page=page, page_size=page_size)
     items = [PolicyCallDto.model_validate(r, from_attributes=True) for r in rows]
     return items, total
 
@@ -376,9 +432,7 @@ async def stream_trace(
     if run is None:
         raise NotFoundError(f"run not found: {run_id}")
 
-    iterator = trace.tail_run_stream(
-        run_id, follow=follow, since=since, kinds=kinds
-    )
+    iterator = trace.tail_run_stream(run_id, follow=follow, since=since, kinds=kinds)
 
     if not follow:
         async for dto in iterator:
@@ -390,17 +444,13 @@ async def stream_trace(
     # and periodically re-checks ``Run.status`` to decide when to close.
     # Separating the two keeps us from cancelling the aiofiles-backed
     # iterator mid-``readline`` (which leaves it in a half-read state).
-    queue: asyncio.Queue[
-        StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto | None
-    ] = asyncio.Queue()
+    queue: asyncio.Queue[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto | None] = asyncio.Queue()
     reader = asyncio.create_task(_drain_iterator(iterator, queue))
     try:
         empty_polls = 0
         while True:
             try:
-                dto = await asyncio.wait_for(
-                    queue.get(), timeout=_TAIL_POLL_SECONDS
-                )
+                dto = await asyncio.wait_for(queue.get(), timeout=_TAIL_POLL_SECONDS)
             except TimeoutError:
                 await db.refresh(run)
                 if RunStatus(run.status) in _TERMINAL_STATUSES:
@@ -424,9 +474,7 @@ async def stream_trace(
 
 async def _drain_iterator(
     iterator: AsyncIterator[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto],
-    queue: asyncio.Queue[
-        StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto | None
-    ],
+    queue: asyncio.Queue[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto | None],
 ) -> None:
     """Forward every DTO from *iterator* into *queue*; enqueue ``None`` on end."""
     try:
@@ -441,12 +489,7 @@ def _serialize_trace_record(
 ) -> str:
     """Render a trace DTO as a single NDJSON line ending in ``\\n``."""
     kind = _KIND_BY_TYPE[type(dto)]
-    return (
-        json.dumps(
-            {"kind": kind, "data": dto.model_dump(mode="json", by_alias=True)}
-        )
-        + "\n"
-    )
+    return json.dumps({"kind": kind, "data": dto.model_dump(mode="json", by_alias=True)}) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -494,9 +537,7 @@ async def _persist_event(
     event_type: str = event_body["event_type"]
     payload: dict[str, Any] = event_body.get("payload", {}) or {}
 
-    existing = await db.scalar(
-        select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
-    )
+    existing = await db.scalar(select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key))
     if existing is not None:
         return existing, False
 
@@ -522,9 +563,7 @@ async def _persist_event(
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        winner = await db.scalar(
-            select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
-        )
+        winner = await db.scalar(select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key))
         if winner is None:  # pragma: no cover — unexpected constraint violation
             raise
         return winner, False
@@ -576,6 +615,113 @@ async def _reconcile_step_from_event(
 
     await db.commit()
     return True
+
+
+async def handle_executor_webhook(
+    *,
+    executor_id: str,
+    body: dict[str, Any],
+    raw_body: bytes,
+    signature_ok: bool,
+    db: AsyncSession,
+    supervisor: RunSupervisor,
+) -> tuple[uuid.UUID, str]:
+    """Process a remote-executor webhook (FEAT-009 / T-216).
+
+    Returns ``(webhook_event_id, status)`` where ``status`` is one of:
+
+    * ``"signature_invalid"`` — caller should return 401.
+    * ``"unknown_dispatch"`` — caller should return 404.
+    * ``"already_received"`` — terminal with same outcome; 200 + idempotent.
+    * ``"conflict"`` — terminal with different outcome; 409.
+    * ``"delivered"`` — newly terminal; 200.
+
+    Persist-first: the ``webhook_events`` row is written for every inbound
+    delivery (including bad signatures) before any dispatch state changes.
+    Mirrors the FEAT-006 ``/hooks/engine/*`` discipline.
+    """
+    import uuid as _uuid
+    from datetime import UTC, datetime
+
+    from app.modules.ai.enums import (
+        DispatchOutcome,
+        DispatchState,
+        WebhookEventType,
+        WebhookSource,
+    )
+    from app.modules.ai.models import Dispatch
+    from app.modules.ai.schemas import DispatchEnvelope
+
+    dispatch_id_raw = body.get("dispatchId") or body.get("dispatch_id")
+    try:
+        dispatch_id = _uuid.UUID(str(dispatch_id_raw))
+    except (TypeError, ValueError):
+        dispatch_id = None  # type: ignore[assignment]
+
+    dedupe_key = f"executor:{executor_id}:{dispatch_id}:{body.get('outcome', 'unknown')}"
+    engine_run_id = f"executor:{dispatch_id or 'unknown'}"
+
+    existing_event = await db.scalar(select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key))
+    if existing_event is not None:
+        webhook_event_id = existing_event.id
+    else:
+        new_event = WebhookEvent(
+            run_id=None,
+            step_id=None,
+            event_type=WebhookEventType.EXECUTOR_DISPATCH_RESULT.value,
+            engine_run_id=engine_run_id,
+            payload=body,
+            signature_ok=signature_ok,
+            source=WebhookSource.ENGINE.value,
+            dedupe_key=dedupe_key,
+        )
+        db.add(new_event)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            winner = await db.scalar(select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key))
+            if winner is None:  # pragma: no cover
+                raise
+            new_event = winner
+        webhook_event_id = new_event.id
+
+    if not signature_ok:
+        return webhook_event_id, "signature_invalid"
+    if dispatch_id is None:
+        return webhook_event_id, "unknown_dispatch"
+
+    dispatch = await db.scalar(select(Dispatch).where(Dispatch.dispatch_id == dispatch_id))
+    if dispatch is None:
+        return webhook_event_id, "unknown_dispatch"
+
+    incoming_outcome = body.get("outcome")
+    result_payload: dict[str, Any] | None = body.get("result") if isinstance(body.get("result"), dict) else None  # type: ignore[arg-type]
+    detail: str | None = body.get("detail") if isinstance(body.get("detail"), str) else None  # type: ignore[arg-type]
+
+    if dispatch.state in (DispatchState.COMPLETED, DispatchState.FAILED, DispatchState.CANCELLED):
+        prev_outcome = dispatch.outcome
+        if (incoming_outcome == "ok" and prev_outcome == DispatchOutcome.OK) or (
+            incoming_outcome == "error" and prev_outcome == DispatchOutcome.ERROR
+        ):
+            return webhook_event_id, "already_received"
+        return webhook_event_id, "conflict"
+
+    now = datetime.now(UTC)
+    if dispatch.state == DispatchState.PENDING:
+        dispatch.mark_dispatched(at=now)
+    if incoming_outcome == "ok":
+        dispatch.mark_completed(at=now, result=result_payload, detail=detail)
+    else:
+        dispatch.mark_failed(at=now, result=result_payload, detail=detail)
+    await db.commit()
+
+    envelope = DispatchEnvelope.model_validate(dispatch, from_attributes=True)
+    supervisor.deliver_dispatch(dispatch.dispatch_id, envelope)
+    # Quiet the unused-vars hint; raw_body is reserved for future
+    # signature-rotation work (T-215 follow-up).
+    del raw_body
+    return webhook_event_id, "delivered"
 
 
 async def ingest_engine_event(

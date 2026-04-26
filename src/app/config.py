@@ -119,6 +119,16 @@ class Settings(BaseSettings):
     # Get from your engine admin / JWT subject. Validated below.
     flow_engine_tenant_id: uuid.UUID | None = None
 
+    # -- Executor seam (FEAT-009) -----------------------------------------
+    # Shared HMAC secret remote executors sign their callback POST with.
+    # Single secret for all remote executors initially; per-executor rotation
+    # is a future FEAT and should not pre-bake assumptions here.
+    executor_dispatch_secret: SecretStr | None = None
+    # Per-dispatch upper bound the runtime loop applies when awaiting a
+    # remote/human executor's webhook reply. Local executors are bounded by
+    # their own callable; they ignore this setting.
+    executor_dispatch_timeout_seconds: int = 600
+
     # -- Observability -----------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     trace_backend: Literal["noop", "jsonl"] = "jsonl"
@@ -136,9 +146,7 @@ class Settings(BaseSettings):
 
         key = self.anthropic_api_key
         if key is None or not key.get_secret_value().strip():
-            raise ValueError(
-                "anthropic_api_key is required when llm_provider='anthropic'"
-            )
+            raise ValueError("anthropic_api_key is required when llm_provider='anthropic'")
         if self.llm_model is None or not self.llm_model.strip():
             self.llm_model = "claude-opus-4-7"
         return self
@@ -158,13 +166,9 @@ class Settings(BaseSettings):
         has_app = has_app_id and has_app_key
 
         if has_app_id != has_app_key:
-            raise ValueError(
-                "github_app_id and github_private_key must be configured together"
-            )
+            raise ValueError("github_app_id and github_private_key must be configured together")
         if has_pat and has_app:
-            raise ValueError(
-                "configure GITHUB_PAT or GITHUB_APP_ID+GITHUB_PRIVATE_KEY, not both"
-            )
+            raise ValueError("configure GITHUB_PAT or GITHUB_APP_ID+GITHUB_PRIVATE_KEY, not both")
         return self
 
     @model_validator(mode="after")

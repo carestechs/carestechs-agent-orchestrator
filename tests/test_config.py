@@ -86,6 +86,8 @@ class TestSettingsFields:
             "trace_backend",
             "engine_dispatch_timeout_seconds",
             "public_base_url",
+            "executor_dispatch_secret",
+            "executor_dispatch_timeout_seconds",
         }
         assert expected == set(Settings.model_fields.keys())
 
