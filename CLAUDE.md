@@ -83,13 +83,27 @@ src/app/
 │   └── ai.py                   — IAIService protocol for cross-module callers (none in v1)
 ├── modules/ai/                 — The only feature module in v1
 │   ├── router.py               — /api/v1/* + /hooks/engine/*
-│   ├── service.py              — Agent runtime loop, trace emission, stop conditions
-│   ├── models.py               — Run, Step, PolicyCall, WebhookEvent, RunMemory, RunSignal, WorkItem, Task, TaskAssignment, Approval, LifecycleSignal, EngineWorkflow (SQLAlchemy)
+│   ├── service.py              — Agent runtime entry point (start_run routes to runtime.py for flow.policy=llm or runtime_deterministic.py for flow.policy=deterministic), trace emission, stop conditions
+│   ├── runtime.py              — LLM-policy runtime loop (legacy, opt-in mode)
+│   ├── runtime_deterministic.py — Deterministic-policy runtime loop (FEAT-009 default for new agents — never imports core.llm)
+│   ├── flow_resolver.py        — Pure-function next-node selection for flow.policy=deterministic (FEAT-009 / T-211)
+│   ├── flow_predicates.py      — Branch-rule predicate registry consumed by FlowResolver
+│   ├── models.py               — Run, Step, PolicyCall, WebhookEvent, RunMemory, RunSignal, WorkItem, Task, TaskAssignment, Approval, LifecycleSignal, EngineWorkflow, Dispatch (SQLAlchemy)
 │   ├── schemas.py              — Pydantic DTOs mirroring data-model.md
 │   ├── dependencies.py         — AI-specific FastAPI deps (policy factory, engine client, lifecycle engine client, actor-role guard)
 │   ├── tools/
-│   │   ├── __init__.py         — build_tools + TERMINATE_TOOL_NAME
-│   │   └── lifecycle/          — FEAT-005 lifecycle agent tools + local registry
+│   │   ├── __init__.py         — build_tools + TERMINATE_TOOL_NAME (LLM-policy mode only)
+│   │   └── lifecycle/          — FEAT-005 lifecycle agent tools (LLM-policy mode only)
+│   ├── executors/              — FEAT-009 executor seam (deterministic-policy mode)
+│   │   ├── base.py             — Executor Protocol + DispatchContext
+│   │   ├── binding.py          — ExecutorBinding + no_executor exemption helper
+│   │   ├── registry.py         — ExecutorRegistry keyed on (agent_ref, node_name)
+│   │   ├── coverage.py         — validate_executor_coverage lifespan guard
+│   │   ├── local.py            — LocalExecutor (in-process callable adapter)
+│   │   ├── remote.py           — RemoteExecutor (HTTP POST + bounded retry)
+│   │   ├── human.py            — HumanExecutor (operator signal as dispatch result)
+│   │   ├── reconcile.py        — Restart reconciler (orphan dispatch cleanup)
+│   │   └── bootstrap.py        — register_all_executors (auto-wires v0.1.0 + v0.2.0)
 │   ├── lifecycle/              — FEAT-006 deterministic-flow submodule
 │   │   ├── declarations.py     — work_item_workflow + task_workflow state/transition constants
 │   │   ├── engine_client.py    — FlowEngineLifecycleClient (JWT, retries, correlation-id encoding)
@@ -104,7 +118,9 @@ src/app/
 │       └── github.py           — GitHub PR webhook signature + parsing (FEAT-006)
 └── migrations/                 — Alembic
 
-agents/                         — YAML agent definitions (e.g. lifecycle-agent@0.1.0.yaml)
+agents/                         — YAML agent definitions
+                                   - lifecycle-agent@0.1.0.yaml (full lifecycle, llm-policy)
+                                   - lifecycle-agent@0.2.0.yaml (FEAT-009 demo, deterministic-policy)
 docs/                           — Framework docs (stakeholder, architecture, data-model, api-spec, ui-specification, personas, work-items)
 tests/                          — conftest + modules/ai + integration/ + contract/
 ```
@@ -118,7 +134,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Async all the way.** All I/O is `async def`. DB sessions are `AsyncSession`. Never mix sync provider SDKs into async paths without an explicit adapter.
 - **Service layer owns logic.** Route handlers and CLI commands are thin adapters — they parse inputs, call a service function, and format output. Business logic lives in `modules/<mod>/service.py` and is reachable from both entry points identically.
 - **LLM through the abstraction.** Service code imports `core.llm` interfaces only. Provider SDKs (Anthropic/OpenAI/etc.) appear only in adapters or the composition root.
-- **Policy via tool calling.** Every "decide next step" call uses the provider's native tool-calling API with one tool per candidate node. Never free-form JSON parsing. See `adrs/ai/policy-via-tool-calling.md` in the shared arch repo. *(Being superseded for runtime-loop node selection by FEAT-009 — see `docs/design/feat-009-pure-orchestrator.md`. The pattern survives **inside individual executors** that need to generate content; only the loop's node-selection use is removed. Full sweep lands with T-229.)*
+- **Policy is per-agent: deterministic by default, LLM opt-in.** New agents declare `flow.policy: deterministic` and route through `FlowResolver` (FEAT-009): node selection is a pure function of `(transitions, current_node, memory, last_dispatch_result)` — no LLM call in the loop. Multi-target transitions express their branch via a YAML `branch:` block (predicate name or a `result.<field> <op> <literal>` expression). Agents whose branches genuinely require model judgment that data can't capture declare `flow.policy: llm` and run on the legacy LLM-as-policy loop, which is preserved as an opt-in mode. The default is "deterministic"; reach for "llm" only when the resolver expression syntax can't capture the decision. See `docs/design/feat-009-pure-orchestrator.md`.
 - **Append-only traces.** `Step`, `PolicyCall`, and `WebhookEvent` records are append-only once terminal fields are set. No post-hoc edits.
 
 ### Naming Conventions
@@ -159,6 +175,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Outbox + reconciliation backstop.** `pending_aux_writes` captures aux-write intent in the same transaction that commits the engine mirror. If the webhook is lost, the row stays orphaned. `uv run orchestrator reconcile-aux [--since=24h] [--dry-run]` queries the engine for the matching item, verifies the expected target state, and materializes the missed row. Idempotent — safe to re-run. Treat a growing orphan count as a health signal, not as a bug.
 - **Pause-for-signal contract.** A local tool that returns `(LifecycleMemory, PauseForSignal)` tells the runtime to suspend the step as `in_progress` and `await supervisor.await_signal(...)`. `POST /api/v1/runs/{id}/signals` with `name=implementation-complete` persists a `RunSignal` row and calls `supervisor.deliver_signal(...)` — persist-first, then wake. Idempotent on `(run_id, name, task_id)`; duplicate calls return `202` with `meta.alreadyReceived=true`.
 - **Correction-attempt bound.** `LIFECYCLE_MAX_CORRECTIONS` (default `2`) caps the number of `corrections` entries per task; exceeding it terminates the run with `stop_reason=error` and `final_state.reason=correction_budget_exceeded`. The bound lives in `stop_conditions.correction_budget_exceeded` and fires inside the existing `error` priority bucket — `cancelled > error > budget_exceeded > policy_terminated > done_node`.
+- **Executor seam is the producer surface (FEAT-009).** Every artefact-producing step in an agent declaring `flow.policy: deterministic` is a dispatch to a registered `Executor` — local, remote, or human. Adding a new external integration = register an executor in `modules/ai/executors/bootstrap.py` against `(agent_ref, node_name)`. Local executors wrap a `(DispatchContext) -> Mapping[str, Any]` callable; remote executors POST to a configured URL and report back via `POST /hooks/executors/<id>`; human executors return `dispatched` immediately and wait for `POST /api/v1/runs/<id>/signals`. Coverage is enforced at lifespan startup — every node either has a registered executor or an explicit `no_executor("≥10-char reason")` exemption. The deterministic runtime in `modules/ai/runtime_deterministic.py` imports neither `core.llm` nor any executor handler module — verified by `tests/test_runtime_deterministic_is_pure.py`. See `docs/design/feat-009-pure-orchestrator.md`.
 
 ### Anti-Patterns to Avoid
 
@@ -176,6 +193,8 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Don't write `tasks.status` or `work_items.status` from a signal adapter under engine-present mode.** The reactor is the only writer. A stale-read window between signal-202 and webhook arrival is by design; don't paper over it with inline writes.
 - **Don't write aux rows (`Approval`, `TaskAssignment`, `TaskPlan`, `TaskImplementation`) from a signal adapter under engine-present mode.** Adapters enqueue a `PendingAuxWrite` and let the reactor materialize the row when the engine confirms the transition. Inline aux writes break correlation matching and re-create the rc2 anti-pattern that FEAT-008 inverted.
 - **Don't add inline outbound calls for new external integrations.** The effector registry is the seam — register a new effector (or, with explicit justification + exemption, a per-request `dispatch_effector` site). A "quick" inline call regrows the FEAT-008 drift and forces the next pivot.
+- **Don't produce artefacts inside the deterministic runtime loop (FEAT-009).** `modules/ai/runtime_deterministic.py` and `modules/ai/runtime_helpers.py` must not write files, edit markdown, run subprocesses, or call an LLM. Producers live behind the executor seam; the loop only resolves, dispatches, awaits, and records. Enforced by `tests/test_runtime_deterministic_is_pure.py`. The legacy `runtime.py` (LLM-policy mode) is intentionally exempt — it imports `core.llm` because that's its mode.
+- **Don't ask an LLM what node comes next when the YAML can answer.** For `flow.policy: deterministic`, multi-target transitions must declare a `branch:` block (predicate name or `result.<field> <op> <literal>`). If a flow truly can't express its branches in YAML, that's the right time to flip the agent to `flow.policy: llm` — but reach for that only after confirming the data on the dispatch-result envelope can't capture the decision.
 
 ---
 

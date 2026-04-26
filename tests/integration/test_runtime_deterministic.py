@@ -120,3 +120,58 @@ async def test_deterministic_run_one_step(test_database_url: str, migrated: None
             assert run_row.status == RunStatus.COMPLETED, f"final_state={run_row.final_state}"
     finally:
         await _cleanup(session_factory, run.id)
+
+
+async def test_lifecycle_agent_v02_end_to_end(test_database_url: str, migrated: None) -> None:
+    """v0.2.0 demo agent runs through the deterministic runtime end-to-end.
+
+    Loads the real ``agents/lifecycle-agent@0.2.0.yaml`` declaration,
+    builds an executor registry via ``register_all_executors`` against
+    the live ``agents/`` directory, runs the loop, asserts the run
+    reaches ``completed``. This is the closing-PR proof that v0.2.0's
+    YAML + bootstrap + deterministic runtime compose correctly.
+    """
+    from pathlib import Path as _Path
+
+    from app.modules.ai.agents import load_agent
+    from app.modules.ai.executors.bootstrap import register_all_executors
+
+    agents_dir = _Path(__file__).resolve().parents[2] / "agents"
+    agent = load_agent("lifecycle-agent@0.2.0", agents_dir)
+
+    session_factory = _build_session_factory(test_database_url)
+
+    async with session_factory() as session:
+        run = Run(
+            agent_ref=agent.ref,
+            agent_definition_hash=agent.agent_definition_hash or "sha256:" + "0" * 64,
+            intake={"workItemPath": "docs/work-items/FEAT-009-orchestrator-as-pure-orchestrator.md"},
+            status=RunStatus.PENDING,
+            started_at=_now(),
+            trace_uri="file:///tmp/t.jsonl",
+        )
+        session.add(run)
+        await session.flush()
+        session.add(RunMemory(run_id=run.id, data={}))
+        await session.commit()
+        await session.refresh(run)
+
+    registry = ExecutorRegistry()
+    register_all_executors(registry, agents_dir)
+
+    try:
+        await run_deterministic_loop(
+            run_id=run.id,
+            agent=agent,
+            trace=NoopTraceStore(),
+            supervisor=RunSupervisor(),
+            registry=registry,
+            session_factory=session_factory,
+            cancel_event=asyncio.Event(),
+            dispatch_timeout_seconds=10,
+        )
+        async with session_factory() as session:
+            run_row = (await session.scalars(select(Run).where(Run.id == run.id))).one()
+            assert run_row.status == RunStatus.COMPLETED, f"final_state={run_row.final_state}"
+    finally:
+        await _cleanup(session_factory, run.id)

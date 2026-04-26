@@ -45,8 +45,8 @@ def register_all_executors(registry: ExecutorRegistry, agents_dir: Path) -> None
     for agent in agents:
         if agent.ref.startswith("lifecycle-agent@0.1"):
             _register_lifecycle_v01(registry, agent.ref, [n.name for n in agent.nodes])
-        # lifecycle-agent@0.2.x lands in T-222/T-223; keep the dispatch
-        # unbound until then so coverage validation flags the gap.
+        elif agent.ref.startswith("lifecycle-agent@0.2"):
+            _register_lifecycle_v02(registry, agent.ref)
 
     logger.info(
         "executor registry: %d binding(s) across %d agent(s)",
@@ -102,6 +102,55 @@ def _make_v01_placeholder(agent_ref: str, node_name: str):  # type: ignore[no-un
         )
 
     return _handler
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0 — real handlers (FEAT-009 / T-223)
+# ---------------------------------------------------------------------------
+
+
+def _register_lifecycle_v02(registry: ExecutorRegistry, agent_ref: str) -> None:
+    """Register the v0.2.0 demo agent's local executors.
+
+    v0.2.0 is a minimal demo proving the new shape end-to-end (dispatch
+    verbs + deterministic policy + executor seam).  It is **not** a
+    drop-in replacement for v0.1.0 — migrating the full lifecycle (with
+    its eight original tools, LifecycleMemory semantics, and the
+    wait_for_implementation pause) is tracked as a separate future FEAT.
+    """
+    registry.register(
+        agent_ref,
+        "request_work_item_load",
+        LocalExecutor(
+            ref="local:request_work_item_load",
+            handler=_handle_request_work_item_load,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "request_closure",
+        LocalExecutor(ref="local:request_closure", handler=_handle_request_closure),
+    )
+
+
+async def _handle_request_work_item_load(ctx: DispatchContext) -> Mapping[str, Any]:
+    """Load a work-item brief path into the run's memory.
+
+    Pure code; no LLM. The path comes from the run's ``intake.workItemPath``
+    forwarded by the runtime via memory bookkeeping (or a future
+    enhancement that threads intake into ``DispatchContext.intake``).
+    """
+    path = ctx.intake.get("workItemPath") or ctx.intake.get("path")
+    return {
+        "loaded": True,
+        "path": str(path) if path is not None else None,
+        "__memory_patch": {"work_item_path": str(path) if path is not None else None},
+    }
+
+
+async def _handle_request_closure(_ctx: DispatchContext) -> Mapping[str, Any]:
+    """Mark closure (terminal). Pure code; no LLM."""
+    return {"closed": True}
 
 
 __all__ = [
