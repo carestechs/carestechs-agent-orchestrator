@@ -40,9 +40,7 @@ async def reconcile_zombie_runs(
     """
     now = datetime.now(UTC)
     async with session_factory() as session:
-        zombies = await session.scalars(
-            select(Run).where(Run.status == RunStatus.RUNNING)
-        )
+        zombies = await session.scalars(select(Run).where(Run.status == RunStatus.RUNNING))
         count = 0
         for run in zombies:
             existing = dict(run.final_state or {})
@@ -94,6 +92,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # FEAT-008/T-171: build the effector registry + exhaustiveness check.
     _bootstrap_effector_registry(app)
+
+    # FEAT-009/T-218: build the executor registry + coverage validation.
+    _bootstrap_executor_registry(app)
 
     try:
         yield
@@ -149,6 +150,41 @@ def _bootstrap_effector_registry(app: FastAPI) -> None:
     )
 
 
+def _bootstrap_executor_registry(app: FastAPI) -> None:
+    """Build the executor registry, register all v0.1.0 nodes, validate coverage.
+
+    FEAT-009/T-218: every loaded agent's nodes must have a registered
+    executor or a ``no_executor`` exemption. A gap raises at startup
+    with the offending ``(agent_ref, node_name)`` tuples listed.
+
+    The registry is consumed by the runtime loop after the T-220 swap;
+    until then, the bindings exist solely to satisfy this validator.
+    """
+    import os
+    from pathlib import Path
+
+    from app.modules.ai.executors.bootstrap import (
+        ExecutorCoverageError,
+        register_all_executors,
+        run_coverage_validation,
+    )
+    from app.modules.ai.executors.registry import ExecutorRegistry
+
+    agents_dir = Path(os.environ.get("AGENTS_DIR", "agents"))
+    registry = ExecutorRegistry()
+    register_all_executors(registry, agents_dir)
+    try:
+        run_coverage_validation(registry, agents_dir)
+    except ExecutorCoverageError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    app.state.executor_registry = registry
+    logger.info(
+        "executor coverage: %d binding(s) across all loaded agents",
+        len(registry.registered_keys()),
+    )
+
+
 def _bootstrap_github_checks_client(app: FastAPI) -> None:
     """Resolve the Checks client once and stash it on app state."""
     from app.config import get_settings
@@ -179,9 +215,7 @@ async def _bootstrap_lifecycle_workflows(
     api_key = settings.flow_engine_tenant_api_key
     tenant_id = settings.flow_engine_tenant_id
     if base_url is None or api_key is None:
-        logger.info(
-            "lifecycle engine not configured; skipping workflow bootstrap"
-        )
+        logger.info("lifecycle engine not configured; skipping workflow bootstrap")
         app.state.lifecycle_engine_client = None
         app.state.lifecycle_workflow_ids = {}
         return
@@ -198,9 +232,7 @@ async def _bootstrap_lifecycle_workflows(
 
     try:
         async with session_factory() as session:
-            workflow_ids = await ensure_workflows(
-                session, client, tenant_id=tenant_id
-            )
+            workflow_ids = await ensure_workflows(session, client, tenant_id=tenant_id)
     except Exception:
         logger.exception("lifecycle workflow bootstrap failed; continuing startup")
         app.state.lifecycle_workflow_ids = {}
