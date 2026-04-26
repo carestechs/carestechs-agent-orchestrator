@@ -329,6 +329,38 @@ The orchestrator models a small, tightly-focused domain: **agent runs** and ever
 
 ---
 
+### Dispatch
+
+> *Module: `ai` — One executor invocation issued by the runtime loop. Introduced by FEAT-009/T-212 (orchestrator-as-pure-orchestrator).*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| dispatch_id | UUID | PK | Correlation id carried into the executor and echoed back on the webhook reply (`/hooks/executors/<id>`). UUIDv7. |
+| step_id | UUID | FK→steps.id, Unique | The step this dispatch fulfills. One dispatch per step; a retry is a new step + new dispatch. |
+| run_id | UUID | FK→runs.id | Owning run (denormalized for index-friendly lookups by run). |
+| executor_ref | text | Required | Stable identifier of the registered executor (`local:request_task_generation`, `remote:claude-code`, `human:wait_for_implementation`). |
+| mode | text | Required, Check | One of `local`, `remote`, `human`. |
+| state | text | Required, Check | One of `pending`, `dispatched`, `completed`, `failed`, `cancelled`. State machine: `pending → dispatched → completed | failed | cancelled`; direct `pending → cancelled` is allowed for cancellations that arrive before the executor is invoked. |
+| intake | jsonb | Required | Intake payload sent to the executor. |
+| result | jsonb | Nullable | Result envelope returned by the executor on terminal state. |
+| outcome | text | Nullable, Check | One of `ok`, `error`, `cancelled`. Set together with the terminal state. |
+| detail | text | Nullable | Free-form diagnostic (e.g. exception class for local failures, HTTP status for remote, reason for cancellation). |
+| started_at | timestamptz | Required, Auto | When the row was created by the runtime loop. |
+| dispatched_at | timestamptz | Nullable | When the executor was actually invoked. |
+| finished_at | timestamptz | Nullable | When the terminal state was set. |
+
+**Indexes:**
+- BTREE on `run_id` — supports the per-run dispatch listing endpoint planned in T-216.
+- BTREE on `state` — supports the restart reconciler scan in T-221 (`WHERE state IN ('pending','dispatched')`).
+- UNIQUE on `step_id` — enforces one-dispatch-per-step.
+
+**Business Rules:**
+- Append-only after a terminal state is set: `result` and `outcome` are immutable once written; the model raises `IllegalDispatchTransition` on invalid `mark_*` calls.
+- The webhook reply path (`/hooks/executors/<id>`, T-216) looks the row up by `dispatch_id` PK; idempotent re-deliveries with the same outcome return 200 + `meta.alreadyReceived=true`, conflicting outcomes return 409.
+- Local executors synthesize `mark_dispatched` immediately before invoking the in-process callable so the state machine remains uniform across all three modes.
+
+---
+
 ## Relationships
 
 ### One-to-Many
@@ -526,6 +558,7 @@ None — single-module project in v1.
 
 ## Changelog
 
+- 2026-04-26 — FEAT-009/T-212 — Added `Dispatch` entity (table `dispatches`). Records every executor invocation issued by the runtime loop with the state machine `pending → dispatched → completed | failed | cancelled`. `dispatch_id` is the correlation key both echoed in the webhook reply (`/hooks/executors/<id>`, T-216) and used as the PK for trivial inbound lookup; one dispatch per step (`UNIQUE step_id`). Migration `b18627b561ef` creates the table; downgrade refuses while non-terminal rows exist (mirrors the destructive-pre-flight pattern). New enums `DispatchState`, `DispatchMode`, `DispatchOutcome`. Append-only after terminal state — `IllegalDispatchTransition` raised on invalid `mark_*` calls.
 - 2026-04-26 — BUG-002 — `engine_workflows` PK changed from `name` to `(tenant_id, name)`. The cache was tenant-blind, so switching `FLOW_ENGINE_TENANT_API_KEY` returned the prior tenant's workflow id and every transition 404'd. Migration `180ccaa84946` adds `tenant_id uuid NOT NULL`; pre-flight refuses on populated tables (operator must `TRUNCATE engine_workflows` before upgrading — re-bootstrap re-fetches against the current tenant on next boot). Bootstrap (`lifecycle/bootstrap.py`) now keys cache reads/writes by `(tenant_id, name)` and validates each cache hit with one `GET /workflows/<id>` engine call so a 404 triggers transparent re-resolution (covers tenant change AND in-tenant data resets).
 - 2026-04-25 — FEAT-008 (engine-as-authority is live) — `WorkItem.status` and `Task.status` reframed as reactor-managed caches: under engine-present mode the lifecycle reactor is the only writer; signal adapters return 202 with a possible stale-read window. New `PendingAuxWrite` entity (table `pending_aux_writes`) is the outbox that captures aux-write intent at signal commit and is drained by the reactor on matched `item.transitioned` webhook arrival. Aux rows (`Approval`, `TaskAssignment`, `TaskPlan`, `TaskImplementation`) are reactor-written under engine-present mode; engine-absent fallback preserves the pre-FEAT-008 inline path.
 - 2026-04-24 — FEAT-008/T-168 — Dropped `WorkItem.locked_from` and `Task.deferred_from`. Under engine-as-authority (FEAT-008), prior-state tracking is owned by the flow engine's transition history. Migration `a1e4d58c9033` drops both columns; pre-flight fails loudly on currently-locked or deferred rows so operators resolve before upgrading. WorkItem unlock always returns to `in_progress` (v1 invariant: lock only reachable from `in_progress`).

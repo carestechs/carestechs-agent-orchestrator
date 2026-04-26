@@ -26,6 +26,32 @@ class StepStatus(StrEnum):
     FAILED = "failed"
 
 
+class DispatchState(StrEnum):
+    """Lifecycle state of a Dispatch (FEAT-009)."""
+
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class DispatchMode(StrEnum):
+    """Where the executor lives (FEAT-009)."""
+
+    LOCAL = "local"
+    REMOTE = "remote"
+    HUMAN = "human"
+
+
+class DispatchOutcome(StrEnum):
+    """Terminal outcome of a Dispatch (FEAT-009)."""
+
+    OK = "ok"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+
 class StopReason(StrEnum):
     """Why a Run terminated."""
 
