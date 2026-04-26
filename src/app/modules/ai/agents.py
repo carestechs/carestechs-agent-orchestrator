@@ -16,7 +16,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -47,12 +47,25 @@ class AgentFlow(BaseModel):
     Transitions are advisory in v1 — the runtime loop trusts the policy's
     tool selection and records the choice.  Explicit transition enforcement
     is a FEAT-003+ concern.
+
+    FEAT-009 / T-220: ``policy`` selects how the runtime loop picks the
+    next node.
+
+    * ``llm`` (default for backward compatibility) — LLM-as-policy. The
+      model is asked which tool to call; transitions in the YAML are
+      advisory. This is the path every pre-FEAT-009 agent runs on.
+    * ``deterministic`` — node selection is a pure function of the YAML
+      transitions + run state via the FlowResolver (FEAT-009 T-211).
+      Multi-target transitions must be expressed as ``branch:`` blocks;
+      no LLM call participates in node selection. The path artefacts are
+      produced by registered executors, not in-process tools.
     """
 
     model_config = _CAMEL_CONFIG
 
     entry_node: str
-    transitions: dict[str, list[str]] = Field(default_factory=dict)
+    transitions: dict[str, Any] = Field(default_factory=dict)
+    policy: Literal["llm", "deterministic"] = "llm"
 
 
 class BudgetDefaults(BaseModel):
@@ -108,9 +121,7 @@ class AgentDefinition(BaseModel):
             raise ValueError("agent node names must be unique")
 
         if TERMINATE_TOOL_NAME in node_names:
-            raise ValueError(
-                f"node name {TERMINATE_TOOL_NAME!r} is reserved for the built-in terminate tool"
-            )
+            raise ValueError(f"node name {TERMINATE_TOOL_NAME!r} is reserved for the built-in terminate tool")
 
         if not self.terminal_nodes:
             raise ValueError("terminal_nodes must be non-empty")
@@ -120,15 +131,11 @@ class AgentDefinition(BaseModel):
             raise ValueError(f"terminal_nodes references unknown nodes: {sorted(missing)}")
 
         if self.flow.entry_node not in node_names:
-            raise ValueError(
-                f"flow.entry_node {self.flow.entry_node!r} is not among declared nodes"
-            )
+            raise ValueError(f"flow.entry_node {self.flow.entry_node!r} is not among declared nodes")
 
         unknown_prompt_nodes = set(self.policy.system_prompts.keys()) - node_names
         if unknown_prompt_nodes:
-            raise ValueError(
-                f"system_prompts references unknown nodes: {sorted(unknown_prompt_nodes)}"
-            )
+            raise ValueError(f"system_prompts references unknown nodes: {sorted(unknown_prompt_nodes)}")
 
         return self
 

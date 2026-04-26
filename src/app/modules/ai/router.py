@@ -96,6 +96,7 @@ api_router = APIRouter(
 
 @api_router.post("/runs", status_code=202, response_model=Envelope[RunSummaryDto])
 async def create_run(
+    request: Request,
     body: CreateRunRequest,
     settings: Annotated[Settings, Depends(get_settings_dep)],
     supervisor: Annotated[RunSupervisor, Depends(get_supervisor)],
@@ -105,6 +106,7 @@ async def create_run(
     trace: Annotated[TraceStore, Depends(get_trace_store)],
 ) -> Envelope[RunSummaryDto]:
     """Start a new agent run (returns 202 immediately)."""
+    registry = getattr(request.app.state, "executor_registry", None)
     result = await service.start_run(
         body,
         settings=settings,
@@ -113,6 +115,7 @@ async def create_run(
         policy=policy,
         engine=engine,
         trace=trace,
+        registry=registry,
     )
     return envelope(result)
 
