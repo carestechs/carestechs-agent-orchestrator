@@ -177,6 +177,7 @@ async def _bootstrap_lifecycle_workflows(
     settings = get_settings()
     base_url = settings.flow_engine_lifecycle_base_url
     api_key = settings.flow_engine_tenant_api_key
+    tenant_id = settings.flow_engine_tenant_id
     if base_url is None or api_key is None:
         logger.info(
             "lifecycle engine not configured; skipping workflow bootstrap"
@@ -184,6 +185,10 @@ async def _bootstrap_lifecycle_workflows(
         app.state.lifecycle_engine_client = None
         app.state.lifecycle_workflow_ids = {}
         return
+
+    # The Settings validator already pairs base_url with api_key + tenant_id
+    # (BUG-002). This assert documents the invariant for the type checker.
+    assert tenant_id is not None, "Settings validator must enforce tenant id"
 
     client = FlowEngineLifecycleClient(
         base_url=str(base_url),
@@ -193,7 +198,9 @@ async def _bootstrap_lifecycle_workflows(
 
     try:
         async with session_factory() as session:
-            workflow_ids = await ensure_workflows(session, client)
+            workflow_ids = await ensure_workflows(
+                session, client, tenant_id=tenant_id
+            )
     except Exception:
         logger.exception("lifecycle workflow bootstrap failed; continuing startup")
         app.state.lifecycle_workflow_ids = {}

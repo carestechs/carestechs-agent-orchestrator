@@ -534,10 +534,17 @@ class TaskImplementation(Base):
 
 
 class EngineWorkflow(Base):
-    """Local cache of a flow-engine workflow ID keyed by declared name."""
+    """Local cache of a flow-engine workflow ID keyed by ``(tenant_id, name)``.
+
+    BUG-002: the original PK was ``name`` only; under a tenant change the
+    cache returned the prior tenant's ``engine_workflow_id`` and every
+    transition 404'd at the engine. Composite PK keeps each tenant's
+    workflow ids independent.
+    """
 
     __tablename__ = "engine_workflows"
 
+    tenant_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(Text, primary_key=True)
     engine_workflow_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(

@@ -93,7 +93,7 @@ src/app/
 │   ├── lifecycle/              — FEAT-006 deterministic-flow submodule
 │   │   ├── declarations.py     — work_item_workflow + task_workflow state/transition constants
 │   │   ├── engine_client.py    — FlowEngineLifecycleClient (JWT, retries, correlation-id encoding)
-│   │   ├── bootstrap.py        — ensure_workflows on startup (engine registration, idempotent; cache key is tenant-blind — see BUG-002)
+│   │   ├── bootstrap.py        — ensure_workflows on startup (engine registration, tenant-scoped cache, stale-cache 404 recovery)
 │   │   ├── work_items.py       — work-item transitions (W1-W6) with optional engine mirror
 │   │   ├── tasks.py            — task transitions (T1-T12) with optional engine mirror + approval matrix
 │   │   ├── approval_matrix.py  — pure function: who may approve at each stage
