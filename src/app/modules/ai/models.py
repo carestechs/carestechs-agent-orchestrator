@@ -35,6 +35,9 @@ from app.modules.ai.enums import (
     ApprovalDecision,
     ApprovalStage,
     AssigneeType,
+    DispatchMode,
+    DispatchOutcome,
+    DispatchState,
     RunStatus,
     StepStatus,
     StopReason,
@@ -184,25 +187,19 @@ class WebhookEvent(Base):
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
     # ``run_id`` is NULL for non-engine events (e.g., GitHub webhooks) that
     # correlate to a task rather than a run.
-    run_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("runs.id"), nullable=True
-    )
+    run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
     step_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("steps.id"), nullable=True)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
     engine_run_id: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     signature_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    source: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=WebhookSource.ENGINE.value
-    )
+    source: Mapped[str] = mapped_column(Text, nullable=False, server_default=WebhookSource.ENGINE.value)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dedupe_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
 
     # -- Relationships -----------------------------------------------------
-    run: Mapped[Run | None] = relationship(
-        back_populates="webhook_events", lazy="raise"
-    )
+    run: Mapped[Run | None] = relationship(back_populates="webhook_events", lazy="raise")
     step: Mapped[Step | None] = relationship(back_populates="webhook_events", lazy="raise")
 
     __table_args__ = (
@@ -253,9 +250,7 @@ class RunSignal(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     task_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
-    received_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     dedupe_key: Mapped[str] = mapped_column(Text, nullable=False)
 
     __table_args__ = (
@@ -288,15 +283,11 @@ class WorkItem(Base):
     # FEAT-006 rc2 (T-131a): nullable for transition.  When the engine
     # client is configured, ``engine_item_id`` is populated at open-time
     # and every transition mirrors the local state change onto the engine.
-    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True, unique=True
-    )
+    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, unique=True)
     opened_by: Mapped[str] = mapped_column(Text, nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -325,21 +316,15 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    work_item_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("work_items.id", ondelete="RESTRICT"), nullable=False
-    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("work_items.id", ondelete="RESTRICT"), nullable=False)
     external_ref: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=TaskStatus.PROPOSED)
     # FEAT-006 rc2 (T-131a): mirror-write id on the flow-engine side.
-    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True, unique=True
-    )
+    engine_item_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True, unique=True)
     proposer_type: Mapped[str] = mapped_column(Text, nullable=False)
     proposer_id: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
@@ -368,18 +353,12 @@ class TaskAssignment(Base):
     __tablename__ = "task_assignments"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    task_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
-    )
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False)
     assignee_type: Mapped[str] = mapped_column(Text, nullable=False)
     assignee_id: Mapped[str] = mapped_column(Text, nullable=False)
     assigned_by: Mapped[str] = mapped_column(Text, nullable=False)
-    assigned_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    superseded_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         _enum_check("assignee_type", AssigneeType),
@@ -412,17 +391,13 @@ class Approval(Base):
     __tablename__ = "approvals"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    task_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
-    )
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False)
     stage: Mapped[str] = mapped_column(Text, nullable=False)
     decision: Mapped[str] = mapped_column(Text, nullable=False)
     decided_by: Mapped[str] = mapped_column(Text, nullable=False)
     decided_by_role: Mapped[str] = mapped_column(Text, nullable=False)
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
-    decided_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         _enum_check("stage", ApprovalStage),
@@ -453,13 +428,9 @@ class LifecycleSignal(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)
     entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     signal_name: Mapped[str] = mapped_column(Text, nullable=False)
-    recorded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    __table_args__ = (
-        Index("ix_lifecycle_signals_entity_name", "entity_id", "signal_name"),
-    )
+    __table_args__ = (Index("ix_lifecycle_signals_entity_name", "entity_id", "signal_name"),)
 
 
 # ---------------------------------------------------------------------------
@@ -473,19 +444,13 @@ class TaskPlan(Base):
     __tablename__ = "task_plans"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    task_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
-    )
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False)
     plan_path: Mapped[str] = mapped_column(Text, nullable=False)
     plan_sha: Mapped[str] = mapped_column(Text, nullable=False)
     submitted_by: Mapped[str] = mapped_column(Text, nullable=False)
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    __table_args__ = (
-        Index("ix_task_plans_task_submitted", "task_id", "submitted_at"),
-    )
+    __table_args__ = (Index("ix_task_plans_task_submitted", "task_id", "submitted_at"),)
 
 
 # ---------------------------------------------------------------------------
@@ -499,23 +464,17 @@ class TaskImplementation(Base):
     __tablename__ = "task_implementations"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
-    task_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False
-    )
+    task_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tasks.id", ondelete="RESTRICT"), nullable=False)
     pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     commit_sha: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     submitted_by: Mapped[str] = mapped_column(Text, nullable=False)
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     # FEAT-007: GitHub check-run id posted for this implementation.  NULL
     # when no ``pr_url`` was supplied; the noop sentinel (``"noop"``) is
     # stored when the Checks client is degraded, so later ``update_check``
     # paths can short-circuit without a credential lookup.
-    github_check_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    github_check_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index(
@@ -547,9 +506,7 @@ class EngineWorkflow(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(Text, primary_key=True)
     engine_workflow_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 # ---------------------------------------------------------------------------
@@ -573,12 +530,8 @@ class PendingSignalContext(Base):
 
     correlation_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     signal_name: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default="{}"
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class PendingAuxWrite(Base):
@@ -603,11 +556,122 @@ class PendingAuxWrite(Base):
     entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
     entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    enqueued_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         Index("ix_pending_aux_writes_entity_id", "entity_id"),
         Index("ix_pending_aux_writes_enqueued_at", "enqueued_at"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch (FEAT-009 / T-212) — one row per executor invocation
+# ---------------------------------------------------------------------------
+
+
+class IllegalDispatchTransition(RuntimeError):
+    """Raised when a Dispatch is asked to make an invalid state transition."""
+
+
+# Allowed transitions in the Dispatch state machine.
+_DISPATCH_TRANSITIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        (DispatchState.PENDING, DispatchState.DISPATCHED),
+        (DispatchState.DISPATCHED, DispatchState.COMPLETED),
+        (DispatchState.DISPATCHED, DispatchState.FAILED),
+        (DispatchState.DISPATCHED, DispatchState.CANCELLED),
+        # Local executors can synthesize a terminal state without a separate
+        # "dispatched" round-trip; the orchestrator still writes ``dispatched``
+        # first to keep the transition graph uniform with remote/human modes.
+        # Direct pending→cancelled covers the run-cancelled-before-dispatch
+        # window (cancel arrives between row insert and the executor call).
+        (DispatchState.PENDING, DispatchState.CANCELLED),
+    }
+)
+
+
+class Dispatch(Base):
+    """Records every executor invocation issued by the runtime (FEAT-009).
+
+    State machine: ``pending → dispatched → completed | failed | cancelled``.
+    Append-only after a terminal state is set: ``result`` and ``outcome`` are
+    immutable once written.
+
+    ``dispatch_id`` is the correlation key carried into the executor and
+    echoed back on the webhook reply (``/hooks/executors/<id>``); it is also
+    the primary key here so the webhook lookup is a trivial PK fetch.
+
+    One Dispatch per Step — enforced by the unique constraint on
+    ``step_id``.  A step that needs to retry must do so via a *new* Step
+    (and therefore a new Dispatch).
+    """
+
+    __tablename__ = "dispatches"
+
+    dispatch_id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=generate_uuid7)
+    step_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("steps.id"), nullable=False, unique=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("runs.id"), nullable=False)
+    executor_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, default=DispatchState.PENDING)
+    intake: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        _enum_check("state", DispatchState),
+        _enum_check("mode", DispatchMode),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('ok', 'error', 'cancelled')",
+            name="ck_dispatch_outcome",
+        ),
+        Index("ix_dispatches_run_id", "run_id"),
+        Index("ix_dispatches_state", "state"),
+    )
+
+    # -- State machine -----------------------------------------------------
+
+    def _transition(self, target: DispatchState) -> None:
+        if (self.state, target) not in _DISPATCH_TRANSITIONS:
+            raise IllegalDispatchTransition(f"dispatch {self.dispatch_id} cannot move {self.state!r} → {target!r}")
+        self.state = target
+
+    def mark_dispatched(self, *, at: datetime) -> None:
+        self._transition(DispatchState.DISPATCHED)
+        self.dispatched_at = at
+
+    def mark_completed(
+        self,
+        *,
+        at: datetime,
+        result: dict[str, Any] | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self._transition(DispatchState.COMPLETED)
+        self.outcome = DispatchOutcome.OK
+        self.result = result
+        self.detail = detail
+        self.finished_at = at
+
+    def mark_failed(
+        self,
+        *,
+        at: datetime,
+        result: dict[str, Any] | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self._transition(DispatchState.FAILED)
+        self.outcome = DispatchOutcome.ERROR
+        self.result = result
+        self.detail = detail
+        self.finished_at = at
+
+    def mark_cancelled(self, *, at: datetime, detail: str | None = None) -> None:
+        self._transition(DispatchState.CANCELLED)
+        self.outcome = DispatchOutcome.CANCELLED
+        self.detail = detail
+        self.finished_at = at

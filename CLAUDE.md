@@ -118,7 +118,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Async all the way.** All I/O is `async def`. DB sessions are `AsyncSession`. Never mix sync provider SDKs into async paths without an explicit adapter.
 - **Service layer owns logic.** Route handlers and CLI commands are thin adapters — they parse inputs, call a service function, and format output. Business logic lives in `modules/<mod>/service.py` and is reachable from both entry points identically.
 - **LLM through the abstraction.** Service code imports `core.llm` interfaces only. Provider SDKs (Anthropic/OpenAI/etc.) appear only in adapters or the composition root.
-- **Policy via tool calling.** Every "decide next step" call uses the provider's native tool-calling API with one tool per candidate node. Never free-form JSON parsing. See `adrs/ai/policy-via-tool-calling.md` in the shared arch repo.
+- **Policy via tool calling.** Every "decide next step" call uses the provider's native tool-calling API with one tool per candidate node. Never free-form JSON parsing. See `adrs/ai/policy-via-tool-calling.md` in the shared arch repo. *(Being superseded for runtime-loop node selection by FEAT-009 — see `docs/design/feat-009-pure-orchestrator.md`. The pattern survives **inside individual executors** that need to generate content; only the loop's node-selection use is removed. Full sweep lands with T-229.)*
 - **Append-only traces.** `Step`, `PolicyCall`, and `WebhookEvent` records are append-only once terminal fields are set. No post-hoc edits.
 
 ### Naming Conventions

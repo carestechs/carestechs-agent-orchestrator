@@ -20,6 +20,9 @@ from app.modules.ai.enums import (
     ApprovalDecision,
     ApprovalStage,
     AssigneeType,
+    DispatchMode,
+    DispatchOutcome,
+    DispatchState,
     RunStatus,
     StepStatus,
     StopReason,
@@ -118,6 +121,26 @@ class WebhookEventDto(BaseModel):
     source: WebhookSource = WebhookSource.ENGINE
     received_at: datetime
     processed_at: datetime | None = None
+
+
+class DispatchEnvelope(BaseModel):
+    """Full Dispatch row + trace serialization (FEAT-009)."""
+
+    model_config = _CAMEL_CONFIG
+
+    dispatch_id: uuid.UUID
+    step_id: uuid.UUID
+    run_id: uuid.UUID
+    executor_ref: str
+    mode: DispatchMode
+    state: DispatchState
+    intake: dict[str, Any]
+    result: dict[str, Any] | None = None
+    outcome: DispatchOutcome | None = None
+    detail: str | None = None
+    started_at: datetime
+    dispatched_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class EffectorCallDto(BaseModel):
@@ -246,9 +269,7 @@ class SignalCreateResponse(BaseModel):
 class WorkItemDto(BaseModel):
     """Shape returned to clients for a WorkItem row."""
 
-    model_config = ConfigDict(
-        populate_by_name=True, alias_generator=to_camel, extra="forbid"
-    )
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel, extra="forbid")
 
     id: uuid.UUID
     external_ref: str
@@ -266,9 +287,7 @@ class WorkItemDto(BaseModel):
 class TaskAssignmentDto(BaseModel):
     """Shape returned to clients for a TaskAssignment row."""
 
-    model_config = ConfigDict(
-        populate_by_name=True, alias_generator=to_camel, extra="forbid"
-    )
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel, extra="forbid")
 
     id: uuid.UUID
     task_id: uuid.UUID
@@ -286,9 +305,7 @@ class TaskDto(BaseModel):
     loading; it is not a DB column on ``tasks``.
     """
 
-    model_config = ConfigDict(
-        populate_by_name=True, alias_generator=to_camel, extra="forbid"
-    )
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel, extra="forbid")
 
     id: uuid.UUID
     work_item_id: uuid.UUID
@@ -305,9 +322,7 @@ class TaskDto(BaseModel):
 class ApprovalDto(BaseModel):
     """Shape returned to clients for an Approval row."""
 
-    model_config = ConfigDict(
-        populate_by_name=True, alias_generator=to_camel, extra="forbid"
-    )
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel, extra="forbid")
 
     id: uuid.UUID
     task_id: uuid.UUID
