@@ -124,7 +124,13 @@ class WebhookEventDto(BaseModel):
 
 
 class DispatchEnvelope(BaseModel):
-    """Full Dispatch row + trace serialization (FEAT-009)."""
+    """Full Dispatch row + trace serialization (FEAT-009).
+
+    The trailing ``correlation_id`` / ``transition_key`` / ``engine_run_id``
+    fields are FEAT-010 engine-mode metadata.  They are present only when
+    ``mode == "engine"``; for ``local`` / ``remote`` / ``human`` modes they
+    remain ``None`` and are omitted from serialized output.
+    """
 
     model_config = _CAMEL_CONFIG
 
@@ -141,6 +147,10 @@ class DispatchEnvelope(BaseModel):
     started_at: datetime
     dispatched_at: datetime | None = None
     finished_at: datetime | None = None
+    # FEAT-010 engine-mode metadata (None for non-engine modes).
+    correlation_id: uuid.UUID | None = None
+    transition_key: str | None = None
+    engine_run_id: str | None = None
 
 
 class ExecutorWebhookPayload(BaseModel):
@@ -155,7 +165,14 @@ class ExecutorWebhookPayload(BaseModel):
 
 
 class ExecutorCallDto(BaseModel):
-    """Trace entry for one executor dispatch terminal state (FEAT-009)."""
+    """Trace entry for one executor dispatch terminal state (FEAT-009).
+
+    FEAT-010 extends the entry with engine-mode metadata
+    (``correlation_id``, ``transition_key``, ``engine_run_id``).  These
+    fields are populated only when ``mode == "engine"``; the writer
+    rejects them on non-engine modes (defensive — prevents accidental
+    schema drift).
+    """
 
     model_config = _CAMEL_CONFIG
 
@@ -167,6 +184,20 @@ class ExecutorCallDto(BaseModel):
     finished_at: datetime | None = None
     outcome: DispatchOutcome | None = None
     detail: str | None = None
+    # FEAT-010 — engine-mode metadata.
+    correlation_id: uuid.UUID | None = None
+    transition_key: str | None = None
+    engine_run_id: str | None = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Defensive: engine-mode fields must not appear on non-engine entries."""
+        engine_fields = (self.correlation_id, self.transition_key, self.engine_run_id)
+        if self.mode != DispatchMode.ENGINE and any(f is not None for f in engine_fields):
+            raise ValueError(
+                "ExecutorCallDto: engine-mode fields "
+                "(correlation_id / transition_key / engine_run_id) "
+                f"must be None when mode={self.mode!r}"
+            )
 
 
 class EffectorCallDto(BaseModel):

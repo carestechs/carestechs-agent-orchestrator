@@ -37,11 +37,12 @@ class DispatchState(StrEnum):
 
 
 class DispatchMode(StrEnum):
-    """Where the executor lives (FEAT-009)."""
+    """Where the executor lives (FEAT-009; ``ENGINE`` added in FEAT-010)."""
 
     LOCAL = "local"
     REMOTE = "remote"
     HUMAN = "human"
+    ENGINE = "engine"
 
 
 class DispatchOutcome(StrEnum):

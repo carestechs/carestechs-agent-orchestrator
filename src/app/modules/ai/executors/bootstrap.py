@@ -20,15 +20,26 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
+from app.modules.ai.executors.binding import ExecutorBinding
 from app.modules.ai.executors.coverage import (
     ExecutorCoverageError,
     validate_executor_coverage,
 )
 from app.modules.ai.executors.local import LocalExecutor
 from app.modules.ai.executors.registry import ExecutorRegistry
+
+if TYPE_CHECKING:
+    # FEAT-010 import quarantine — only the helper signature pulls
+    # ``FlowEngineLifecycleClient`` for typing; never at module scope so
+    # importing ``runtime_deterministic`` (which imports the registry's
+    # bootstrap surface transitively) does not pull the engine HTTP
+    # client into ``sys.modules``.
+    from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +164,69 @@ async def _handle_request_closure(_ctx: DispatchContext) -> Mapping[str, Any]:
     return {"closed": True}
 
 
+# ---------------------------------------------------------------------------
+# FEAT-010 — engine executor registration helper
+# ---------------------------------------------------------------------------
+
+
+def register_engine_executor(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    node_name: str,
+    *,
+    transition_key: str,
+    to_status: str,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    session_factory: async_sessionmaker[AsyncSession],
+    actor: str | None = None,
+    timeout_seconds: float | None = None,
+) -> ExecutorBinding:
+    """Register an :class:`EngineExecutor` for ``(agent_ref, node_name)``.
+
+    Mirrors how local/remote/human bindings are wired today: bootstrap
+    is the single source of truth for executor wiring; agents declare
+    nodes, bootstrap binds executors.
+
+    Raises ``RuntimeError`` if ``lifecycle_client`` is ``None`` (engine-
+    absent dev mode).  Surfacing the misconfiguration at boot — naming
+    the offending binding — is preferable to a stack trace at first
+    dispatch.  The fallback for engine-absent dev mode is an explicit
+    ``no_executor("≥10-char reason")`` exemption on the binding.
+    """
+    if lifecycle_client is None:
+        raise RuntimeError(
+            f"register_engine_executor: lifecycle_client is None for "
+            f"({agent_ref!r}, {node_name!r}); engine-bound nodes require a "
+            "configured FlowEngineLifecycleClient.  In engine-absent dev "
+            'mode, declare a no_executor("reason") exemption for this '
+            "binding instead."
+        )
+
+    # Local import — keeps ``executors.engine`` off the module-level
+    # import graph until this helper is actually called (so static
+    # imports of ``executors.bootstrap`` in tests / runtime don't pull
+    # the engine adapter for free).
+    from app.modules.ai.executors.engine import EngineExecutor
+
+    executor = EngineExecutor(
+        ref=f"engine:{transition_key}",
+        transition_key=transition_key,
+        to_status=to_status,
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+    )
+    return registry.register(
+        agent_ref,
+        node_name,
+        executor,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 __all__ = [
     "ExecutorCoverageError",
     "register_all_executors",
+    "register_engine_executor",
     "run_coverage_validation",
 ]
