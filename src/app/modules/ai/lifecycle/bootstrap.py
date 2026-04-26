@@ -57,6 +57,10 @@ async def _resolve(
 ) -> uuid.UUID:
     name = decl["name"]
 
+    # FIXME(BUG-002): cache key is `name` only; under a tenant change the
+    # orchestrator returns the prior tenant's engine_workflow_id and every
+    # downstream transition fails 404. See
+    # docs/work-items/BUG-002-engine-workflows-tenant-scope.md.
     cached = await db.scalar(
         select(EngineWorkflow.engine_workflow_id).where(EngineWorkflow.name == name)
     )
