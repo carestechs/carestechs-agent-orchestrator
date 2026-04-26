@@ -14,7 +14,7 @@
 | **ID** | FEAT-009 |
 | **Name** | Orchestrator as a pure orchestrator (executors are pluggable, not embedded) |
 | **Target Version** | v0.4.0 |
-| **Status** | Not Started |
+| **Status** | Completed |
 | **Priority** | High |
 | **Requested By** | Project owner (architectural drift surfaced when reviewing how a "real run" of `lifecycle-agent@0.1.0` actually works end-to-end) |
 | **Date Created** | 2026-04-26 |

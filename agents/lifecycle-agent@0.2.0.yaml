@@ -1,0 +1,57 @@
+# lifecycle-agent@0.2.0 — FEAT-009 PR 6
+#
+# Demonstrates the new shape: dispatch-verb node naming + deterministic
+# policy + ExecutorRegistry-driven artefact production.
+#
+# This is a minimal *demo* agent, not a full lifecycle replacement.
+# Migrating the real lifecycle (load_work_item, generate_tasks,
+# generate_plan, wait_for_implementation, review_implementation,
+# corrections, close_work_item) onto deterministic policy is a separate
+# future FEAT — that work has to bridge each existing handler's memory
+# semantics + PauseForSignal contract into the executor seam, which is
+# orthogonal to FEAT-009's architectural realignment. v0.1.0 stays on
+# llm-policy until that migration lands.
+#
+# What this YAML proves: an agent declaring ``flow.policy: deterministic``
+# routes through ``runtime_deterministic.py`` and dispatches every node
+# through the registered executor — with no LLM call at the loop level.
+
+ref: lifecycle-agent@0.2.0
+version: "0.2.0"
+description: >
+  Two-node demo agent for FEAT-009: ``request_work_item_load``
+  (pure-code load) → ``request_closure`` (terminal). Uses the new
+  deterministic policy + executor seam end-to-end.
+
+nodes:
+  - name: request_work_item_load
+    description: Load a work-item brief into run memory.
+    inputSchema:
+      type: object
+      properties:
+        path: {type: string}
+      required: [path]
+
+  - name: request_closure
+    description: Mark the work item closed (terminal).
+    inputSchema:
+      type: object
+      properties: {}
+
+flow:
+  entryNode: request_work_item_load
+  transitions:
+    request_work_item_load: [request_closure]
+    request_closure: []
+  policy: deterministic
+
+intakeSchema:
+  type: object
+  properties:
+    workItemPath: {type: string}
+  required: [workItemPath]
+
+terminalNodes: [request_closure]
+
+defaultBudget:
+  maxSteps: 50

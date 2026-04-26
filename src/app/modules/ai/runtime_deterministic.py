@@ -205,7 +205,12 @@ async def _execute_node(
     dispatch_id = generate_uuid7()
     started_at = datetime.now(UTC)
 
-    intake = _build_node_intake(agent, run_id, node_name)
+    # Thread the run's intake into every dispatch so executors can read
+    # caller-supplied parameters (e.g. ``workItemPath``).
+    async with session_factory() as session:
+        run_row = await session.get(Run, run_id)
+        run_intake: dict[str, Any] = (run_row.intake if run_row is not None else {}) or {}
+    intake = {**run_intake, **_build_node_intake(agent, run_id, node_name)}
 
     async with session_factory() as session:
         step = Step(
