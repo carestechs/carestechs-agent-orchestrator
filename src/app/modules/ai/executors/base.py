@@ -60,7 +60,10 @@ class Executor(Protocol):
     (mirrors the FEAT-008 ``Effector`` discipline).
     """
 
-    name: ClassVar[str]
+    # ``name`` is per-instance (e.g. ``local:request_plan``,
+    # ``remote:claude-code``). ``mode`` is per-class because all
+    # instances of a given adapter share the same transport.
+    name: str
     mode: ClassVar[ExecutorMode]
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope: ...
