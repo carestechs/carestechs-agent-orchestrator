@@ -1,0 +1,48 @@
+# test-engine-agent@0.1.0 — FEAT-010 PR 2 throwaway fixture
+#
+# Two-node deterministic agent that exercises the engine executor seam
+# end-to-end: ``request_seed_load`` (local executor — pure stub) →
+# ``request_engine_transition`` (engine executor bound to a synthetic
+# work-item transition).  The integration test (test_engine_executor_e2e)
+# stubs the engine HTTP boundary via ``respx`` and asserts the run
+# reaches terminal via the new reactor wake leg.
+#
+# This agent is a *test fixture* — it lives under tests/fixtures/agents/
+# and is not registered in the production agents/ directory.
+
+ref: test-engine-agent@0.1.0
+version: "0.1.0"
+description: >
+  FEAT-010 throwaway agent: load → engine transition → terminal.
+  Used only by tests/integration/test_engine_executor_e2e.py.
+
+nodes:
+  - name: request_seed_load
+    description: Stub local-executor node that seeds the engine item id into memory.
+    inputSchema:
+      type: object
+      properties: {}
+
+  - name: request_engine_transition
+    description: Engine-executor node that dispatches a work-item transition.
+    inputSchema:
+      type: object
+      properties: {}
+
+flow:
+  entryNode: request_seed_load
+  transitions:
+    request_seed_load: [request_engine_transition]
+    request_engine_transition: []
+  policy: deterministic
+
+intakeSchema:
+  type: object
+  properties:
+    engineItemId: {type: string}
+  required: [engineItemId]
+
+terminalNodes: [request_engine_transition]
+
+defaultBudget:
+  maxSteps: 10

@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
-from typing import Literal
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.modules.ai.enums import TaskStatus, WorkItemStatus
+from app.modules.ai.enums import DispatchMode, DispatchState, TaskStatus, WorkItemStatus
 from app.modules.ai.lifecycle import declarations, work_items
 from app.modules.ai.lifecycle.effectors.context import EffectorContext
 from app.modules.ai.lifecycle.effectors.registry import (
@@ -44,6 +44,7 @@ from app.modules.ai.lifecycle.effectors.registry import (
 from app.modules.ai.lifecycle.engine_client import extract_correlation_id
 from app.modules.ai.models import (
     Approval,
+    Dispatch,
     PendingAuxWrite,
     PendingSignalContext,
     Task,
@@ -52,6 +53,10 @@ from app.modules.ai.models import (
     TaskPlan,
     WorkItem,
 )
+from app.modules.ai.schemas import DispatchEnvelope
+
+if TYPE_CHECKING:
+    from app.modules.ai.supervisor import RunSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,7 @@ async def handle_transition(
     workflow_name_by_id: dict[uuid.UUID, str] | None = None,
     registry: EffectorRegistry | None = None,
     settings: Settings | None = None,
+    supervisor: RunSupervisor | None = None,
 ) -> None:
     """Dispatch a lifecycle webhook to the appropriate derivation.
 
@@ -142,9 +148,17 @@ async def handle_transition(
     # row see the engine's authoritative state. Fires before W2/W5
     # derivations so the originating transition's effectors run first.
     if registry is not None and settings is not None:
-        await _dispatch_effectors(
-            db, event, workflow_name, registry, settings, corr
-        )
+        await _dispatch_effectors(db, event, workflow_name, registry, settings, corr)
+
+    # FEAT-010/T-233: wake any engine-mode dispatch whose correlation id
+    # matches this webhook.  Runs after effectors so the resumed runtime
+    # observes effector-derived state, and before derivations so the
+    # runtime advances on the originating transition's outcome rather
+    # than a derived one.  No-op when ``supervisor`` is None (test
+    # fixtures), or when no matching dispatch is found, or when the
+    # matched dispatch is already terminal.
+    if corr is not None and supervisor is not None:
+        await _wake_dispatch(db, corr, event, supervisor)
 
     to_status = event.data.to_status
     if workflow_name == declarations.TASK_WORKFLOW_NAME:
@@ -178,9 +192,7 @@ async def _update_status_cache(
     if to_status is None:
         return
     if workflow_name == declarations.TASK_WORKFLOW_NAME:
-        task = await db.scalar(
-            select(Task).where(Task.engine_item_id == event.item_id)
-        )
+        task = await db.scalar(select(Task).where(Task.engine_item_id == event.item_id))
         if task is None:
             logger.info(
                 "status cache miss for task engine_item_id=%s; skipping",
@@ -189,9 +201,7 @@ async def _update_status_cache(
             return
         task.status = to_status
     elif workflow_name == declarations.WORK_ITEM_WORKFLOW_NAME:
-        wi = await db.scalar(
-            select(WorkItem).where(WorkItem.engine_item_id == event.item_id)
-        )
+        wi = await db.scalar(select(WorkItem).where(WorkItem.engine_item_id == event.item_id))
         if wi is None:
             logger.info(
                 "status cache miss for work_item engine_item_id=%s; skipping",
@@ -204,9 +214,7 @@ async def _update_status_cache(
     await db.flush()
 
 
-async def _materialize_aux(
-    db: AsyncSession, correlation_id: uuid.UUID
-) -> None:
+async def _materialize_aux(db: AsyncSession, correlation_id: uuid.UUID) -> None:
     """Materialize an outbox-queued aux row (FEAT-008/T-167).
 
     The signal adapter enqueued a ``PendingAuxWrite`` inside the same
@@ -288,9 +296,7 @@ def build_aux_row(
     return None
 
 
-async def _consume_correlation(
-    db: AsyncSession, triggered_by: str | None
-) -> None:
+async def _consume_correlation(db: AsyncSession, triggered_by: str | None) -> None:
     """Parse the correlation UUID out of ``triggered_by``, look up the
     matching ``PendingSignalContext`` row, log it, and delete.
 
@@ -302,11 +308,7 @@ async def _consume_correlation(
     corr = extract_correlation_id(triggered_by)
     if corr is None:
         return
-    row = await db.scalar(
-        select(PendingSignalContext).where(
-            PendingSignalContext.correlation_id == corr
-        )
-    )
+    row = await db.scalar(select(PendingSignalContext).where(PendingSignalContext.correlation_id == corr))
     if row is None:
         logger.debug(
             "no pending_signal_context for correlation %s (already consumed?)",
@@ -346,15 +348,11 @@ async def _dispatch_effectors(
     entity_type: Literal["work_item", "task"]
     if workflow_name == declarations.TASK_WORKFLOW_NAME:
         entity_type = "task"
-        task = await db.scalar(
-            select(Task).where(Task.engine_item_id == event.item_id)
-        )
+        task = await db.scalar(select(Task).where(Task.engine_item_id == event.item_id))
         entity_id = task.id if task is not None else None
     elif workflow_name == declarations.WORK_ITEM_WORKFLOW_NAME:
         entity_type = "work_item"
-        wi = await db.scalar(
-            select(WorkItem).where(WorkItem.engine_item_id == event.item_id)
-        )
+        wi = await db.scalar(select(WorkItem).where(WorkItem.engine_item_id == event.item_id))
         entity_id = wi.id if wi is not None else None
     else:
         return
@@ -381,15 +379,101 @@ async def _dispatch_effectors(
     await registry.fire_all(ctx)
 
 
-async def _infer_workflow_from_item(
-    db: AsyncSession, engine_item_id: uuid.UUID
-) -> str | None:
+async def _wake_dispatch(
+    db: AsyncSession,
+    correlation_id: uuid.UUID,
+    event: LifecycleWebhookEvent,
+    supervisor: RunSupervisor,
+) -> None:
+    """Wake the engine-mode :class:`Dispatch` whose correlation matches.
+
+    Looks up a dispatch row whose ``intake.correlation_id`` matches the
+    correlation id encoded into the engine's ``triggeredBy``.  If found
+    and still in :attr:`DispatchState.DISPATCHED`, builds a ``completed``
+    envelope from the webhook event, marks the row complete, and calls
+    :meth:`RunSupervisor.deliver_dispatch` so the deterministic runtime
+    advances.
+
+    Tolerant by design — every absent precondition no-ops:
+
+    * Webhook arrived before the dispatch row committed (race covered
+      in the FEAT-010 brief): no row found → no-op.  The dispatch row
+      will be committed by the engine executor, the runtime will await
+      the supervisor future, and on the next iteration the materialized
+      aux row makes forward progress.  The wake leg simply doesn't fire
+      this time.
+    * Webhook is for a transition that wasn't engine-executor driven
+      (e.g. the v0.1.0 LLM-policy + engine path which doesn't register
+      engine executors): no dispatch row carries this correlation → no-op.
+    * Replayed webhook: the dispatch row is already terminal → no-op.
+    """
+    dispatch_row = await db.scalar(
+        select(Dispatch).where(
+            Dispatch.mode == DispatchMode.ENGINE.value,
+            Dispatch.intake["correlation_id"].astext == str(correlation_id),
+        )
+    )
+    if dispatch_row is None:
+        logger.info(
+            "wake_dispatch: no engine dispatch found for correlation %s "
+            "(race or non-executor-driven transition); skipping",
+            correlation_id,
+        )
+        return
+    if dispatch_row.state != DispatchState.DISPATCHED:
+        logger.debug(
+            "wake_dispatch: dispatch %s already terminal (state=%s); skipping",
+            dispatch_row.dispatch_id,
+            dispatch_row.state,
+        )
+        return
+
+    transition_key = (dispatch_row.intake or {}).get("transition_key")
+    to_status = event.data.to_status
+    result: dict[str, object] = {
+        "correlation_id": str(correlation_id),
+        "transition_key": transition_key,
+        "engine_to_status": to_status,
+        "engine_from_status": event.data.from_status,
+    }
+
+    now = datetime.now(UTC)
+    dispatch_row.mark_completed(at=now, result=result)
+    await db.flush()
+
+    envelope = DispatchEnvelope(
+        dispatch_id=dispatch_row.dispatch_id,
+        step_id=dispatch_row.step_id,
+        run_id=dispatch_row.run_id,
+        executor_ref=dispatch_row.executor_ref,
+        mode=DispatchMode.ENGINE,
+        state=DispatchState.COMPLETED,
+        intake=dict(dispatch_row.intake or {}),
+        result=result,
+        outcome=dispatch_row.outcome,  # type: ignore[arg-type]
+        detail=None,
+        started_at=dispatch_row.started_at,
+        dispatched_at=dispatch_row.dispatched_at,
+        finished_at=now,
+        correlation_id=correlation_id,
+        transition_key=transition_key if isinstance(transition_key, str) else None,
+        engine_run_id=None,
+    )
+    supervisor.deliver_dispatch(dispatch_row.dispatch_id, envelope)
+    logger.info(
+        "wake_dispatch: woke dispatch %s (run %s) on correlation %s → %s",
+        dispatch_row.dispatch_id,
+        dispatch_row.run_id,
+        correlation_id,
+        to_status,
+    )
+
+
+async def _infer_workflow_from_item(db: AsyncSession, engine_item_id: uuid.UUID) -> str | None:
     task = await db.scalar(select(Task).where(Task.engine_item_id == engine_item_id))
     if task is not None:
         return declarations.TASK_WORKFLOW_NAME
-    wi = await db.scalar(
-        select(WorkItem).where(WorkItem.engine_item_id == engine_item_id)
-    )
+    wi = await db.scalar(select(WorkItem).where(WorkItem.engine_item_id == engine_item_id))
     if wi is not None:
         return declarations.WORK_ITEM_WORKFLOW_NAME
     return None
@@ -420,7 +504,7 @@ async def _handle_task_transition(
 
     # Other transitions (planning, plan_review, etc.) don't fire derivations
     # in rc2 phase 1.  Log at debug for forensics.
-    logger.debug(
-        "task %s transitioned to %s; no derivation", task.id, to_status
-    )
+    logger.debug("task %s transitioned to %s; no derivation", task.id, to_status)
+
+
 _ = WorkItemStatus  # keep import alive for future extensions (impl-review etc.)

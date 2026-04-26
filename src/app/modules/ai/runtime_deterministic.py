@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai import flow_resolver
 from app.modules.ai.enums import (
+    DispatchMode,
     DispatchOutcome,
     DispatchState,
     RunStatus,
@@ -270,6 +271,23 @@ async def _execute_node(
         )
 
     if envelope.state == DispatchState.DISPATCHED:
+        # FEAT-010: when an engine executor returns ``dispatched`` it has
+        # generated a ``correlation_id`` that the engine echoes back in
+        # the ``item.transitioned`` webhook.  Persist it onto the
+        # ``Dispatch.intake`` JSONB so the reactor's ``_wake_dispatch``
+        # step can find this row by correlation id when the webhook
+        # arrives (T-233).  No new column; the outbox row is the
+        # durable source of truth.
+        if envelope.mode == DispatchMode.ENGINE and envelope.correlation_id is not None:
+            async with session_factory() as session:
+                dispatch_row = await session.get(Dispatch, dispatch_id)
+                if dispatch_row is not None:
+                    new_intake = dict(dispatch_row.intake or {})
+                    new_intake["correlation_id"] = str(envelope.correlation_id)
+                    if envelope.transition_key is not None:
+                        new_intake["transition_key"] = envelope.transition_key
+                    dispatch_row.intake = new_intake
+                    await session.commit()
         # Non-terminal: webhook will deliver the terminal envelope.
         timeout = binding.timeout_seconds if binding.timeout_seconds is not None else float(dispatch_timeout_seconds)
         try:
@@ -296,6 +314,11 @@ async def _execute_node(
 
     # Trace.
     try:
+        # FEAT-010: forward engine-mode metadata onto the trace entry so
+        # operators can join executor_call → pending_aux_write →
+        # webhook_event by correlation id.  Fields are None for non-engine
+        # modes (and the DTO post-init guard rejects mixed shapes).
+        is_engine = binding.executor.mode == DispatchMode.ENGINE
         await trace.record_executor_call(
             run_id,
             ExecutorCallDto(
@@ -307,6 +330,9 @@ async def _execute_node(
                 finished_at=envelope.finished_at,
                 outcome=envelope.outcome,
                 detail=envelope.detail,
+                correlation_id=envelope.correlation_id if is_engine else None,
+                transition_key=envelope.transition_key if is_engine else None,
+                engine_run_id=envelope.engine_run_id if is_engine else None,
             ),
         )
         await trace.record_step(

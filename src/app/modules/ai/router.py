@@ -759,12 +759,19 @@ async def receive_lifecycle_item_transitioned(
     # default keeps tests that build a bare ``FastAPI()`` (no lifespan run)
     # working — registry-less is a graceful no-op in the reactor.
     registry = getattr(request.app.state, "effector_registry", None)
+    # FEAT-010/T-233: thread the lifespan-built supervisor into the
+    # reactor so engine-mode dispatches are woken when the matching
+    # ``item.transitioned`` webhook arrives.  ``getattr`` default keeps
+    # tests that build a bare ``FastAPI()`` (no lifespan run) working —
+    # the wake step no-ops without a supervisor.
+    supervisor = getattr(request.app.state, "supervisor", None)
     await lifecycle_reactor.handle_transition(
         db,
         event,
         workflow_name_by_id=workflow_name_by_id,
         registry=registry,
         settings=settings,
+        supervisor=supervisor,
     )
     await db.commit()
 
