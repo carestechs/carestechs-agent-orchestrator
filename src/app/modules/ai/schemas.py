@@ -143,6 +143,17 @@ class DispatchEnvelope(BaseModel):
     finished_at: datetime | None = None
 
 
+class ExecutorWebhookPayload(BaseModel):
+    """Body shape POSTed by remote executors to ``/hooks/executors/{id}`` (FEAT-009)."""
+
+    model_config = _CAMEL_CONFIG
+
+    dispatch_id: uuid.UUID
+    outcome: Literal["ok", "error"]
+    result: dict[str, Any] | None = None
+    detail: str | None = None
+
+
 class ExecutorCallDto(BaseModel):
     """Trace entry for one executor dispatch terminal state (FEAT-009)."""
 

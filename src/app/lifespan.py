@@ -82,6 +82,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         logger.exception("zombie reconciliation failed; continuing startup")
 
+    # FEAT-009 / T-221: cancel orphan dispatches left by a prior process.
+    try:
+        from app.modules.ai.executors.reconcile import reconcile_orphan_dispatches
+
+        await reconcile_orphan_dispatches(session_factory)
+    except Exception:
+        logger.exception("dispatch reconciliation failed; continuing startup")
+
     # FEAT-006 rc2: ensure flow-engine workflows are registered.  Optional —
     # if lifecycle-engine config is absent we skip so dev setups without the
     # engine up still boot.

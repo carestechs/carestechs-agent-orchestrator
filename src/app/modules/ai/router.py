@@ -23,7 +23,11 @@ from app.core.dependencies import (
 from app.core.envelope import Envelope, Meta, envelope
 from app.core.exceptions import NotFoundError
 from app.core.llm import LLMProvider
-from app.core.webhook_auth import require_engine_signature, require_flow_engine_signature
+from app.core.webhook_auth import (
+    require_engine_signature,
+    require_executor_signature,
+    require_flow_engine_signature,
+)
 from app.modules.ai import repository, service
 from app.modules.ai.dependencies import (
     get_engine_client,
@@ -328,9 +332,7 @@ async def unlock_work_item(
 ) -> WorkItemSignalResponse:
     """S3 — admin resume."""
     del role, body
-    wi, is_new = await lifecycle_service.unlock_work_item_signal(
-        db, work_item_id, actor="admin", engine=engine
-    )
+    wi, is_new = await lifecycle_service.unlock_work_item_signal(db, work_item_id, actor="admin", engine=engine)
     return _work_item_envelope(wi, already_received=not is_new)
 
 
@@ -379,9 +381,7 @@ async def approve_task(
 ) -> TaskSignalResponse:
     """S5 — admin approves a proposed task (fires T4 + W2 derivation)."""
     del role, body
-    task, is_new = await lifecycle_service.approve_task_signal(
-        db, task_id, actor="admin", engine=engine
-    )
+    task, is_new = await lifecycle_service.approve_task_signal(db, task_id, actor="admin", engine=engine)
     return _task_envelope(task, already_received=not is_new)
 
 
@@ -464,9 +464,7 @@ async def submit_plan(
     task_id: uuid.UUID,
     body: PlanSubmitRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-    role: Annotated[
-        ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
-    ],
+    role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
@@ -492,9 +490,7 @@ async def approve_plan(
     task_id: uuid.UUID,
     body: PlanApproveRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-    role: Annotated[
-        ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
-    ],
+    role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
@@ -520,9 +516,7 @@ async def reject_plan(
     task_id: uuid.UUID,
     body: PlanRejectRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-    role: Annotated[
-        ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
-    ],
+    role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> TaskSignalResponse:
@@ -581,9 +575,7 @@ async def approve_review(
     task_id: uuid.UUID,
     body: ReviewApproveRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-    role: Annotated[
-        ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
-    ],
+    role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
     github: Annotated[GitHubChecksClient, Depends(get_github_checks_client_dep)],
@@ -611,9 +603,7 @@ async def reject_review(
     task_id: uuid.UUID,
     body: ReviewRejectRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
-    role: Annotated[
-        ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))
-    ],
+    role: Annotated[ActorRole, Depends(require_actor_role(ActorRole.ADMIN, ActorRole.DEV))],
     engine: Annotated[FlowEngineLifecycleClient | None, Depends(get_lifecycle_engine_client)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
     github: Annotated[GitHubChecksClient, Depends(get_github_checks_client_dep)],
@@ -685,9 +675,7 @@ async def receive_lifecycle_item_transitioned(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db_session)],
     sig_ok: Annotated[bool, Depends(require_flow_engine_signature)],
-    workflow_ids: Annotated[
-        dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)
-    ],
+    workflow_ids: Annotated[dict[str, uuid.UUID], Depends(get_lifecycle_workflow_ids)],
     settings: Annotated[Settings, Depends(get_settings_dep)],
 ) -> JSONResponse:
     """Ingest a flow-engine lifecycle webhook (state change on an item).
@@ -751,6 +739,7 @@ async def receive_lifecycle_item_transitioned(
         event = lifecycle_reactor.LifecycleWebhookEvent.model_validate(parsed)
     except Exception:
         import logging
+
         logging.getLogger(__name__).warning(
             "lifecycle webhook body did not parse; skipping reactor",
             exc_info=True,
@@ -786,6 +775,106 @@ async def receive_lifecycle_item_transitioned(
             }
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# FEAT-009 — Remote-executor webhook
+# ---------------------------------------------------------------------------
+
+executor_hooks_router = APIRouter(prefix="/hooks/executors")
+
+
+@executor_hooks_router.post("/{executor_id}", status_code=200)
+async def receive_executor_webhook(
+    executor_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    sig_ok: Annotated[bool, Depends(require_executor_signature)],
+    supervisor: Annotated[RunSupervisor, Depends(get_supervisor)],
+) -> JSONResponse:
+    """Ingest a remote-executor terminal-state delivery (FEAT-009 / T-216).
+
+    Persist-first: the ``webhook_events`` row is written for every inbound
+    delivery (including bad signatures, with ``signature_ok=False``).
+    The route then resolves the matching ``Dispatch`` by ``dispatch_id``
+    and either marks it terminal + delivers to the awaiting supervisor
+    future, or returns an idempotent ack / 409 conflict / 404 unknown.
+    """
+    import json as _json
+
+    raw: bytes = request.state.raw_body
+    try:
+        body = _json.loads(raw)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "https://orchestrator.local/problems/validation-error",
+                "title": "Validation error",
+                "status": 400,
+                "detail": "invalid JSON body",
+            },
+            media_type="application/problem+json",
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "https://orchestrator.local/problems/validation-error",
+                "title": "Validation error",
+                "status": 400,
+                "detail": "body must be a JSON object",
+            },
+            media_type="application/problem+json",
+        )
+
+    body_dict: dict[str, Any] = body  # type: ignore[assignment]
+    event_id, status_str = await service.handle_executor_webhook(
+        executor_id=executor_id,
+        body=body_dict,
+        raw_body=raw,
+        signature_ok=sig_ok,
+        db=db,
+        supervisor=supervisor,
+    )
+
+    if status_str == "signature_invalid":
+        return JSONResponse(
+            status_code=401,
+            content={
+                "type": "https://orchestrator.local/problems/unauthorized",
+                "title": "Unauthorized",
+                "status": 401,
+                "detail": "invalid executor webhook signature",
+            },
+            media_type="application/problem+json",
+        )
+    if status_str == "unknown_dispatch":
+        return JSONResponse(
+            status_code=404,
+            content={
+                "type": "https://orchestrator.local/problems/not-found",
+                "title": "Unknown dispatch",
+                "status": 404,
+                "detail": "no dispatch matches the supplied dispatchId",
+            },
+            media_type="application/problem+json",
+        )
+    if status_str == "conflict":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "type": "https://orchestrator.local/problems/conflict",
+                "title": "Conflicting outcome",
+                "status": 409,
+                "detail": "dispatch already terminal with a different outcome",
+            },
+            media_type="application/problem+json",
+        )
+    meta: dict[str, Any] = {"eventId": str(event_id)}
+    if status_str == "already_received":
+        meta["alreadyReceived"] = True
+    return JSONResponse(status_code=200, content={"data": {"received": True}, "meta": meta})
 
 
 # ---------------------------------------------------------------------------

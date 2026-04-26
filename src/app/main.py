@@ -10,7 +10,12 @@ from app.core.exceptions import register_exception_handlers
 from app.core.middleware import RawBodyMiddleware
 from app.health import router as health_router
 from app.lifespan import lifespan
-from app.modules.ai.router import api_router, github_hooks_router, hooks_router
+from app.modules.ai.router import (
+    api_router,
+    executor_hooks_router,
+    github_hooks_router,
+    hooks_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,7 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(api_router)
     application.include_router(hooks_router)
+    application.include_router(executor_hooks_router)
     application.include_router(github_hooks_router)
 
     # -- Middleware ---------------------------------------------------------

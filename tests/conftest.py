@@ -188,6 +188,8 @@ def _test_env(test_database_url: str) -> Iterator[None]:
         "DATABASE_URL": test_database_url,
         "ORCHESTRATOR_API_KEY": API_KEY,
         "ENGINE_WEBHOOK_SECRET": WEBHOOK_SECRET,
+        # FEAT-009 / T-216 — executor webhook secret for /hooks/executors/*.
+        "EXECUTOR_DISPATCH_SECRET": WEBHOOK_SECRET,
         "ENGINE_BASE_URL": ENGINE_BASE_URL,
         "LLM_PROVIDER": "stub",
         # Solo mode is the default for integration tests — every signal in
