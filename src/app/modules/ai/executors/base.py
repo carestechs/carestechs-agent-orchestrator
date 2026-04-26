@@ -26,7 +26,7 @@ from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 
 from app.modules.ai.schemas import DispatchEnvelope
 
-ExecutorMode = Literal["local", "remote", "human"]
+ExecutorMode = Literal["local", "remote", "human", "engine"]
 
 
 @dataclass(frozen=True, slots=True)
