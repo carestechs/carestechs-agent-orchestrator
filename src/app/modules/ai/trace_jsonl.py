@@ -26,6 +26,7 @@ import aiofiles
 
 from app.modules.ai.schemas import (
     EffectorCallDto,
+    ExecutorCallDto,
     PolicyCallDto,
     RunSignalDto,
     StepDto,
@@ -53,14 +54,10 @@ class JsonlTraceStore:
     # -- Public API --------------------------------------------------------
 
     async def record_step(self, run_id: uuid.UUID, step: StepDto) -> None:
-        await self._append(
-            run_id, {"kind": "step", "data": step.model_dump(mode="json", by_alias=True)}
-        )
+        await self._append(run_id, {"kind": "step", "data": step.model_dump(mode="json", by_alias=True)})
 
     async def record_policy_call(self, run_id: uuid.UUID, call: PolicyCallDto) -> None:
-        await self._append(
-            run_id, {"kind": "policy_call", "data": call.model_dump(mode="json", by_alias=True)}
-        )
+        await self._append(run_id, {"kind": "policy_call", "data": call.model_dump(mode="json", by_alias=True)})
 
     async def record_webhook_event(self, run_id: uuid.UUID, event: WebhookEventDto) -> None:
         await self._append(
@@ -68,9 +65,7 @@ class JsonlTraceStore:
             {"kind": "webhook_event", "data": event.model_dump(mode="json", by_alias=True)},
         )
 
-    async def record_operator_signal(
-        self, run_id: uuid.UUID, signal: RunSignalDto
-    ) -> None:
+    async def record_operator_signal(self, run_id: uuid.UUID, signal: RunSignalDto) -> None:
         await self._append(
             run_id,
             {
@@ -79,9 +74,7 @@ class JsonlTraceStore:
             },
         )
 
-    async def record_effector_call(
-        self, entity_id: uuid.UUID, call: EffectorCallDto
-    ) -> None:
+    async def record_effector_call(self, entity_id: uuid.UUID, call: EffectorCallDto) -> None:
         """Append an effector-call trace under ``effectors/<entity_id>.jsonl``.
 
         Separate directory keeps effector fan-out from contending with
@@ -106,9 +99,31 @@ class JsonlTraceStore:
                 except OSError as exc:  # pragma: no cover — best-effort hardening
                     logger.warning("chmod 0600 failed for %s: %s", path, exc)
 
-    async def read_effector_calls(
-        self, entity_id: uuid.UUID
-    ) -> list[EffectorCallDto]:
+    async def record_executor_call(self, run_id: uuid.UUID, call: ExecutorCallDto) -> None:
+        """Append an executor-call trace under ``executors/<run_id>.jsonl``.
+
+        Separate directory keeps executor dispatch terminals from
+        contending with per-run step/policy stream readers.
+        """
+        record = {
+            "kind": "executor_call",
+            "data": call.model_dump(mode="json", by_alias=True),
+        }
+        path = self._executor_path(run_id)
+        lock = await self._lock_for(run_id)
+        line = json.dumps(record, default=str) + "\n"
+        async with lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            newly_created = not path.exists()
+            async with aiofiles.open(path, "a", encoding="utf-8") as f:
+                await f.write(line)
+            if newly_created:
+                try:
+                    os.chmod(path, 0o600)
+                except OSError as exc:  # pragma: no cover — best-effort hardening
+                    logger.warning("chmod 0600 failed for %s: %s", path, exc)
+
+    async def read_effector_calls(self, entity_id: uuid.UUID) -> list[EffectorCallDto]:
         """Replay every effector-call trace for *entity_id* in insertion order.
 
         Returns an empty list when no trace file exists yet (no fires
@@ -128,9 +143,7 @@ class JsonlTraceStore:
                 try:
                     record = json.loads(line)
                 except ValueError:
-                    logger.warning(
-                        "skipping malformed effector trace line in %s", path
-                    )
+                    logger.warning("skipping malformed effector trace line in %s", path)
                     continue
                 if not isinstance(record, dict):
                     continue
@@ -191,6 +204,9 @@ class JsonlTraceStore:
     def _effector_path(self, entity_id: uuid.UUID) -> Path:
         return self._dir / "effectors" / f"{entity_id}.jsonl"
 
+    def _executor_path(self, run_id: uuid.UUID) -> Path:
+        return self._dir / "executors" / f"{run_id}.jsonl"
+
     async def _lock_for(self, run_id: uuid.UUID) -> asyncio.Lock:
         async with self._locks_guard:
             lock = self._locks.get(run_id)
@@ -219,9 +235,7 @@ class JsonlTraceStore:
 # -- Replay helpers --------------------------------------------------------
 
 
-_DTO_BY_KIND: dict[
-    str, type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]
-] = {
+_DTO_BY_KIND: dict[str, type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]] = {
     "step": StepDto,
     "policy_call": PolicyCallDto,
     "webhook_event": WebhookEventDto,
@@ -241,22 +255,16 @@ def _parse_line(
     try:
         record_raw: Any = json.loads(line)
     except json.JSONDecodeError as exc:
-        logger.warning(
-            "malformed trace line %s:%d — %s", path, line_number, exc
-        )
+        logger.warning("malformed trace line %s:%d — %s", path, line_number, exc)
         return None
     if not isinstance(record_raw, dict):
-        logger.warning(
-            "non-object trace line at %s:%d", path, line_number
-        )
+        logger.warning("non-object trace line at %s:%d", path, line_number)
         return None
     record = cast("dict[str, Any]", record_raw)
     kind_raw: Any = record.get("kind")
     dto_cls = _DTO_BY_KIND.get(kind_raw) if isinstance(kind_raw, str) else None
     if dto_cls is None:
-        logger.warning(
-            "unknown trace line kind=%r in %s:%d", kind_raw, path, line_number
-        )
+        logger.warning("unknown trace line kind=%r in %s:%d", kind_raw, path, line_number)
         return None
     return dto_cls.model_validate(record["data"])
 
@@ -337,7 +345,9 @@ async def _tail(
                     except json.JSONDecodeError as exc:
                         logger.warning(
                             "malformed trace line %s:%d — %s",
-                            path, line_number, exc,
+                            path,
+                            line_number,
+                            exc,
                         )
                         continue
                     if isinstance(record, dict):

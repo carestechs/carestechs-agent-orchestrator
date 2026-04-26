@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 
 from app.modules.ai.schemas import (
     EffectorCallDto,
+    ExecutorCallDto,
     PolicyCallDto,
     RunSignalDto,
     StepDto,
@@ -47,15 +48,11 @@ class TraceStore(Protocol):
         """Persist a webhook-event trace entry."""
         ...
 
-    async def record_operator_signal(
-        self, run_id: uuid.UUID, signal: RunSignalDto
-    ) -> None:
+    async def record_operator_signal(self, run_id: uuid.UUID, signal: RunSignalDto) -> None:
         """Persist an operator-injected signal trace entry (FEAT-005)."""
         ...
 
-    async def record_effector_call(
-        self, entity_id: uuid.UUID, call: EffectorCallDto
-    ) -> None:
+    async def record_effector_call(self, entity_id: uuid.UUID, call: EffectorCallDto) -> None:
         """Persist an effector-call trace entry (FEAT-008).
 
         Keyed on ``entity_id`` (work item or task) rather than run id —
@@ -65,9 +62,18 @@ class TraceStore(Protocol):
         """
         ...
 
-    async def read_effector_calls(
-        self, entity_id: uuid.UUID
-    ) -> list[EffectorCallDto]:
+    async def record_executor_call(self, run_id: uuid.UUID, call: ExecutorCallDto) -> None:
+        """Persist an executor-call trace entry (FEAT-009).
+
+        Emitted by the runtime loop when a dispatch reaches a terminal
+        state. The JSONL writer stores these under
+        ``<trace_dir>/executors/<run_id>.jsonl`` (separate from the
+        per-run step/policy trace so the two streams can be tailed
+        independently).
+        """
+        ...
+
+    async def read_effector_calls(self, entity_id: uuid.UUID) -> list[EffectorCallDto]:
         """Replay every effector-call trace for *entity_id* in insertion order.
 
         Backs the FEAT-008/T-172 invariant-3 check, where the test
@@ -121,19 +127,16 @@ class NoopTraceStore:
     async def record_webhook_event(self, run_id: uuid.UUID, event: WebhookEventDto) -> None:
         """Accept and discard a webhook-event trace entry."""
 
-    async def record_operator_signal(
-        self, run_id: uuid.UUID, signal: RunSignalDto
-    ) -> None:
+    async def record_operator_signal(self, run_id: uuid.UUID, signal: RunSignalDto) -> None:
         """Accept and discard an operator-signal trace entry (FEAT-005)."""
 
-    async def record_effector_call(
-        self, entity_id: uuid.UUID, call: EffectorCallDto
-    ) -> None:
+    async def record_effector_call(self, entity_id: uuid.UUID, call: EffectorCallDto) -> None:
         """Accept and discard an effector-call trace entry (FEAT-008)."""
 
-    async def read_effector_calls(
-        self, entity_id: uuid.UUID
-    ) -> list[EffectorCallDto]:
+    async def record_executor_call(self, run_id: uuid.UUID, call: ExecutorCallDto) -> None:
+        """Accept and discard an executor-call trace entry (FEAT-009)."""
+
+    async def read_effector_calls(self, entity_id: uuid.UUID) -> list[EffectorCallDto]:
         """Return an empty list — the noop backend has no data."""
         del entity_id
         return []
