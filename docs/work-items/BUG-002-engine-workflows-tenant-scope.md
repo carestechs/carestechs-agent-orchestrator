@@ -12,7 +12,7 @@
 | **ID** | BUG-002 |
 | **Summary** | `engine_workflows` cache table keys workflow ids by `name` only; switching the configured tenant silently returns the prior tenant's ids. |
 | **Severity** | Medium |
-| **Status** | Reported |
+| **Status** | Resolved |
 | **Reported By** | Smoke test running orchestrator + flow-engine together (DevTools umbrella adaptation) |
 | **Date Reported** | 2026-04-25 |
 | **Date First Observed** | 2026-04-25 |

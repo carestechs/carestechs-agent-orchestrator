@@ -81,6 +81,7 @@ class TestSettingsFields:
             "github_private_key",
             "flow_engine_lifecycle_base_url",
             "flow_engine_tenant_api_key",
+            "flow_engine_tenant_id",
             "log_level",
             "trace_backend",
             "engine_dispatch_timeout_seconds",

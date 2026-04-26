@@ -203,6 +203,22 @@ class FlowEngineLifecycleClient:
         data: dict[str, Any] = payload.get("data") or {}
         return uuid.UUID(str(data["id"]))
 
+    async def get_workflow_by_id(self, workflow_id: uuid.UUID) -> bool:
+        """Return True if the engine recognizes *workflow_id* under the
+        client's tenant; False on 404; raise on other errors.
+
+        Used by the bootstrap (BUG-002) to validate cache hits — a 404
+        means the cache row is stale (engine data reset, or the row was
+        orphaned by a prior tenant-blind cache bug) and should be
+        re-resolved.
+        """
+        resp = await self._request("GET", f"/api/workflows/{workflow_id}")
+        if resp.status_code == 404:
+            return False
+        if resp.status_code != 200:
+            _raise_engine_error(resp, where="get_workflow_by_id")
+        return True
+
     async def get_workflow_by_name(self, name: str) -> uuid.UUID | None:
         resp = await self._request(
             "GET", "/api/workflows", params={"name": name}

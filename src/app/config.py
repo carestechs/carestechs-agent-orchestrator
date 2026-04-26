@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -113,6 +114,10 @@ class Settings(BaseSettings):
     # the node/dispatch surface used by FEAT-005.
     flow_engine_lifecycle_base_url: AnyHttpUrl | None = None
     flow_engine_tenant_api_key: SecretStr | None = None
+    # BUG-002: required when ``flow_engine_lifecycle_base_url`` is set so
+    # the orchestrator can key its ``engine_workflows`` cache by tenant.
+    # Get from your engine admin / JWT subject. Validated below.
+    flow_engine_tenant_id: uuid.UUID | None = None
 
     # -- Observability -----------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -159,6 +164,30 @@ class Settings(BaseSettings):
         if has_pat and has_app:
             raise ValueError(
                 "configure GITHUB_PAT or GITHUB_APP_ID+GITHUB_PRIVATE_KEY, not both"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_engine_lifecycle_settings(self) -> Settings:
+        """Pair ``flow_engine_lifecycle_base_url`` with both auth + tenant id.
+
+        BUG-002: ``engine_workflows`` is keyed by ``(tenant_id, name)``;
+        without an explicit tenant id the bootstrap cannot key the cache
+        and would silently fall back to the FEAT-006 single-tenant
+        assumption. Refuse at construction so a misconfigured process
+        never starts.
+        """
+        if self.flow_engine_lifecycle_base_url is None:
+            return self
+        missing: list[str] = []
+        if self.flow_engine_tenant_api_key is None:
+            missing.append("FLOW_ENGINE_TENANT_API_KEY")
+        if self.flow_engine_tenant_id is None:
+            missing.append("FLOW_ENGINE_TENANT_ID")
+        if missing:
+            raise ValueError(
+                f"FLOW_ENGINE_LIFECYCLE_BASE_URL is set but {', '.join(missing)} "
+                "is not. See docs/work-items/BUG-002-engine-workflows-tenant-scope.md."
             )
         return self
 
