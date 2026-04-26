@@ -20,9 +20,16 @@ import logging
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.modules.ai.schemas import DispatchEnvelope
 
 logger = logging.getLogger(__name__)
+
+
+class DispatchCancelled(RuntimeError):
+    """Raised by ``await_dispatch`` when the dispatch is cancelled while waiting."""
 
 
 @dataclass
@@ -42,12 +49,16 @@ class RunSupervisor:
         # FEAT-005 / T-096 — per-(run, name, task) signal channels.
         # Events fire the first matching ``await_signal`` call; buffered
         # payloads let ``deliver_signal`` arrive *before* the waiter.
-        self._signal_events: dict[
-            tuple[uuid.UUID, str, str], asyncio.Event
-        ] = {}
-        self._signal_buffers: dict[
-            tuple[uuid.UUID, str, str], dict[str, Any]
-        ] = {}
+        self._signal_events: dict[tuple[uuid.UUID, str, str], asyncio.Event] = {}
+        self._signal_buffers: dict[tuple[uuid.UUID, str, str], dict[str, Any]] = {}
+        # FEAT-009 / T-219 — per-dispatch_id futures.  ``await_dispatch``
+        # blocks on the future; ``deliver_dispatch`` resolves it.  Keyed
+        # by a single UUID (the Dispatch row's PK) so the lookup is a
+        # trivial dict get and the API surface stays small.
+        self._dispatch_futures: dict[uuid.UUID, asyncio.Future[DispatchEnvelope]] = {}
+        # ``run_id`` → set of in-flight dispatch ids, used by run cancel
+        # to wake every pending dispatch belonging to the cancelled run.
+        self._dispatches_by_run: dict[uuid.UUID, set[uuid.UUID]] = {}
 
     # -- Spawn / cancel / wake --------------------------------------------
 
@@ -118,9 +129,7 @@ class RunSupervisor:
 
     # -- Operator signals (FEAT-005 / T-096) -------------------------------
 
-    async def await_signal(
-        self, run_id: uuid.UUID, name: str, task_id: str
-    ) -> dict[str, Any]:
+    async def await_signal(self, run_id: uuid.UUID, name: str, task_id: str) -> dict[str, Any]:
         """Block until :meth:`deliver_signal` matches ``(run_id, name, task_id)``.
 
         Returns the payload delivered by the matching
@@ -177,6 +186,71 @@ class RunSupervisor:
                 event = self._signal_events.pop(key, None)
                 if event is not None:
                     event.set()  # unblock any lingering waiter
+        for dispatch_id in list(self._dispatches_by_run.get(run_id, ())):
+            future = self._dispatch_futures.pop(dispatch_id, None)
+            if future is not None and not future.done():
+                future.set_exception(DispatchCancelled(f"dispatch {dispatch_id} cancelled: run {run_id} terminated"))
+        self._dispatches_by_run.pop(run_id, None)
+
+    # -- Executor dispatches (FEAT-009 / T-219) ----------------------------
+
+    def register_dispatch(self, run_id: uuid.UUID, dispatch_id: uuid.UUID) -> None:
+        """Reserve a future slot for ``dispatch_id`` ahead of awaiting it.
+
+        Called by the runtime loop right after the ``Dispatch`` row is
+        inserted but before the executor is invoked.  Required so a
+        :meth:`deliver_dispatch` arriving *before* :meth:`await_dispatch`
+        (e.g. local executor that completes synchronously) is not lost.
+        """
+        if dispatch_id in self._dispatch_futures:
+            return
+        loop = asyncio.get_event_loop()
+        self._dispatch_futures[dispatch_id] = loop.create_future()
+        self._dispatches_by_run.setdefault(run_id, set()).add(dispatch_id)
+
+    async def await_dispatch(self, dispatch_id: uuid.UUID) -> DispatchEnvelope:
+        """Block until :meth:`deliver_dispatch` resolves ``dispatch_id``.
+
+        Raises :class:`DispatchCancelled` if the owning run is cancelled
+        before the dispatch completes.  Cancellation of the awaiting
+        task itself propagates :class:`asyncio.CancelledError` normally.
+
+        Calling :meth:`await_dispatch` for an unregistered id (no prior
+        :meth:`register_dispatch`) auto-registers it lazily — the runtime
+        loop will always register first, but local-executor adapters
+        that synthesize their own dispatch row may rely on this fallback.
+        """
+        future = self._dispatch_futures.get(dispatch_id)
+        if future is None:
+            loop = asyncio.get_event_loop()
+            future = loop.create_future()
+            self._dispatch_futures[dispatch_id] = future
+        try:
+            return await future
+        finally:
+            self._dispatch_futures.pop(dispatch_id, None)
+            for run_id, dispatches in self._dispatches_by_run.items():
+                if dispatch_id in dispatches:
+                    dispatches.discard(dispatch_id)
+                    if not dispatches:
+                        self._dispatches_by_run.pop(run_id, None)
+                    break
+
+    def deliver_dispatch(self, dispatch_id: uuid.UUID, envelope: DispatchEnvelope) -> None:
+        """Resolve the future for ``dispatch_id`` with ``envelope``.
+
+        No-op if the future is already resolved (idempotent re-delivery)
+        or unregistered (delivery for an unknown dispatch is logged at
+        DEBUG and dropped — the webhook route returns 404 before calling
+        in that case, so this branch is only hit on cleanup races).
+        """
+        future = self._dispatch_futures.get(dispatch_id)
+        if future is None:
+            logger.debug("deliver_dispatch: dispatch %s has no awaiting future", dispatch_id)
+            return
+        if future.done():
+            return
+        future.set_result(envelope)
 
     # -- Inspection --------------------------------------------------------
 

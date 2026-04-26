@@ -143,6 +143,21 @@ class DispatchEnvelope(BaseModel):
     finished_at: datetime | None = None
 
 
+class ExecutorCallDto(BaseModel):
+    """Trace entry for one executor dispatch terminal state (FEAT-009)."""
+
+    model_config = _CAMEL_CONFIG
+
+    dispatch_id: uuid.UUID
+    run_id: uuid.UUID
+    executor_ref: str
+    mode: DispatchMode
+    started_at: datetime
+    finished_at: datetime | None = None
+    outcome: DispatchOutcome | None = None
+    detail: str | None = None
+
+
 class EffectorCallDto(BaseModel):
     """Trace entry for one effector fire (FEAT-008)."""
 
