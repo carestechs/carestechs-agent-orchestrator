@@ -16,7 +16,7 @@
 | **ID** | FEAT-010 |
 | **Name** | Engine executor adapter |
 | **Target Version** | v0.5.0 |
-| **Status** | Not Started |
+| **Status** | Completed |
 | **Priority** | High |
 | **Requested By** | Project owner (FEAT-009 closing review — deterministic runtime can dispatch but cannot advance engine state) |
 | **Date Created** | 2026-04-26 |
@@ -151,3 +151,9 @@ N/A — headless service.
 4. **Test against `respx`-stubbed engine** for unit + integration; live engine smoke is a nice-to-have.
 5. **Reconciler is part of the FEAT, not optional.** AC-2 is non-negotiable — restart safety is the whole point of the outbox pattern.
 6. **Trace before code:** the `executor_call` trace shape extension (correlation_id + transition_key) is a contract — generate tasks for the trace shape *before* the dispatch path so the integration test can assert on it.
+
+---
+
+## 14. Outcome (2026-04-26)
+
+FEAT-010 shipped across three sequenced PRs (T-230 → T-240). The `EngineExecutor` joined `LocalExecutor`, `RemoteExecutor`, and `HumanExecutor` as the fourth sibling on the FEAT-009 executor seam, plugging the deterministic dispatch model into the FEAT-008 outbox + reactor pipeline. The reactor pipeline ordering at the wake point landed canonical: `materialize aux → consume correlation context → fire effectors → wake dispatch → fire derivations`. Restart safety is operator-driven via `uv run orchestrator reconcile-dispatches`; engine-mode rows are settled against `FlowEngineLifecycleClient.get_item_state` (which already existed — no engine-side endpoint was added), with three structured detail strings (`orchestrator_restart_engine_confirmed`, `orchestrator_restart_engine_did_not_transition`, `orchestrator_restart_engine_unconfirmed`) covering the three branches; the conservative-cancel branch fires when no engine read is possible, and outbox rows are preserved across all branches for `reconcile-aux` (or a future webhook arrival) to materialize. The import-quarantine property held — `runtime_deterministic.py` does not transitively pull `lifecycle/engine_client.py`. The `lifecycle-agent@0.1.0` LLM-policy + engine path is unchanged (regression bar). FEAT-011 (deterministic lifecycle port) is unblocked — every leg of the engine-bound deterministic dispatch is now in place, exercised end-to-end, and operationally backed.

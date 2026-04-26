@@ -92,3 +92,14 @@ In PR 1 (this PR) the reactor is unchanged. The wake step lands in PR 2; PR 1's 
 **Forward links.** PR 2 (T-233 / T-236 / T-238) extends the reactor with the wake-dispatch step and proves the entire FEAT works end-to-end. PR 3 (T-235 / T-240) closes the operational gap with the reconciler and finalises the docs.
 
 **Cross-link from `CLAUDE.md`.** Patterns: *"Engine-bound nodes register an `EngineExecutor`, never call the engine inline."* Anti-Patterns: *"Don't add a parallel persistence surface for engine round-trips — reuse `pending_aux_writes` and the FEAT-008 reactor."* Both land with the docs sweep in PR 3 (T-240) once the pipeline order has stabilised.
+
+---
+
+## Closing note (2026-04-26 — PR 3 merged)
+
+All six load-bearing decisions in the table above held end-to-end. Two implementation-time confirmations are worth recording:
+
+- **Reconciler reach into engine.** `FlowEngineLifecycleClient.get_item_state` already existed (added in FEAT-008 / T-170 for `reconcile-aux`), so the reconciler reuses it directly — no new method on the client, no new engine-side endpoint, no thin wrapper. The conservative-cancel fallback (read API absent) is still wired in `reconcile_orphan_dispatches_engine_aware` for the engine-absent dev mode path; it just isn't the production path. The brief's contingency for "even the read API is absent" did not materialise.
+- **Lifespan vs. CLI semantics.** The lifespan-time reconciler keeps the FEAT-009 "cancel everything non-terminal at startup" semantic (a fresh process has no in-flight supervisor by definition). The CLI path (`reconcile-dispatches`) skips dispatches owned by still-`running` runs so an operator can re-run it without nuking in-flight work. This split landed via a `skip_run_alive` flag on the engine-aware entrypoint; the original `reconcile_orphan_dispatches` shim preserves the lifespan call site bit-for-bit.
+
+The FEAT shipped without any modification to `EngineExecutor` (PR 1 surface), the reactor pipeline (PR 2 surface), `FlowEngineLifecycleClient`, `runtime_deterministic.py`, or the live agent YAMLs. PR 3 was reconciler + CLI + docs only.
