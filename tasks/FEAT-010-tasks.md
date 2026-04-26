@@ -1,7 +1,7 @@
 # FEAT-010 — Engine executor adapter
 
 > **Source:** `docs/work-items/FEAT-010-engine-executor-adapter.md`
-> **Status:** Not Started
+> **Status:** Completed
 > **Target version:** v0.5.0
 
 FEAT-010 adds the missing seam between FEAT-009's deterministic dispatch model and FEAT-006/008's flow-engine integration. A new `EngineExecutor` joins `LocalExecutor`, `RemoteExecutor`, and `HumanExecutor` as the fourth sibling on the executor seam — its dispatch maps to a flow-engine workflow transition, encodes a correlation id, enqueues a `PendingAuxWrite` row, and is woken by an extension to the existing `lifecycle/reactor.py` pipeline. No new persistence surface, no new webhook endpoint, no LLM in the runtime loop.

@@ -92,8 +92,6 @@ def root_callback(
 # ---------------------------------------------------------------------------
 
 
-
-
 def _require_api_key() -> None:
     if not _state.api_key:
         typer.echo(
@@ -321,9 +319,7 @@ async def _run_reconcile_aux(*, since: Optional[str], dry_run: bool) -> None:
     )
     try:
         async with sessionmaker() as db:
-            report = await reconcile(
-                db, engine_client, since=since_td, dry_run=dry_run
-            )
+            report = await reconcile(db, engine_client, since=since_td, dry_run=dry_run)
     finally:
         await engine_client.aclose()
 
@@ -360,6 +356,95 @@ def _parse_since(raw: str):
         return timedelta(minutes=value)
     typer.echo(f"error: --since unit must be h/d/m, got {raw!r}", err=True)
     raise SystemExit(1)
+
+
+@main.command("reconcile-dispatches")
+def reconcile_dispatches_cmd(
+    since: Annotated[
+        Optional[str],
+        typer.Option(
+            "--since",
+            help="Only scan dispatches whose started_at is within this window "
+            "(e.g. 24h, 7d, 15m). Defaults to the full table.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report what would happen without writing to the database.",
+        ),
+    ] = False,
+) -> None:
+    """Reconcile orphan dispatches, querying the engine for engine-mode rows (FEAT-010/T-235).
+
+    Companion to ``reconcile-aux``: where ``reconcile-aux`` settles
+    orphan outbox rows by querying engine state, this command settles
+    orphan ``Dispatch`` rows the same way.
+
+    For each non-terminal dispatch whose owning run is no longer
+    ``running``:
+
+    * ``mode=engine`` rows are queried against the engine — confirmed,
+      did-not-transition, or unconfirmed (if no engine read possible).
+    * other modes (local / remote / human) are cancelled with
+      ``detail='orchestrator_restart'`` — the FEAT-009 conservative
+      path, preserved bit-for-bit.
+
+    Idempotent — safe to re-run.  ``--dry-run`` reports without
+    writing.  Outbox rows are never deleted by this command;
+    ``reconcile-aux`` is the path that materialises (and drains) outbox
+    rows.
+    """
+    import asyncio
+
+    asyncio.run(_run_reconcile_dispatches(since=since, dry_run=dry_run))
+
+
+async def _run_reconcile_dispatches(*, since: Optional[str], dry_run: bool) -> None:
+    from app.config import get_settings
+    from app.core.database import get_engine, make_sessionmaker
+    from app.modules.ai.executors.reconcile import (
+        format_dispatch_report,
+        reconcile_orphan_dispatches_engine_aware,
+    )
+    from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
+
+    since_td = _parse_since(since) if since else None
+    settings = get_settings()
+    base_url = settings.flow_engine_lifecycle_base_url
+    api_key = settings.flow_engine_tenant_api_key
+
+    engine_client: Optional[FlowEngineLifecycleClient] = None
+    if base_url is not None and api_key is not None:
+        engine_client = FlowEngineLifecycleClient(
+            base_url=str(base_url),
+            api_key=api_key.get_secret_value(),
+        )
+    else:
+        typer.echo(
+            "warning: flow-engine is not configured "
+            "(FLOW_ENGINE_LIFECYCLE_BASE_URL + FLOW_ENGINE_TENANT_API_KEY); "
+            "engine-mode rows will be marked failed with "
+            "detail='orchestrator_restart_engine_unconfirmed'.",
+            err=True,
+        )
+
+    sessionmaker = make_sessionmaker(get_engine())
+    try:
+        report = await reconcile_orphan_dispatches_engine_aware(
+            sessionmaker,
+            engine_client=engine_client,
+            since=since_td,
+            dry_run=dry_run,
+        )
+    finally:
+        if engine_client is not None:
+            await engine_client.aclose()
+
+    typer.echo(format_dispatch_report(report, dry_run=dry_run))
+    if report.errors:
+        raise SystemExit(2)
 
 
 @main.command()
@@ -424,9 +509,7 @@ def runs_cancel(
     """Cancel a running run."""
     _require_api_key()
     with _client() as client:
-        envelope = _handle_response(
-            client.post(f"/api/v1/runs/{run_id}/cancel", json={"reason": reason})
-        )
+        envelope = _handle_response(client.post(f"/api/v1/runs/{run_id}/cancel", json={"reason": reason}))
     _emit(envelope, render_run_summary)
 
 
@@ -459,12 +542,15 @@ def runs_trace(
         params["kind"] = kind  # httpx emits a repeated key for list values
 
     try:
-        with _client() as client, client.stream(
-            "GET",
-            f"/api/v1/runs/{run_id}/trace",
-            params=params,
-            timeout=None,
-        ) as response:
+        with (
+            _client() as client,
+            client.stream(
+                "GET",
+                f"/api/v1/runs/{run_id}/trace",
+                params=params,
+                timeout=None,
+            ) as response,
+        ):
             if response.status_code >= 400:
                 response.read()
                 _handle_response(response)
@@ -540,9 +626,7 @@ def agents_show(
     with _client() as client:
         envelope = _handle_response(client.get("/api/v1/agents"))
     items_raw: Any = envelope.get("data") or []
-    items: list[dict[str, Any]] = [
-        cast("dict[str, Any]", a) for a in items_raw if isinstance(a, dict)
-    ]
+    items: list[dict[str, Any]] = [cast("dict[str, Any]", a) for a in items_raw if isinstance(a, dict)]
     match = next((a for a in items if a.get("ref") == ref), None)
     if match is None:
         typer.echo(f"error: agent not found: {ref}", err=True)
@@ -566,9 +650,7 @@ def _render_list(envelope: dict[str, Any], *, columns: list[str]) -> None:
     if not data_raw:
         typer.echo("(no rows)")
         return
-    rows: list[dict[str, Any]] = [
-        cast("dict[str, Any]", item) for item in data_raw if isinstance(item, dict)
-    ]
+    rows: list[dict[str, Any]] = [cast("dict[str, Any]", item) for item in data_raw if isinstance(item, dict)]
     typer.echo(render_table(rows, columns))
     meta_raw: Any = envelope.get("meta")
     if isinstance(meta_raw, dict):
