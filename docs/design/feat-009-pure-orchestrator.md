@@ -4,6 +4,8 @@
 
 > **Forward link (FEAT-010):** the executor seam introduced here gains a fourth sibling — `EngineExecutor` — that advances flow-engine state on dispatch. See [`feat-010-engine-executor.md`](./feat-010-engine-executor.md) for the engine round-trip contract and the reactor's wake-dispatch step.
 
+> **Forward link (FEAT-011):** the production lifecycle (`lifecycle-agent@0.3.0`) ports onto this seam. See [`feat-011-lifecycle-deterministic-port.md`](./feat-011-lifecycle-deterministic-port.md) for the node-to-engine-transition mapping table, the `LifecycleMemory` shape decision, and the new branch predicates (`review_passed`, `task_rejected`).
+
 > **Revision note (2026-04-26, mid-implementation):** the first draft framed the LLM-policy path as deprecated drift to be removed. That framing was tightened: LLM-policy is a *legitimate* mode for agents whose branches genuinely require model judgment, not a drift. What this FEAT lands is therefore *repositioning*, not removal — deterministic resolution is the default, LLM-policy is opt-in. The structural guard (T-228) polices the deterministic path only.
 
 ## Context
