@@ -56,7 +56,7 @@ The **regression bar (AC-7)** runs in every PR: the v0.1.0 LLM-policy e2e suite 
 - **T-260**: AC-1 + AC-2 e2e — happy path reaches `RunStatus.COMPLETED`; correction budget parametrized over attempts 1, 2, 3 (attempt 3 → `RunStatus.FAILED` + `correction_budget_exceeded`).
 - **T-265**: AC-6 coverage validator — refuses to boot on missing v0.3.0 binding; boots with `no_executor` exemption.
 
-**Load-bearing decision in this PR:** *Where do system prompts for LLM-content executors live?* Recommendation: copy from `.ai-framework/prompts/` into `src/app/modules/ai/executors/prompts/lifecycle/` (one `.md` per node) at PR-3 time. Rationale: v0.1.0 retirement should not silently mutate v0.3.0 behavior. Trade-off: prompt drift between two locations becomes a new maintenance surface — flag in the migration doc (T-267).
+**Load-bearing decision in this PR (confirmed by user 2026-04-26):** system prompts for LLM-content executors are **copied** from `.ai-framework/prompts/` into `src/app/modules/ai/executors/prompts/lifecycle/` (one `.md` per node) at PR-3 time — not symlinked, not imported. Rationale: v0.1.0 retirement should not silently mutate v0.3.0 behavior. Trade-off: prompt drift between two locations becomes a new maintenance surface — flag in the migration doc (T-267).
 
 **This is the irreversible PR.** Once `register_lifecycle_v03` is wired into `register_all_executors`, lifespan startup binds the v0.3.0 executors automatically when the YAML is on disk; reverting after FEAT-012 starts consuming v0.3.0's dispatch shapes is a much larger surgery. The mitigation: T-264 (the v0.1.0 regression bar) runs in this PR and every later PR.
 
