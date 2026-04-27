@@ -77,3 +77,57 @@ def _correction_attempts_under_bound(  # pyright: ignore[reportUnusedFunction] -
     attempts = cast(int, attempts_map.get(task_id, 0))
     bound = cast(int, memory.get("correction_bound", 2))
     return int(attempts) < int(bound)
+
+
+# ---------------------------------------------------------------------------
+# Built-in predicates for lifecycle-agent@0.3.0 (FEAT-011 / T-251)
+# ---------------------------------------------------------------------------
+
+
+@register("review_passed")
+def _review_passed(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    _memory: Mapping[str, Any], last: Mapping[str, Any] | None
+) -> bool:
+    """True iff ``last.verdict == "pass"``; False on ``"fail"``; raises otherwise.
+
+    Reads ``result.verdict`` produced by the ``review_implementation`` node
+    (LLM-content executor that returns a structured ``{verdict, feedback}``
+    payload). Any value other than ``"pass"`` / ``"fail"`` — including a
+    missing field — is a contract violation: the upstream executor must
+    constrain its output via ``result_schema`` so the predicate is total.
+    """
+    if last is None:
+        raise ValueError(
+            "review_passed predicate: no dispatch result available; "
+            "the producing node (review_implementation) must run before this branch"
+        )
+    verdict = last.get("verdict")
+    if verdict == "pass":
+        return True
+    if verdict == "fail":
+        return False
+    raise ValueError(f"review_passed predicate: result.verdict must be 'pass' or 'fail'; got {verdict!r}")
+
+
+@register("task_rejected")
+def _task_rejected(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    _memory: Mapping[str, Any], last: Mapping[str, Any] | None
+) -> bool:
+    """True iff ``last.outcome == "rejected"``; False on ``"approved"``; raises otherwise.
+
+    Reads ``result.outcome`` produced by an approval-stage node (e.g. the
+    ``correct_implementation`` LocalExecutor — see FEAT-011 design doc). Any
+    value other than ``"approved"`` / ``"rejected"`` is a contract violation;
+    the producing executor must constrain its output via ``result_schema``.
+    """
+    if last is None:
+        raise ValueError(
+            "task_rejected predicate: no dispatch result available; "
+            "the producing approval-stage node must run before this branch"
+        )
+    outcome = last.get("outcome")
+    if outcome == "rejected":
+        return True
+    if outcome == "approved":
+        return False
+    raise ValueError(f"task_rejected predicate: result.outcome must be 'approved' or 'rejected'; got {outcome!r}")

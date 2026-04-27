@@ -2,6 +2,8 @@
 
 **Status:** Accepted · **Date:** 2026-04-26 · **Sequel to:** [`feat-009-pure-orchestrator.md`](./feat-009-pure-orchestrator.md). Reuses every surface introduced by [`feat-008-engine-as-authority.md`](./feat-008-engine-as-authority.md).
 
+> **Forward link (FEAT-011):** the deterministic lifecycle port (`lifecycle-agent@0.3.0`) is the first real consumer of the `EngineExecutor` seam — every work-item / task transition the agent drives goes through a registration declared here. See [`feat-011-lifecycle-deterministic-port.md`](./feat-011-lifecycle-deterministic-port.md).
+
 ## Context
 
 FEAT-009 stood up the executor seam — a runtime loop that resolves the next node, dispatches to a registered `Executor`, awaits a process-local future, and records the outcome. Three concrete adapters landed (`LocalExecutor`, `RemoteExecutor`, `HumanExecutor`) and the `Dispatch` state machine became the single source of truth for a step's outcome.
