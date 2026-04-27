@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
-from app.modules.ai.executors.binding import ExecutorBinding
+from app.modules.ai.executors.binding import ExecutorBinding, no_executor
 from app.modules.ai.executors.coverage import (
     ExecutorCoverageError,
     validate_executor_coverage,
@@ -58,6 +58,16 @@ def register_all_executors(registry: ExecutorRegistry, agents_dir: Path) -> None
             _register_lifecycle_v01(registry, agent.ref, [n.name for n in agent.nodes])
         elif agent.ref.startswith("lifecycle-agent@0.2"):
             _register_lifecycle_v02(registry, agent.ref)
+        elif agent.ref.startswith("lifecycle-agent@0.3"):
+            # FEAT-011 / PR 2: the v0.3.0 YAML lands on disk but real
+            # executor wiring (LLMContentExecutor + EngineExecutor +
+            # HumanExecutor + LocalExecutor for `correct_implementation`)
+            # is deferred to PR 3 / T-254 (`register_lifecycle_v03`).  Until
+            # then declare every node as an explicit no_executor exemption
+            # so the lifespan-time coverage validator boots cleanly.  No
+            # caller starts a run against this agent in PR 2 (it would
+            # fail at dispatch time, naming the unbound node).
+            _exempt_lifecycle_v03(agent.ref, [n.name for n in agent.nodes])
 
     logger.info(
         "executor registry: %d binding(s) across %d agent(s)",
@@ -162,6 +172,25 @@ async def _handle_request_work_item_load(ctx: DispatchContext) -> Mapping[str, A
 async def _handle_request_closure(_ctx: DispatchContext) -> Mapping[str, Any]:
     """Mark closure (terminal). Pure code; no LLM."""
     return {"closed": True}
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 — PR 2 placeholder exemptions (real wiring in PR 3 / T-254)
+# ---------------------------------------------------------------------------
+
+
+def _exempt_lifecycle_v03(agent_ref: str, node_names: list[str]) -> None:
+    """Declare every v0.3.0 node as an explicit no_executor exemption.
+
+    PR 2 lands the YAML and the new ``LLMContentExecutor`` module but
+    intentionally does NOT bind executors to nodes — that's PR 3 (T-254
+    ``register_lifecycle_v03``).  Without this exemption the lifespan
+    coverage validator would refuse to boot.  PR 3 deletes this helper
+    when it registers real bindings.
+    """
+    reason = "FEAT-011 PR 2 scaffold; real executor binding lands in PR 3 (T-254)"
+    for node_name in node_names:
+        no_executor(agent_ref, node_name, reason)
 
 
 # ---------------------------------------------------------------------------

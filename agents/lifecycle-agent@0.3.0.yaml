@@ -1,0 +1,162 @@
+# lifecycle-agent@0.3.0 — FEAT-011
+#
+# Deterministic-policy port of the production lifecycle (v0.1.0 / FEAT-005)
+# onto the FEAT-009 executor seam + FEAT-010 EngineExecutor.
+#
+# This YAML is the contract between FlowResolver, ExecutorRegistry, and
+# the runtime loop.  Bootstrap wiring (`register_lifecycle_v03`) lands in
+# PR 3 (T-254); until then the file is on disk but not bound to executors.
+#
+# Node-to-executor mapping is documented in
+# `docs/design/feat-011-lifecycle-deterministic-port.md` (the table under
+# "Node-to-executor mapping table (v0.3.0)").  System prompts for
+# LLM-content nodes are an executor-construction concern (consumed by
+# `LLMContentExecutor` in T-254) — there is intentionally NO
+# `policy.systemPrompts` block at the agent level.
+#
+# Node names follow the FEAT-009 imperative-verb convention: `corrections`
+# is renamed to `correct_implementation`; `wait_for_implementation` is
+# renamed to `request_implementation`.
+
+ref: lifecycle-agent@0.3.0
+version: "0.3.0"
+description: >
+  Deterministic-policy port of the production lifecycle. Drives the
+  ia-framework's 8-stage lifecycle (intake -> closure) against a single
+  work item via the executor seam: engine-bound transitions (W1, W6,
+  T1, T2+T4, T5, T6, T7, T9, T10) advance through `EngineExecutor`;
+  brief / task-list / plan / review production runs through
+  `LLMContentExecutor`; pause-for-implementation routes through
+  `HumanExecutor`. The runtime loop never imports `core.llm`.
+
+nodes:
+  - name: load_work_item
+    description: >
+      Synthesize the work-item brief (LLM-content) and register it with the
+      flow engine via the W1 transition.
+    inputSchema:
+      type: object
+      properties:
+        workItemPath: {type: string}
+      required: [workItemPath]
+
+  - name: generate_tasks
+    description: >
+      Generate the task breakdown (LLM-content) and propose each task to the
+      engine (T1 x N + self-approve T2+T4).
+    inputSchema:
+      type: object
+      properties:
+        workItemId: {type: string}
+      required: [workItemId]
+
+  - name: assign_task
+    description: >
+      Assign the current task to its executor via the engine T5 transition.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: generate_plan
+    description: >
+      Author an implementation plan for the current task (LLM-content) and
+      submit + self-approve it through the engine (T6 + T7). Self-loops
+      while `unplanned_tasks_remaining` is true.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: request_implementation
+    description: >
+      Pause and wait for an operator-injected `implementation-complete`
+      signal; on resume advance the task via the engine T9 transition.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: review_implementation
+    description: >
+      Judge the submitted implementation (LLM-content). On `verdict=pass`
+      advance the task via T10 and proceed to closure; on `verdict=fail`
+      route to `correct_implementation`.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: correct_implementation
+    description: >
+      Record a rejection for the current task implementation (writes the
+      Approval row inline per FEAT-008; does NOT call the engine).
+      Branches on `correction_attempts_under_bound` — true loops back to
+      `request_implementation`, false terminates the run.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: close_work_item
+    description: >
+      Close the work item via the engine W6 transition (terminal).
+    inputSchema:
+      type: object
+      properties:
+        workItemId: {type: string}
+      required: [workItemId]
+
+  - name: terminate_correction_budget
+    description: >
+      Terminal failure node reached when the correction budget is
+      exhausted (`correction_attempts_under_bound` is false). The runtime
+      maps `final_state.reason=correction_budget_exceeded` to
+      `RunStatus.FAILED` via the existing stop-condition pipeline.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+flow:
+  policy: deterministic
+  entryNode: load_work_item
+  transitions:
+    load_work_item: [generate_tasks]
+    generate_tasks: [assign_task]
+    assign_task: [generate_plan]
+    generate_plan:
+      branch:
+        rule: unplanned_tasks_remaining
+        "true": generate_plan
+        "false": request_implementation
+    request_implementation: [review_implementation]
+    review_implementation:
+      branch:
+        rule: review_passed
+        "true": close_work_item
+        "false": correct_implementation
+    correct_implementation:
+      branch:
+        rule: correction_attempts_under_bound
+        "true": request_implementation
+        "false": terminate_correction_budget
+    close_work_item: []
+    terminate_correction_budget: []
+
+intakeSchema:
+  type: object
+  properties:
+    workItemPath: {type: string}
+  required: [workItemPath]
+
+terminalNodes: [close_work_item, terminate_correction_budget]
+
+defaultBudget:
+  maxSteps: 300
