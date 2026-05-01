@@ -294,6 +294,19 @@ async def _execute_node(
                     new_intake["correlation_id"] = str(envelope.correlation_id)
                     if envelope.transition_key is not None:
                         new_intake["transition_key"] = envelope.transition_key
+                    # Merge envelope.intake on top so a per-binding
+                    # ``target_id_resolver`` (BUG-004) that overrode
+                    # ``engineItemId`` for the actual transition_item
+                    # call also surfaces in the persisted dispatch row.
+                    # Without this the audit trail keeps the run-level
+                    # engineItemId (work item) for every task-scoped
+                    # dispatch — misleading when diagnosing wake-leg
+                    # failures.
+                    if envelope.intake:
+                        for key, value in envelope.intake.items():
+                            if key in {"runId", "nodeName"}:
+                                continue  # never let the executor stomp these
+                            new_intake[key] = value
                     dispatch_row.intake = new_intake
                     await session.commit()
         # Non-terminal: webhook will deliver the terminal envelope.

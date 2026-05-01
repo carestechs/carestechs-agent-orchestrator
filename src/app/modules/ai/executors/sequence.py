@@ -146,6 +146,10 @@ class SequenceEngineExecutor:
                     detail=f"hop {hop_index} crashed: {type(exc).__name__}: {exc}",
                 )
 
+        # Reflect the resolved engine target id in the envelope intake
+        # so the persisted dispatch row is truthful (mirrors EngineExecutor).
+        envelope_intake: dict[str, Any] = dict(ctx.intake)
+        envelope_intake["engineItemId"] = str(item_id)
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
             step_id=ctx.step_id,
@@ -153,7 +157,7 @@ class SequenceEngineExecutor:
             executor_ref=self._ref,
             mode="engine",  # type: ignore[arg-type]
             state="dispatched",  # type: ignore[arg-type]
-            intake=dict(ctx.intake),
+            intake=envelope_intake,
             started_at=started,
             dispatched_at=datetime.now(UTC),
             correlation_id=last_correlation_id,
