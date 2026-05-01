@@ -183,8 +183,14 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
 
     session_factory = _build_session_factory(test_database_url)
     engine_item_id = uuid.uuid4()
+    work_item_workflow_id = uuid.uuid4()
 
-    # Seed WorkItem + Task so the Approval FK resolves.
+    # Seed WorkItem + Task so the Approval FK resolves.  BUG-003 note:
+    # ``register_work_item`` runs at the start of every v0.3.0 run and
+    # would normally insert this row itself; here we pre-seed with the
+    # same engine_item_id the mock returns so the executor's idempotent
+    # lookup hits the existing row instead of duplicating it.  The Task
+    # FK then stays valid for the Approval write below.
     async with session_factory() as session:
         wi = WorkItem(
             external_ref=f"FEAT-{uuid.uuid4().hex[:6]}",
@@ -217,6 +223,11 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
         run_row = Run(
             agent_ref=_AGENT_REF,
             agent_definition_hash="sha256:" + "0" * 64,
+            # BUG-003: ``engineItemId`` is no longer in the run intake at
+            # start time — ``register_work_item`` writes it after W1.
+            # Keep it here so the rejection's Approval lookup (which
+            # resolves the Task by ``engine_item_id``) works on the
+            # pre-seeded row before ``register_work_item`` runs.
             intake={
                 "engineItemId": str(engine_item_id),
                 "workItemPath": "docs/work-items/FEAT-099.md",
@@ -256,6 +267,7 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
         lifecycle_client=fake_engine_client,
         llm_provider=provider,  # type: ignore[arg-type]
         session_factory=session_factory,
+        workflow_ids={"work_item_workflow": work_item_workflow_id},
     )
 
     agent = load_agent(_AGENT_REF, _AGENTS_DIR)
@@ -360,6 +372,12 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
 
             with respx.mock(base_url=_ENGINE_BASE, assert_all_called=False) as mock:
                 mock.post("/api/auth/token").respond(200, json=_TOKEN_RESPONSE)
+                # BUG-003: register_work_item posts W1 to create_item.
+                # Return the same engine_item_id the test pre-seeded so
+                # the executor's idempotent lookup reuses the row.
+                mock.post(url__regex=r"/api/workflows/[^/]+/items").respond(
+                    201, json={"data": {"id": str(engine_item_id)}}
+                )
                 mock.post(url__regex=r"/api/items/[^/]+/transitions").mock(side_effect=_post_transition)
                 mock.get(url__regex=r"/api/workflows.*").respond(
                     200, json={"data": {"items": []}}

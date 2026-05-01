@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 
@@ -38,6 +38,19 @@ from pydantic import BaseModel, ValidationError
 from app.core.llm import LLMProvider, ToolCall, ToolDefinition
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.schemas import DispatchEnvelope
+
+MemoryPatchBuilder = Callable[[Mapping[str, Any]], dict[str, Any]]
+"""Callable that converts the validated LLM result dict into a memory patch.
+
+When supplied, the executor merges the patch into the envelope's
+``result`` under the ``__memory_patch`` key so the runtime's standard
+``__memory_patch`` merge writes it into ``RunMemory.data`` after a
+successful dispatch.  Standalone LLM-content nodes (e.g. ``load_work_item``
+in the v0.3.0 split-node shape) use this to persist the brief / task
+list / plan into the typed lifecycle memory; nodes that do not need
+memory writes (e.g. nodes wrapped in :class:`CompositeLLMEngineExecutor`,
+which builds its own patch path) leave it unset.
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +77,7 @@ class LLMContentExecutor:
         llm_provider: LLMProvider,
         max_retries: int = 1,
         model: str | None = None,
+        memory_patch_builder: MemoryPatchBuilder | None = None,
     ) -> None:
         self.name = ref
         self._ref = ref
@@ -74,6 +88,7 @@ class LLMContentExecutor:
         self._max_retries = max_retries
         self._model = model
         self._tool = _tool_from_result_schema(ref, result_schema)
+        self._memory_patch_builder = memory_patch_builder
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
@@ -129,13 +144,27 @@ class LLMContentExecutor:
                     extra={"dispatch_id": str(ctx.dispatch_id)},
                 )
                 continue
+            result_dict: dict[str, Any] = validated.model_dump(mode="json")
+            if self._memory_patch_builder is not None:
+                try:
+                    patch = self._memory_patch_builder(result_dict)
+                except Exception as exc:
+                    return _envelope(
+                        ctx,
+                        ref=self._ref,
+                        started=started,
+                        state="failed",
+                        outcome="error",
+                        detail=f"memory_patch_builder_failed: {type(exc).__name__}: {exc}",
+                    )
+                result_dict["__memory_patch"] = patch
             return _envelope(
                 ctx,
                 ref=self._ref,
                 started=started,
                 state="completed",
                 outcome="ok",
-                result=validated.model_dump(mode="json"),
+                result=result_dict,
             )
 
         return _envelope(
@@ -229,4 +258,4 @@ def _envelope(
     )
 
 
-__all__ = ["LLMContentExecutor"]
+__all__ = ["LLMContentExecutor", "MemoryPatchBuilder"]

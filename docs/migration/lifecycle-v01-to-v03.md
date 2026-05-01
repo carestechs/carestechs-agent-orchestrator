@@ -23,7 +23,9 @@ External contracts are unchanged: same `/api/v1/runs`, same signal endpoint, sam
 
 - **Policy is deterministic.** `flow.policy: deterministic` in `agents/lifecycle-agent@0.3.0.yaml`. Branch decisions resolve via the predicate registry (`correction_attempts_under_bound`, `review_passed`, `unplanned_tasks_remaining`); no LLM call inside the runtime loop. Verified by `tests/test_runtime_deterministic_is_pure.py`.
 - **Executor seam is the production surface.** Every node binds to a concrete executor in `register_lifecycle_v03` (`src/app/modules/ai/executors/bootstrap.py`):
-  - `load_work_item`, `generate_tasks`, `generate_plan`, `review_implementation` → `CompositeLLMEngineExecutor` (LLM call → engine transition in one tx).
+  - `load_work_item` → `LLMContentExecutor` (synthesises the brief; persists into `LifecycleMemory.work_item`; no engine call).
+  - `register_work_item` → `EngineCreateExecutor` (BUG-003; calls W1 `create_item`, writes `engineItemId` into `Run.intake`, inserts the local `work_items` row).
+  - `generate_tasks`, `generate_plan`, `review_implementation` → `CompositeLLMEngineExecutor` (LLM call → engine transition in one tx).
   - `assign_task`, `close_work_item` → `EngineExecutor` (engine-only).
   - `request_implementation` → `HumanExecutor` (signal-driven).
   - `correct_implementation` → `LocalExecutor` (writes `Approval` row inline; FEAT-008 contract).
@@ -39,7 +41,7 @@ External contracts are unchanged: same `/api/v1/runs`, same signal endpoint, sam
 2. **Cost comparison.** Pick one work item; run it through both v0.1.0 and v0.3.0 with the same Anthropic model. Diff token counts from the trace's `policy_call` / `executor_call` entries.
 3. **Side-by-side trace inspection.** v0.3.0's trace shows `mode=local` for LLM-content nodes, `mode=engine` for engine-bound nodes (composite or pure), `mode=human` for the pause node, and `mode=local` for `correct_implementation` / `terminate_correction_budget`. The flow has a synthetic `start` step; subsequent steps follow the YAML transitions.
 4. **Aux-row materialization.** Confirm `task_assignments`, `task_plans`, `task_implementations`, `approvals` rows show up under v0.3.0 the same way they do under v0.1.0. Rejection paths (`correct_implementation`) write `Approval(stage='impl', decision='reject')` inline — no engine transition. Verified by `tests/integration/test_lifecycle_v03_rejection.py`.
-5. **Engine transition order.** Trace shows engine POSTs in the order: `work_item.W1` → `task.T2_T4` → `task.T5` → `task.T6_T7` → (resume) → `task.T10` → `work_item.W6`. T1xN fanout is collapsed in PR 3 — see "T1 fanout" below.
+5. **Engine transition order.** Trace shows engine calls in the order: `register_work_item` → W1 `create_item` (synchronous, no webhook) → `task.T2_T4` → `task.T5` → `task.T6_T7` → (resume) → `task.T10` → `work_item.W6`. T1xN fanout is collapsed in PR 3 — see "T1 fanout" below.
 
 ## Edge cases (FEAT-011 brief Section 9)
 
@@ -63,3 +65,4 @@ FEAT-012 (queued; not yet started) folds rejection-path aux writes into the unif
 ## Changelog
 
 - 2026-04-30 — Initial migration doc shipped with FEAT-011.
+- 2026-05-01 — BUG-003: `load_work_item` Composite split into `load_work_item` (LLM-content only) + `register_work_item` (new `EngineCreateExecutor`). Engine W1 is `create_item`, not `transition_item` — the Composite's "transition existing item" contract no longer leaks into the creation step. The agent YAML grows one node and one transition; no operational change for callers.

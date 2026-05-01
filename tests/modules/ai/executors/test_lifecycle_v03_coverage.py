@@ -8,6 +8,7 @@ boots cleanly.  Without the call, the validator raises a
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -24,7 +25,9 @@ from app.modules.ai.executors.bootstrap import (
 )
 from app.modules.ai.executors.composite import CompositeLLMEngineExecutor
 from app.modules.ai.executors.engine import EngineExecutor
+from app.modules.ai.executors.engine_create import EngineCreateExecutor
 from app.modules.ai.executors.human import HumanExecutor
+from app.modules.ai.executors.llm_content import LLMContentExecutor
 from app.modules.ai.executors.local import LocalExecutor
 from app.modules.ai.executors.registry import ExecutorRegistry
 
@@ -70,6 +73,7 @@ class TestCoverageWiredV03:
             lifecycle_client=stub_lifecycle_client,
             llm_provider=stub_llm_provider,
             session_factory=session_factory,
+            workflow_ids={"work_item_workflow": uuid.uuid4()},
         )
 
         # Restrict coverage validation to just the v0.3.0 agent.
@@ -95,10 +99,12 @@ class TestCoverageWiredV03:
             lifecycle_client=stub_lifecycle_client,
             llm_provider=stub_llm_provider,
             session_factory=session_factory,
+            workflow_ids={"work_item_workflow": uuid.uuid4()},
         )
 
         expected: dict[str, type[Any]] = {
-            "load_work_item": CompositeLLMEngineExecutor,
+            "load_work_item": LLMContentExecutor,
+            "register_work_item": EngineCreateExecutor,
             "generate_tasks": CompositeLLMEngineExecutor,
             "assign_task": EngineExecutor,
             "generate_plan": CompositeLLMEngineExecutor,
@@ -126,6 +132,7 @@ class TestCoverageWithoutV03Wiring:
         for node_name in (
             "start",
             "load_work_item",
+            "register_work_item",
             "generate_tasks",
             "assign_task",
             "generate_plan",

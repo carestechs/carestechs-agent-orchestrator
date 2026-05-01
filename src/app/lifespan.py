@@ -193,14 +193,20 @@ def _bootstrap_executor_registry(
     registry = ExecutorRegistry()
 
     lifecycle_client = getattr(app.state, "lifecycle_engine_client", None)
+    workflow_ids = getattr(app.state, "lifecycle_workflow_ids", {}) or {}
     v03_collaborators: LifecycleV03Collaborators | None
-    if lifecycle_client is None:
+    if lifecycle_client is None or not workflow_ids:
+        # Engine-absent dev mode OR ensure_workflows() never resolved the
+        # work_item_workflow id — register_lifecycle_v03's BUG-003 guard
+        # would refuse to bind ``register_work_item`` anyway.  Fall back
+        # to no_executor exemptions so coverage still boots.
         v03_collaborators = None
     else:
         v03_collaborators = LifecycleV03Collaborators(
             lifecycle_client=lifecycle_client,
             llm_provider=get_llm_provider(get_settings()),
             session_factory=session_factory,
+            workflow_ids=workflow_ids,
         )
 
     register_all_executors(registry, agents_dir, v03_collaborators=v03_collaborators)
