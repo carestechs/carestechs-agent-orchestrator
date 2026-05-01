@@ -47,7 +47,6 @@ def _build_event(
     from_status: str = "in_progress",
     to_status: str = "ready",
 ) -> reactor.LifecycleWebhookEvent:
-    triggered_by = f"orchestrator-corr:{correlation_id}" if correlation_id is not None else "engine"
     return reactor.LifecycleWebhookEvent(
         delivery_id=uuid.uuid4(),
         event_type="item.transitioned",
@@ -58,7 +57,8 @@ def _build_event(
         data=reactor.LifecycleWebhookData(
             from_status=from_status,
             to_status=to_status,
-            triggered_by=triggered_by,
+            triggered_by="engine",
+            correlation_id=correlation_id,
         ),
     )
 
@@ -317,8 +317,8 @@ class TestPipelineOrder:
             del db, name, evt
             calls.append("update_status_cache")
 
-        async def fake_consume(db: Any, triggered_by: Any) -> None:
-            del db, triggered_by
+        async def fake_consume(db: Any, corr: Any) -> None:
+            del db, corr
             calls.append("consume_correlation")
 
         async def fake_effectors(*args: Any, **kwargs: Any) -> None:
@@ -335,7 +335,7 @@ class TestPipelineOrder:
 
         monkeypatch.setattr(reactor, "_materialize_aux", fake_materialize)
         monkeypatch.setattr(reactor, "_update_status_cache", fake_status)
-        monkeypatch.setattr(reactor, "_consume_correlation", fake_consume)
+        monkeypatch.setattr(reactor, "_consume_correlation_by_id", fake_consume)
         monkeypatch.setattr(reactor, "_dispatch_effectors", fake_effectors)
         monkeypatch.setattr(reactor, "_wake_dispatch", fake_wake)
         monkeypatch.setattr(reactor, "_handle_task_transition", fake_handle_task_transition)

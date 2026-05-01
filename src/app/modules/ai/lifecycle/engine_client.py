@@ -283,17 +283,32 @@ class FlowEngineLifecycleClient:
         actor: str | None = None,
         comment: str | None = None,
     ) -> dict[str, Any]:
-        """Transition an item.  Encodes ``correlation_id`` into the
-        comment using ``orchestrator-corr:<uuid>`` so the reactor can parse
-        it from the emitted webhook's ``triggeredBy``.
+        """Transition an item.
+
+        Sends ``correlationId`` as a structured field on the request
+        body — the engine echoes it back on the resulting
+        ``item.transitioned`` webhook so the reactor can match the
+        outbox row + wake the parked dispatch.
+
+        Historical note: prior to this change the orchestrator encoded
+        the correlation as ``orchestrator-corr:<uuid>`` at the start of
+        the ``comment`` field on the (mistaken) assumption that the
+        engine propagated the comment to the webhook's ``triggeredBy``.
+        It does not — ``triggeredBy`` is the engine's actor id.  The
+        comment-encoding hack never worked; this is the fix.
         """
         comment_suffix = f"[actor={actor}]" if actor else ""
-        encoded = f"orchestrator-corr:{correlation_id}"
-        full_comment = " ".join(filter(None, [encoded, comment, comment_suffix]))
+        full_comment = " ".join(filter(None, [comment, comment_suffix])) or None
+        body: dict[str, Any] = {
+            "toStatus": to_status,
+            "correlationId": str(correlation_id),
+        }
+        if full_comment:
+            body["comment"] = full_comment
         resp = await self._request(
             "POST",
             f"/api/items/{item_id}/transitions",
-            json={"toStatus": to_status, "comment": full_comment},
+            json=body,
         )
         if resp.status_code != 200:
             _raise_engine_error(resp, where="transition_item")
@@ -376,22 +391,3 @@ def _raise_engine_error(resp: httpx.Response, *, where: str) -> None:
     )
 
 
-def extract_correlation_id(triggered_by: str | None) -> uuid.UUID | None:
-    """Parse a correlation id out of the engine webhook's ``triggeredBy``.
-
-    Mirrors the ``orchestrator-corr:<uuid>`` encoding used by
-    :meth:`FlowEngineLifecycleClient.transition_item`.  Returns None if
-    the prefix is absent or the UUID is malformed.
-    """
-    if not triggered_by:
-        return None
-    prefix = "orchestrator-corr:"
-    idx = triggered_by.find(prefix)
-    if idx < 0:
-        return None
-    tail = triggered_by[idx + len(prefix) :].strip()
-    token = tail.split()[0] if tail else ""
-    try:
-        return uuid.UUID(token)
-    except ValueError:
-        return None

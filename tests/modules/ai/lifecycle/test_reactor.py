@@ -213,7 +213,8 @@ class TestCorrelationConsumption:
             data=reactor.LifecycleWebhookData(
                 from_status="impl_review",
                 to_status="done",
-                triggered_by=f"user:admin orchestrator-corr:{corr}",
+                triggered_by="user:admin",
+                correlation_id=corr,
             ),
         )
         mapping = {task_workflow_id: declarations.TASK_WORKFLOW_NAME}

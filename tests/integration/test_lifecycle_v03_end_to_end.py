@@ -279,12 +279,13 @@ async def _drive_engine_with_webhooks(
 
     async def _post_transition(request: Any) -> Response:
         body = json.loads(request.content.decode())
-        comment = body.get("comment", "")
-        prefix = "orchestrator-corr:"
-        for tok in comment.split():
-            if tok.startswith(prefix):
-                correlation_log.append(uuid.UUID(tok[len(prefix) :]))
-                break
+        # Orchestrator now sends correlationId as a structured field
+        # on the request body (the engine echoes it back on the
+        # resulting webhook).  Extract it here so the drainer can
+        # reflect it on the synthetic webhook below.
+        corr_raw = body.get("correlationId")
+        if corr_raw:
+            correlation_log.append(uuid.UUID(corr_raw))
         return Response(
             200,
             json={"data": {"id": str(uuid.uuid4()), "transitionRunId": str(uuid.uuid4())}},
@@ -332,7 +333,8 @@ async def _drive_engine_with_webhooks(
                             "data": {
                                 "fromStatus": "in_progress",
                                 "toStatus": "ready",
-                                "triggeredBy": f"orchestrator-corr:{corr}",
+                                "triggeredBy": "engine",
+                                "correlationId": str(corr),
                             },
                         }
                         raw = json.dumps(body).encode()

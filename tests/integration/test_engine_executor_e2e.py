@@ -238,12 +238,9 @@ async def test_engine_executor_reaches_terminal_via_reactor_wake(
     # fire the matching webhook back into the orchestrator.
     async def _post_transition(request: Any) -> Response:
         body = json.loads(request.content.decode())
-        comment = body.get("comment", "")
-        prefix = "orchestrator-corr:"
-        for tok in comment.split():
-            if tok.startswith(prefix):
-                captured_correlation["value"] = uuid.UUID(tok[len(prefix) :])
-                break
+        corr_raw = body.get("correlationId")
+        if corr_raw:
+            captured_correlation["value"] = uuid.UUID(corr_raw)
         return Response(
             200,
             json={
@@ -278,7 +275,8 @@ async def test_engine_executor_reaches_terminal_via_reactor_wake(
                     "data": {
                         "fromStatus": "in_progress",
                         "toStatus": "ready",
-                        "triggeredBy": f"orchestrator-corr:{corr}",
+                        "triggeredBy": "engine",
+                        "correlationId": str(corr),
                     },
                 }
                 raw = json.dumps(body).encode()

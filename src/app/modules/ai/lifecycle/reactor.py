@@ -41,7 +41,6 @@ from app.modules.ai.lifecycle.effectors.registry import (
     EffectorRegistry,
     build_transition_key,
 )
-from app.modules.ai.lifecycle.engine_client import extract_correlation_id
 from app.modules.ai.models import (
     Approval,
     Dispatch,
@@ -69,6 +68,13 @@ class LifecycleWebhookData(BaseModel):
     from_status: str | None = None
     to_status: str | None = None
     triggered_by: str | None = None
+    # Engine echoes the ``correlationId`` we sent on ``transition_item``
+    # back here.  The orchestrator uses it to (a) match the outbox row
+    # in :class:`PendingAuxWrite` for FEAT-008 aux-row materialisation
+    # and (b) wake the parked engine-mode :class:`Dispatch` for
+    # FEAT-010.  Older engines didn't expose this — see the historical
+    # note in :meth:`FlowEngineLifecycleClient.transition_item`.
+    correlation_id: uuid.UUID | None = None
 
 
 class LifecycleWebhookEvent(BaseModel):
@@ -83,6 +89,22 @@ class LifecycleWebhookEvent(BaseModel):
     item_id: uuid.UUID
     timestamp: datetime
     data: LifecycleWebhookData
+    # Some engine versions emit ``correlationId`` at the top level
+    # rather than nested under ``data``.  Accept it in either location;
+    # readers should call :func:`webhook_correlation_id` to resolve.
+    correlation_id: uuid.UUID | None = None
+
+
+def webhook_correlation_id(event: LifecycleWebhookEvent) -> uuid.UUID | None:
+    """Return the engine-echoed correlation id from either location.
+
+    Prefers ``data.correlationId`` (where structured per-transition
+    metadata lives) and falls back to the top-level ``correlationId``
+    (where some engine versions place it).  Returns ``None`` when the
+    engine did not echo one — the reactor's wake step then no-ops with
+    a WARNING (see :func:`_wake_dispatch`).
+    """
+    return event.data.correlation_id or event.correlation_id
 
 
 _TASK_TERMINAL = {TaskStatus.DONE.value, TaskStatus.DEFERRED.value}
@@ -128,7 +150,7 @@ async def handle_transition(
     # correlation before firing derivations — downstream work that reads
     # aux rows (W5 via child-task counts, effectors that inspect latest
     # Approval/TaskImplementation) expects them already committed.
-    corr = extract_correlation_id(event.data.triggered_by)
+    corr = webhook_correlation_id(event)
     if corr is not None:
         await _materialize_aux(db, corr)
 
@@ -141,7 +163,8 @@ async def handle_transition(
     # Consume the signal-context row recorded at signal time.  Logged +
     # deleted; payload is used by the outbox materialization above when
     # the correlation matched.
-    await _consume_correlation(db, event.data.triggered_by)
+    if corr is not None:
+        await _consume_correlation_by_id(db, corr)
 
     # FEAT-008/T-173: dispatch registered effectors for this transition.
     # Fires after the status-cache write so effectors observing the local
@@ -296,18 +319,16 @@ def build_aux_row(
     return None
 
 
-async def _consume_correlation(db: AsyncSession, triggered_by: str | None) -> None:
-    """Parse the correlation UUID out of ``triggered_by``, look up the
-    matching ``PendingSignalContext`` row, log it, and delete.
+async def _consume_correlation_by_id(db: AsyncSession, corr: uuid.UUID) -> None:
+    """Look up the matching ``PendingSignalContext`` row, log it, and delete.
 
-    No-ops when the correlation is absent or the row was already consumed
-    (replayed webhook).  Aux-row writes based on this payload are
-    intentionally deferred — this step only proves the end-to-end loop
-    closes.
+    The correlation arrives directly from the webhook's ``correlationId``
+    field (echoed by the engine on the originating ``transition_item``).
+    No-ops when no matching row exists (already consumed; replayed
+    webhook; or transition was not orchestrator-driven).  Aux-row writes
+    based on this payload are intentionally deferred — this step only
+    proves the end-to-end loop closes.
     """
-    corr = extract_correlation_id(triggered_by)
-    if corr is None:
-        return
     row = await db.scalar(select(PendingSignalContext).where(PendingSignalContext.correlation_id == corr))
     if row is None:
         logger.debug(
@@ -415,11 +436,12 @@ async def _wake_dispatch(
     )
     if dispatch_row is None:
         # Diagnostic: enumerate the active engine-mode dispatches still
-        # waiting on a wake.  When the engine echoes a correlation in a
-        # format ``extract_correlation_id`` doesn't recognise (or echoes
-        # a different correlation entirely), the wake silently misses
-        # and the runtime times out.  Surfacing the active set + the
-        # raw ``triggered_by`` makes that drift diagnosable from logs.
+        # waiting on a wake.  When the engine doesn't echo
+        # ``correlationId`` back (or echoes a different one than the
+        # orchestrator sent on ``transition_item``), the wake silently
+        # misses and the runtime times out.  Surfacing the active set
+        # + the raw ``triggered_by`` makes that drift diagnosable from
+        # logs.
         active = (
             await db.scalars(
                 select(Dispatch).where(

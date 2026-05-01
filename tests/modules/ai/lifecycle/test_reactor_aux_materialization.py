@@ -36,11 +36,6 @@ pytestmark = pytest.mark.asyncio(loop_scope="function")
 def _build_webhook(
     *, item_id: uuid.UUID, correlation_id: uuid.UUID | None, to_status: str
 ) -> reactor.LifecycleWebhookEvent:
-    triggered_by = (
-        f"orchestrator-corr:{correlation_id}"
-        if correlation_id is not None
-        else "engine"
-    )
     return reactor.LifecycleWebhookEvent(
         delivery_id=uuid.uuid4(),
         event_type="item.transitioned",
@@ -49,7 +44,10 @@ def _build_webhook(
         item_id=item_id,
         timestamp=datetime.now(UTC),
         data=reactor.LifecycleWebhookData(
-            from_status=None, to_status=to_status, triggered_by=triggered_by
+            from_status=None,
+            to_status=to_status,
+            triggered_by="engine",
+            correlation_id=correlation_id,
         ),
     )
 
