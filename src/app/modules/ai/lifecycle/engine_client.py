@@ -29,7 +29,7 @@ import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -300,6 +300,34 @@ class FlowEngineLifecycleClient:
         payload: dict[str, Any] = resp.json()
         data: dict[str, Any] = payload.get("data") or {}
         return data
+
+    async def list_webhook_subscriptions(
+        self,
+        *,
+        workflow_id: uuid.UUID | None = None,
+    ) -> list[dict[str, Any]]:
+        """List active webhook subscriptions; optionally filter by workflow id.
+
+        BUG-005: ``ensure_engine_subscriptions`` queries this before
+        POSTing so a re-boot does not duplicate the (url, event_type,
+        workflow_id) triple.  The engine's POST endpoint creates a new
+        subscription on every call, so the orchestrator must dedupe.
+        """
+        params: dict[str, str] = {}
+        if workflow_id is not None:
+            params["workflowId"] = str(workflow_id)
+        resp = await self._request("GET", "/api/webhook-subscriptions", params=params)
+        if resp.status_code != 200:
+            _raise_engine_error(resp, where="list_webhook_subscriptions")
+        payload: dict[str, Any] = resp.json() or {}
+        data: Any = payload.get("data") or []
+        if isinstance(data, dict):
+            data_dict = cast(dict[str, Any], data)
+            inner: Any = data_dict.get("items") or data_dict.get("subscriptions") or []
+            return list(cast(list[dict[str, Any]], inner)) if isinstance(inner, list) else []
+        if isinstance(data, list):
+            return list(cast(list[dict[str, Any]], data))
+        return []
 
     async def ensure_webhook_subscription(
         self,
