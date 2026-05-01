@@ -414,10 +414,36 @@ async def _wake_dispatch(
         )
     )
     if dispatch_row is None:
-        logger.info(
+        # Diagnostic: enumerate the active engine-mode dispatches still
+        # waiting on a wake.  When the engine echoes a correlation in a
+        # format ``extract_correlation_id`` doesn't recognise (or echoes
+        # a different correlation entirely), the wake silently misses
+        # and the runtime times out.  Surfacing the active set + the
+        # raw ``triggered_by`` makes that drift diagnosable from logs.
+        active = (
+            await db.scalars(
+                select(Dispatch).where(
+                    Dispatch.mode == DispatchMode.ENGINE.value,
+                    Dispatch.state == DispatchState.DISPATCHED.value,
+                )
+            )
+        ).all()
+        active_summary = [
+            {
+                "dispatch_id": str(d.dispatch_id),
+                "correlation_id": (d.intake or {}).get("correlation_id"),
+                "transition_key": (d.intake or {}).get("transition_key"),
+                "engine_item_id": (d.intake or {}).get("engineItemId"),
+            }
+            for d in active
+        ]
+        logger.warning(
             "wake_dispatch: no engine dispatch found for correlation %s "
-            "(race or non-executor-driven transition); skipping",
+            "(triggered_by=%r, item_id=%s); active dispatched rows: %s",
             correlation_id,
+            event.data.triggered_by,
+            event.item_id,
+            active_summary,
         )
         return
     if dispatch_row.state != DispatchState.DISPATCHED:

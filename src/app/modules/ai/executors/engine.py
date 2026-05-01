@@ -205,6 +205,14 @@ class EngineExecutor:
                 detail=f"{type(exc).__name__}: {exc}",
             )
 
+        # The envelope's intake reflects the *resolved* engine target so
+        # the persisted dispatch row is a truthful audit record.  The
+        # runtime merges this back into ``Dispatch.intake`` after the
+        # executor returns; without this, the intake would still show
+        # the run-level engineItemId (work item) for task-scoped
+        # dispatches whose resolver picked a different id.
+        envelope_intake: dict[str, Any] = dict(ctx.intake)
+        envelope_intake["engineItemId"] = str(item_id)
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
             step_id=ctx.step_id,
@@ -212,7 +220,7 @@ class EngineExecutor:
             executor_ref=self._ref,
             mode="engine",  # type: ignore[arg-type]
             state="dispatched",  # type: ignore[arg-type]
-            intake=dict(ctx.intake),
+            intake=envelope_intake,
             started_at=started,
             dispatched_at=datetime.now(UTC),
             correlation_id=correlation_id,

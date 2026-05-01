@@ -279,6 +279,46 @@ class TestTargetIdResolver:
         assert env.state.value == "dispatched"
         assert transition_route.call_count == 1, "transition fired against the resolved id, not intake"
 
+    async def test_envelope_intake_carries_resolved_engine_item_id(
+        self,
+        lifecycle_client: FlowEngineLifecycleClient,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The dispatched envelope's ``intake`` must reflect the resolved
+        engine target id, not the run-level ``engineItemId`` from intake.
+        The runtime merges this into the persisted ``Dispatch.intake``
+        so the audit trail names the actual target — when an operator
+        diagnoses a wake-leg failure they should see the right id.
+        """
+        intake_item = uuid.uuid4()
+        resolved_item = uuid.uuid4()
+
+        async def _resolver(_ctx):  # type: ignore[no-untyped-def]
+            return resolved_item
+
+        with respx.mock(base_url=_BASE, assert_all_mocked=False, assert_all_called=False) as rx:
+            rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
+            rx.post(f"/api/items/{resolved_item}/transitions").mock(
+                return_value=Response(200, json={"data": {"id": "ok"}})
+            )
+            executor = EngineExecutor(
+                ref="engine:test",
+                transition_key="task.T5",
+                to_status="planning",
+                lifecycle_client=lifecycle_client,
+                session_factory=session_factory,
+                target_id_resolver=_resolver,
+            )
+            env = await executor.dispatch(_ctx(item_id=intake_item))
+
+        assert env.state.value == "dispatched"
+        assert env.intake["engineItemId"] == str(resolved_item), (
+            "envelope.intake must carry the resolved id so the runtime can "
+            "merge it into Dispatch.intake — otherwise the audit trail "
+            "keeps showing the run-level (work-item) id even for "
+            "task-scoped dispatches"
+        )
+
     async def test_resolver_returning_none_fails_before_engine_call(
         self,
         lifecycle_client: FlowEngineLifecycleClient,
