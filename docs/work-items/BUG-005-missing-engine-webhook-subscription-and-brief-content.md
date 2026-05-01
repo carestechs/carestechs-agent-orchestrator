@@ -35,7 +35,9 @@
 
 ### (a) `ensure_engine_subscriptions(...)` in `lifecycle/bootstrap.py`
 
-New helper, called from lifespan immediately after `ensure_workflows`. Iterates the resolved `workflow_ids` dict, calls `engine_client.ensure_webhook_subscription(url=<public_base_url>/hooks/engine/lifecycle/item-transitioned, event_type="item.transitioned", workflow_id=<each>, secret=settings.engine_webhook_secret)`. Treats engine `409` as "already subscribed" (idempotent across reboots); any other `EngineError` surfaces.
+New helper, called from lifespan immediately after `ensure_workflows`. Iterates the resolved `workflow_ids` dict; for each workflow, GETs `/api/webhook-subscriptions?workflowId=<id>` first to check whether a row already matches `(url, event_type)`. Skips the POST when a match is found. Otherwise POSTs to create the subscription. Engine `409` is also tolerated as a defensive belt-and-braces.
+
+The callback URL is derived from `Settings.public_base_url` (env var `PUBLIC_BASE_URL`). **Container deploys must point this at the orchestrator's container DNS name on the shared network** (e.g. `http://orchestrator-api:8000`) — `localhost` resolves to the engine container itself, and the engine's HTTP delivery would 404.
 
 Wrapped in `try/except` at the lifespan call site so a failure logs loudly but doesn't crash boot — the rest of the orchestrator still works for non-engine paths during diagnosis.
 
@@ -66,3 +68,4 @@ New optional async callable parameter: `prompt_context_loader: Callable[[Dispatc
 ## Changelog
 
 - 2026-05-01 — Filed and resolved in the same PR; diagnosis from the operator.
+- 2026-05-01 — Followup after operator review: the engine's POST `/api/webhook-subscriptions` is *not* idempotent server-side (creates a fresh row per call); a re-boot would accumulate duplicates. Added pre-flight GET via new `list_webhook_subscriptions(workflow_id=...)` engine-client method; `_subscription_matches` skips the POST when an existing row matches `(url, event_type)`. Operator also flagged that `localhost:8000` is the wrong callback URL inside container networks — clarified in the helper docstring; `PUBLIC_BASE_URL` must be set to the orchestrator's container DNS name (e.g. `http://orchestrator-api:8000`) for umbrella mode.
