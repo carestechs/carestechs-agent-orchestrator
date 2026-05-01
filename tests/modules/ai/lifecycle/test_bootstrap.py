@@ -28,15 +28,41 @@ class _FakeClient:
         create_side_effect: list[Any] | None = None,
         lookup_side_effect: list[Any] | None = None,
         recognize_side_effect: list[Any] | None = None,
+        ensure_subscription_side_effect: list[Any] | None = None,
     ) -> None:
         self.create_calls: list[dict[str, Any]] = []
         self.lookup_calls: list[str] = []
         self.recognize_calls: list[uuid.UUID] = []
+        self.subscription_calls: list[dict[str, Any]] = []
         self._create_effects = list(create_side_effect or [])
         self._lookup_effects = list(lookup_side_effect or [])
         # ``recognize_side_effect`` defaults to "engine recognizes everything"
         # so cache-hit tests that don't care about validation just pass through.
         self._recognize_effects = list(recognize_side_effect or [])
+        self._subscription_effects = list(ensure_subscription_side_effect or [])
+
+    async def ensure_webhook_subscription(
+        self,
+        *,
+        url: str,
+        event_type: str,
+        workflow_id: uuid.UUID | None,
+        secret: str,
+    ) -> uuid.UUID:
+        self.subscription_calls.append(
+            {
+                "url": url,
+                "event_type": event_type,
+                "workflow_id": workflow_id,
+                "secret": secret,
+            }
+        )
+        if not self._subscription_effects:
+            return uuid.uuid4()
+        effect = self._subscription_effects.pop(0)
+        if isinstance(effect, Exception):
+            raise effect
+        return effect
 
     async def create_workflow(
         self,
@@ -270,6 +296,71 @@ class TestEnsureWorkflows:
         assert len(rows) == 1
         assert rows[0].engine_workflow_id == new_ids[0]
         assert client.recognize_calls == [stale_id]
+
+
+class TestEnsureEngineSubscriptions:
+    """BUG-005: lifespan must subscribe to engine webhooks per workflow."""
+
+    async def test_subscribes_one_per_workflow(self) -> None:
+        sub_a = uuid.uuid4()
+        sub_b = uuid.uuid4()
+        client = _FakeClient(ensure_subscription_side_effect=[sub_a, sub_b])
+        wf_a = uuid.uuid4()
+        wf_b = uuid.uuid4()
+
+        await bootstrap.ensure_engine_subscriptions(
+            client,  # type: ignore[arg-type]
+            workflow_ids={"work_item_workflow": wf_a, "task_workflow": wf_b},
+            public_base_url="http://orch.test",
+            webhook_secret="hunter2",
+        )
+
+        assert len(client.subscription_calls) == 2
+        for call in client.subscription_calls:
+            assert call["url"] == "http://orch.test/hooks/engine/lifecycle/item-transitioned"
+            assert call["event_type"] == "item.transitioned"
+            assert call["secret"] == "hunter2"
+        seen_workflows = {c["workflow_id"] for c in client.subscription_calls}
+        assert seen_workflows == {wf_a, wf_b}
+
+    async def test_409_already_exists_is_swallowed(self) -> None:
+        from app.core.exceptions import EngineError
+
+        client = _FakeClient(
+            ensure_subscription_side_effect=[
+                EngineError("already exists", engine_http_status=409),
+                uuid.uuid4(),
+            ]
+        )
+        await bootstrap.ensure_engine_subscriptions(
+            client,  # type: ignore[arg-type]
+            workflow_ids={
+                "work_item_workflow": uuid.uuid4(),
+                "task_workflow": uuid.uuid4(),
+            },
+            public_base_url="http://orch.test/",  # trailing slash tolerated
+            webhook_secret="x",
+        )
+        # Both calls observed; the 409 did not stop the iteration.
+        assert len(client.subscription_calls) == 2
+
+    async def test_non_409_engine_error_surfaces(self) -> None:
+        import pytest
+
+        from app.core.exceptions import EngineError
+
+        client = _FakeClient(
+            ensure_subscription_side_effect=[
+                EngineError("auth failed", engine_http_status=401),
+            ]
+        )
+        with pytest.raises(EngineError):
+            await bootstrap.ensure_engine_subscriptions(
+                client,  # type: ignore[arg-type]
+                workflow_ids={"work_item_workflow": uuid.uuid4()},
+                public_base_url="http://orch.test",
+                webhook_secret="x",
+            )
 
 
 class TestSettingsValidator:

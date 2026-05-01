@@ -256,6 +256,57 @@ class TestPromptRendering:
 
 
 # ---------------------------------------------------------------------------
+# prompt_context_loader (BUG-005) — async loader merges into format_map.
+# ---------------------------------------------------------------------------
+
+
+@_async
+class TestPromptContextLoader:
+    async def test_loader_bindings_are_merged_into_template(self) -> None:
+        provider = _ScriptedProvider(script=[{"title": "x", "summary": "y"}])
+
+        async def _loader(_ctx: DispatchContext) -> Mapping[str, Any]:
+            return {"workItemBrief": "<file body>"}
+
+        executor = LLMContentExecutor(
+            ref="llm:load",
+            system_prompt="sys",
+            user_prompt_template="path={workItemPath} body={workItemBrief}",
+            result_schema=_BriefResult,
+            llm_provider=provider,  # type: ignore[arg-type]
+            prompt_context_loader=_loader,
+        )
+
+        await executor.dispatch(_ctx({"workItemPath": "/tmp/x.md"}))
+
+        _system, user = provider.calls[0]
+        assert user == "path=/tmp/x.md body=<file body>"
+
+    async def test_loader_exception_yields_failed_envelope_before_call(self) -> None:
+        provider = _ScriptedProvider(script=[{"title": "x", "summary": "y"}])
+
+        async def _loader(_ctx: DispatchContext) -> Mapping[str, Any]:
+            raise OSError("disk gone")
+
+        executor = LLMContentExecutor(
+            ref="llm:load",
+            system_prompt="sys",
+            user_prompt_template="body={workItemBrief}",
+            result_schema=_BriefResult,
+            llm_provider=provider,  # type: ignore[arg-type]
+            prompt_context_loader=_loader,
+        )
+
+        env = await executor.dispatch(_ctx())
+
+        assert env.state.value == "failed"
+        assert env.detail is not None
+        assert "prompt_context_loader_failed" in env.detail
+        assert "OSError" in env.detail
+        assert provider.calls == []
+
+
+# ---------------------------------------------------------------------------
 # Tool spec is derived from result_schema (regression — empty tools yielded
 # "policy selected no tool" against the real Anthropic provider).
 # ---------------------------------------------------------------------------

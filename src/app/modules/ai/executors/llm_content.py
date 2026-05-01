@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 
@@ -38,6 +38,17 @@ from pydantic import BaseModel, ValidationError
 from app.core.llm import LLMProvider, ToolCall, ToolDefinition
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.schemas import DispatchEnvelope
+
+PromptContextLoader = Callable[[DispatchContext], Awaitable[Mapping[str, Any]]]
+"""Augment ``user_prompt_template`` bindings at dispatch time.
+
+When set, the loader is awaited before ``str.format_map``, and its
+result is merged on top of the intake-derived bindings.  Useful for
+binding-specific work the runtime can't do generically — for example
+the ``load_work_item`` binding installs a loader that reads the brief
+file from disk and exposes it as ``{workItemBrief}``.
+"""
+
 
 MemoryPatchBuilder = Callable[[Mapping[str, Any]], dict[str, Any]]
 """Callable that converts the validated LLM result dict into a memory patch.
@@ -78,6 +89,7 @@ class LLMContentExecutor:
         max_retries: int = 1,
         model: str | None = None,
         memory_patch_builder: MemoryPatchBuilder | None = None,
+        prompt_context_loader: PromptContextLoader | None = None,
     ) -> None:
         self.name = ref
         self._ref = ref
@@ -89,11 +101,27 @@ class LLMContentExecutor:
         self._model = model
         self._tool = _tool_from_result_schema(ref, result_schema)
         self._memory_patch_builder = memory_patch_builder
+        self._prompt_context_loader = prompt_context_loader
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
+
+        extras: Mapping[str, Any] = {}
+        if self._prompt_context_loader is not None:
+            try:
+                extras = await self._prompt_context_loader(ctx)
+            except Exception as exc:
+                return _envelope(
+                    ctx,
+                    ref=self._ref,
+                    started=started,
+                    state="failed",
+                    outcome="error",
+                    detail=f"prompt_context_loader_failed: {type(exc).__name__}: {exc}",
+                )
+
         try:
-            user_prompt = self._render_prompt(ctx)
+            user_prompt = self._render_prompt(ctx, extra_bindings=extras)
         except KeyError as exc:
             # Surface the missing template variable before the LLM call.
             return _envelope(
@@ -180,12 +208,19 @@ class LLMContentExecutor:
     # Prompt rendering
     # ------------------------------------------------------------------
 
-    def _render_prompt(self, ctx: DispatchContext) -> str:
+    def _render_prompt(
+        self,
+        ctx: DispatchContext,
+        *,
+        extra_bindings: Mapping[str, Any] = {},
+    ) -> str:
         bindings: dict[str, Any] = {}
         bindings.update(dict(ctx.intake))
         memory_snapshot = ctx.extras.get("memorySnapshot")
         if isinstance(memory_snapshot, Mapping):
             bindings.update(cast(Mapping[str, Any], memory_snapshot))
+        if extra_bindings:
+            bindings.update(dict(extra_bindings))
         return self._user_prompt_template.format_map(_StrictMap(bindings))
 
 
@@ -258,4 +293,4 @@ def _envelope(
     )
 
 
-__all__ = ["LLMContentExecutor", "MemoryPatchBuilder"]
+__all__ = ["LLMContentExecutor", "MemoryPatchBuilder", "PromptContextLoader"]

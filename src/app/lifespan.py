@@ -244,7 +244,10 @@ async def _bootstrap_lifecycle_workflows(
 ) -> None:
     """Register FEAT-006 workflows in the flow engine on cold start."""
     from app.config import get_settings
-    from app.modules.ai.lifecycle.bootstrap import ensure_workflows
+    from app.modules.ai.lifecycle.bootstrap import (
+        ensure_engine_subscriptions,
+        ensure_workflows,
+    )
     from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 
     settings = get_settings()
@@ -280,3 +283,19 @@ async def _bootstrap_lifecycle_workflows(
         "lifecycle workflow bootstrap complete: %s",
         {name: str(wid) for name, wid in workflow_ids.items()},
     )
+
+    # BUG-005: subscribe the orchestrator to ``item.transitioned`` for
+    # each workflow.  Without this the engine fires transitions but has
+    # nobody listening, and every engine-mode dispatch times out.
+    try:
+        await ensure_engine_subscriptions(
+            client,
+            workflow_ids=workflow_ids,
+            public_base_url=str(settings.public_base_url),
+            webhook_secret=settings.engine_webhook_secret.get_secret_value(),
+        )
+    except Exception:
+        logger.exception(
+            "lifecycle webhook-subscription bootstrap failed; engine-mode dispatches "
+            "will time out until subscriptions are registered"
+        )
