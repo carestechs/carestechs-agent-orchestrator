@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 from typing import Annotated
 
 from fastapi import Depends, Request
 
 from app.config import Settings
 from app.core.dependencies import get_settings_dep
+
+logger = logging.getLogger(__name__)
 
 
 def sign_body(body: bytes, secret: str) -> str:
@@ -62,8 +65,30 @@ async def require_flow_engine_signature(
     """
     body: bytes = request.state.raw_body
     header = request.headers.get("x-flowengine-signature")
-    ok = verify_signature(body, header, settings.engine_webhook_secret.get_secret_value())
+    secret = settings.engine_webhook_secret.get_secret_value()
+    ok = verify_signature(body, header, secret)
     request.state.signature_ok = ok
+    if not ok:
+        # BUG-006 diagnostic: surface the received header + the expected
+        # prefix so an operator can see at a glance whether the engine
+        # is sending raw hex (no ``sha256=`` prefix), a different
+        # algorithm, or signing canonicalised JSON instead of raw bytes.
+        # Truncates the digest portion so secrets cannot be inferred.
+        expected = sign_body(body, secret)
+        received = header or "<missing>"
+
+        def _trunc(s: str) -> str:
+            if len(s) > 16:
+                return f"{s[:14]}…"
+            return s
+
+        logger.warning(
+            "lifecycle webhook signature verification failed: "
+            "received_header=%r expected_prefix=%r body_len=%d",
+            _trunc(received),
+            _trunc(expected),
+            len(body),
+        )
     return ok
 
 
