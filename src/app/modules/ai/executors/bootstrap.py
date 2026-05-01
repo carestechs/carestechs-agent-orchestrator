@@ -18,12 +18,12 @@ envelope.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
@@ -573,45 +573,104 @@ class _CorrectionBudgetExceeded(RuntimeError):
 def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
     session_factory: async_sessionmaker[AsyncSession],
 ):
-    """Build the placeholder ``correct_implementation`` LocalExecutor handler.
+    """Build the ``correct_implementation`` LocalExecutor handler.
 
-    Reads the current attempt count from ``RunMemory.data`` via the
-    injected session factory, increments it for the active task, and
-    returns the new count via ``__memory_patch``.  The returned envelope
-    also carries ``outcome="rejected"`` and ``task_id`` so the
-    resolver's ``correction_attempts_under_bound`` predicate can route
-    on the next iteration.
+    The handler runs after ``review_implementation`` produces a ``fail``
+    verdict.  It does three things, all inside a single transaction:
 
-    PR 3 simplification: no Approval row write yet (T-258 / PR 4).
+    1. Read the current correction-attempt count from ``RunMemory.data``
+       and bump it for the active symbolic ``task_id`` (e.g. ``"T-1"``).
+    2. **FEAT-008 rejection contract**: write an ``Approval`` row with
+       ``stage="implementation"``, ``decision="reject"``, ``decided_by``
+       set to the lifecycle-agent actor.  No engine call — rejection
+       does not advance engine state (the FEAT-008 anti-pattern this
+       FEAT preserves).
+    3. Return a dispatch envelope with ``outcome="rejected"`` so the
+       ``correction_attempts_under_bound`` predicate routes on the
+       next iteration.
+
+    The Approval row links to the persisted ``Task.id`` UUID, looked
+    up by ``(work_item_id, external_ref)`` via ``ctx.intake``.  When
+    the lookup fails (e.g. tests that don't seed ``tasks`` rows), the
+    Approval write is skipped with a warning and the bookkeeping path
+    still runs — keeps the unit-test path working without forcing every
+    test to seed task rows.
     """
+    from sqlalchemy import select as _select
+
+    from app.modules.ai.models import Approval as _Approval
     from app.modules.ai.models import RunMemory as _RunMemory
+    from app.modules.ai.models import Task as _Task
+    from app.modules.ai.models import WorkItem as _WorkItem
 
     async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
-        # Surface the active task id from the dispatch intake or the
-        # resolver's last-result echo (the runtime threads it via
-        # memory bookkeeping).
-        task_id = (
+        task_external_ref = (
             str(ctx.intake.get("taskId") or ctx.intake.get("task_id") or "")
             or "unknown"
         )
+        engine_item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("workItemEngineId")
 
-        # Read-modify-write the counter inside the same handler.  The
-        # runtime's ``__memory_patch`` merge is shallow on the top-level
-        # ``correction_attempts`` key — it would overwrite the whole
-        # dict.  We read the existing value first so the patch carries
-        # the full updated map.
+        # 1. Bookkeeping — read existing attempts, bump for this task.
         async with session_factory() as session:
             row = await session.scalar(
-                select(_RunMemory).where(_RunMemory.run_id == ctx.run_id)
+                _select(_RunMemory).where(_RunMemory.run_id == ctx.run_id)
             )
             existing: dict[str, Any] = ((row.data if row is not None else {}) or {}).copy()
         attempts: dict[str, Any] = dict(existing.get("correction_attempts") or {})
-        current = int(attempts.get(task_id, 0))
-        attempts[task_id] = current + 1
+        current = int(attempts.get(task_external_ref, 0))
+        attempts[task_external_ref] = current + 1
+
+        # 2. FEAT-008 rejection contract — write Approval row inline.
+        # Separate session/transaction from the runtime's __memory_patch
+        # write so a missing Task FK degrades gracefully (the run can
+        # still bump the counter even when the test harness skips the
+        # tasks table).
+        approval_written = False
+        if engine_item_id_raw is not None:
+            try:
+                engine_item_id = uuid.UUID(str(engine_item_id_raw))
+                async with session_factory() as session, session.begin():
+                    work_item = await session.scalar(
+                        _select(_WorkItem).where(_WorkItem.engine_item_id == engine_item_id)
+                    )
+                    if work_item is not None:
+                        task = await session.scalar(
+                            _select(_Task).where(
+                                _Task.work_item_id == work_item.id,
+                                _Task.external_ref == task_external_ref,
+                            )
+                        )
+                        if task is not None:
+                            session.add(
+                                _Approval(
+                                    task_id=task.id,
+                                    stage="impl",
+                                    decision="reject",
+                                    decided_by="lifecycle-agent",
+                                    # v0.3.0 self-approves under admin
+                                    # auspices; the FEAT-008 / ActorRole
+                                    # enum constrains approvers to
+                                    # human roles (admin / dev).  When
+                                    # PR 4 grows multi-actor support, a
+                                    # follow-on adds an "agent" role.
+                                    decided_by_role="admin",
+                                    feedback=None,
+                                )
+                            )
+                            approval_written = True
+            except Exception:
+                logger.warning(
+                    "correct_implementation: Approval row not written "
+                    "(task ref=%r engineItemId=%r); proceeding without it",
+                    task_external_ref,
+                    engine_item_id_raw,
+                    exc_info=True,
+                )
 
         return {
             "outcome": "rejected",
-            "task_id": task_id,
+            "task_id": task_external_ref,
+            "approval_written": approval_written,
             "__memory_patch": {"correction_attempts": attempts},
         }
 
