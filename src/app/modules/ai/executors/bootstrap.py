@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -440,15 +440,27 @@ def register_lifecycle_v03(
 
     def _patch_generate_tasks(result: Mapping[str, Any]) -> dict[str, Any]:
         tasks_in: list[Mapping[str, Any]] = list(result.get("tasks") or [])
+
+        def _task(t: Mapping[str, Any]) -> LifecycleTask:
+            complexity_raw = str(t.get("complexity", "medium") or "medium")
+            complexity = (
+                complexity_raw if complexity_raw in ("small", "medium", "large") else "medium"
+            )
+            return LifecycleTask(
+                id=str(t.get("id", "")),
+                title=str(t.get("title", "")),
+                executor=str(t.get("executor", "")) or None,
+                description=str(t.get("description", "") or ""),
+                acceptance_criteria=[
+                    str(c) for c in cast(list[Any], t.get("acceptance_criteria") or [])
+                ],
+                complexity=complexity,  # type: ignore[arg-type]
+                depends_on=[str(d) for d in cast(list[Any], t.get("depends_on") or [])],
+                files_hint=[str(f) for f in cast(list[Any], t.get("files_hint") or [])],
+            )
+
         memory = LifecycleMemory(
-            tasks=[
-                LifecycleTask(
-                    id=str(t.get("id", "")),
-                    title=str(t.get("title", "")),
-                    executor=str(t.get("executor", "")) or None,
-                )
-                for t in tasks_in
-            ],
+            tasks=[_task(t) for t in tasks_in],
             current_task_id=(str(tasks_in[0].get("id")) if tasks_in else None),
         )
         return write_lifecycle_memory(memory)
@@ -539,6 +551,50 @@ def register_lifecycle_v03(
             "tasks": {task_id: {}},
         }
 
+    async def _load_current_task_body(ctx: DispatchContext) -> Mapping[str, Any]:
+        """Read the current task's structured body from memory for the planner.
+
+        ``generate_tasks`` writes ``description`` + ``acceptance_criteria``
+        + ``complexity`` + ``depends_on`` + ``files_hint`` per task.
+        Without this loader the planner only sees ``taskId`` from intake
+        and re-derives intent from the title — this loader makes the
+        body visible as ``{taskTitle}`` / ``{taskDescription}`` /
+        ``{acceptanceCriteria}`` / ``{complexity}`` / ``{dependsOn}`` /
+        ``{filesHint}`` template variables.
+        """
+        from sqlalchemy import select as _select
+
+        from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+        async with session_factory() as session:
+            mem = await session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+            )
+        memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
+        task = find_current_task(memory)
+        if task is None:
+            # Fall back to a placeholder so format_map still succeeds —
+            # the planner will produce a thin plan from taskId alone.
+            return {
+                "taskTitle": "<task body not available in memory>",
+                "taskDescription": "",
+                "acceptanceCriteria": "(none recorded)",
+                "complexity": "medium",
+                "dependsOn": "(none)",
+                "filesHint": "(none)",
+            }
+        criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "(none recorded)"
+        deps = ", ".join(task.depends_on) or "(none)"
+        files = "\n".join(f"- `{f}`" for f in task.files_hint) or "(none)"
+        return {
+            "taskTitle": task.title,
+            "taskDescription": task.description or "(no description provided)",
+            "acceptanceCriteria": criteria,
+            "complexity": task.complexity,
+            "dependsOn": deps,
+            "filesHint": files,
+        }
+
     registry.register(
         agent_ref,
         "generate_plan",
@@ -547,9 +603,19 @@ def register_lifecycle_v03(
             llm_executor=LLMContentExecutor(
                 ref="llm:generate_plan",
                 system_prompt=_load_prompt("generate_plan"),
-                user_prompt_template="Author an implementation plan for task: {taskId}",
+                user_prompt_template=(
+                    "Author an implementation plan for the task below.\n\n"
+                    "Task id: {taskId}\n"
+                    "Title: {taskTitle}\n"
+                    "Complexity: {complexity}\n"
+                    "Depends on: {dependsOn}\n\n"
+                    "Description:\n{taskDescription}\n\n"
+                    "Acceptance criteria:\n{acceptanceCriteria}\n\n"
+                    "Files hint:\n{filesHint}\n"
+                ),
                 result_schema=GeneratePlanResult,
                 llm_provider=llm_provider,
+                prompt_context_loader=_load_current_task_body,
             ),
             transition_key="task.T6",
             to_status="plan_review",

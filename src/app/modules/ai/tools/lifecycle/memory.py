@@ -65,6 +65,15 @@ class LifecycleTask(BaseModel):
     # subsequent visits (after a rejection loop) skip the engine call
     # because the engine task is already past ``implementing``.
     submitted: bool = False
+    # Task body — the structured reasoning that survives ``generate_tasks``
+    # so ``generate_plan`` and ``review_implementation`` have real input
+    # to work against instead of re-deriving from the title alone.
+    # All optional with safe defaults; older runs validate unchanged.
+    description: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list[str])
+    complexity: Literal["small", "medium", "large"] = "medium"
+    depends_on: list[str] = Field(default_factory=list[str])
+    files_hint: list[str] = Field(default_factory=list[str])
 
 
 class LifecycleReview(BaseModel):
