@@ -50,12 +50,14 @@ from app.modules.ai.executors.bootstrap import register_lifecycle_v03
 from app.modules.ai.executors.registry import ExecutorRegistry
 from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 from app.modules.ai.models import (
+    Approval,
     Dispatch,
     PendingAuxWrite,
     Run,
     RunMemory,
     RunSignal,
     Step,
+    Task,
     WebhookEvent,
     WorkItem,
 )
@@ -178,6 +180,17 @@ async def _cleanup(
         await session.execute(delete(PendingAuxWrite))
         await session.execute(delete(WebhookEvent))
         if work_item_id is not None:
+            # BUG-004: propose_tasks now inserts Task rows that FK to
+            # work_items, and review/correct may have inserted Approvals
+            # that FK to tasks.  Tear them down in dependency order.
+            task_ids = (
+                await session.scalars(
+                    select(Task.id).where(Task.work_item_id == work_item_id)
+                )
+            ).all()
+            if task_ids:
+                await session.execute(delete(Approval).where(Approval.task_id.in_(task_ids)))
+                await session.execute(delete(Task).where(Task.work_item_id == work_item_id))
             await session.execute(delete(WorkItem).where(WorkItem.id == work_item_id))
         await session.commit()
 
@@ -236,13 +249,17 @@ async def _drive_engine_with_webhooks(
     fake_engine_client = FlowEngineLifecycleClient(
         base_url=_ENGINE_BASE, api_key=_ENGINE_API_KEY, max_retries=1
     )
+    task_workflow_id = uuid.uuid4()
     register_lifecycle_v03(
         registry,
         _AGENT_REF,
         lifecycle_client=fake_engine_client,
         llm_provider=provider,  # type: ignore[arg-type]
         session_factory=session_factory,
-        workflow_ids={"work_item_workflow": work_item_workflow_id},
+        workflow_ids={
+            "work_item_workflow": work_item_workflow_id,
+            "task_workflow": task_workflow_id,
+        },
     )
 
     agent = load_agent(_AGENT_REF, _AGENTS_DIR)
@@ -367,13 +384,24 @@ async def _drive_engine_with_webhooks(
                             signaled_dispatches.add(human_row.dispatch_id)
                     await asyncio.sleep(0.05)
 
+            async def _post_create_item(request: Any) -> Response:
+                # BUG-003 + BUG-004: every POST /api/workflows/<id>/items
+                # mints a fresh engine id.  The first call is W1
+                # (work-item create) and must return ``engine_item_id``
+                # so the local row + Run.intake match the rest of the
+                # test's expectations; subsequent calls are T1 task
+                # creates (one per LLM-produced task).
+                path = str(request.url.path)
+                wf_id = path.split("/")[-2]
+                if wf_id == str(work_item_workflow_id):
+                    return Response(201, json={"data": {"id": str(engine_item_id)}})
+                # task workflow — fresh id per call
+                return Response(201, json={"data": {"id": str(uuid.uuid4())}})
+
             with respx.mock(base_url=_ENGINE_BASE, assert_all_called=False) as mock:
                 mock.post("/api/auth/token").respond(200, json=_TOKEN_RESPONSE)
-                # BUG-003: mock the W1 create_item endpoint —
-                # ``register_work_item`` posts here and persists the
-                # returned id into the local WorkItem + Run.intake.
-                mock.post(url__regex=r"/api/workflows/[^/]+/items").respond(
-                    201, json={"data": {"id": str(engine_item_id)}}
+                mock.post(url__regex=r"/api/workflows/[^/]+/items").mock(
+                    side_effect=_post_create_item
                 )
                 mock.post(url__regex=r"/api/items/[^/]+/transitions").mock(side_effect=_post_transition)
                 mock.get(url__regex=r"/api/workflows.*").respond(

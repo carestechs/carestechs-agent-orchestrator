@@ -53,6 +53,18 @@ class LifecycleTask(BaseModel):
     executor: str | None = None
     status: Literal["pending", "in_progress", "completed", "failed"] = "pending"
     plan_path: str | None = None
+    # BUG-004: per-task engine entity id minted by ``propose_tasks``
+    # (T1 ``create_item`` against the task workflow).  Downstream
+    # engine-bound nodes (``assign_task``, ``generate_plan``,
+    # ``submit_implementation``, ``approve_review``) resolve their
+    # transition target from this field, not from ``Run.intake.engineItemId``
+    # (which carries the *work item's* engine id, not the task's).
+    engine_item_id: str | None = None
+    # BUG-004: idempotency guard for ``submit_implementation``.  T9
+    # (``implementing → impl_review``) must fire exactly once per task —
+    # subsequent visits (after a rejection loop) skip the engine call
+    # because the engine task is already past ``implementing``.
+    submitted: bool = False
 
 
 class LifecycleReview(BaseModel):
@@ -143,3 +155,17 @@ def write_lifecycle_memory(memory: LifecycleMemory) -> dict[str, Any]:
     ``__feat009`` block) untouched.
     """
     return {LIFECYCLE_MEMORY_NS: to_run_memory(memory)}
+
+
+def find_current_task(memory: LifecycleMemory) -> LifecycleTask | None:
+    """Return the task indicated by ``current_task_id``, if any.
+
+    BUG-004 helper: every task-lifecycle node addresses *the current
+    task* (not an arbitrary one), so they share this lookup.
+    """
+    if memory.current_task_id is None:
+        return None
+    for task in memory.tasks:
+        if task.id == memory.current_task_id:
+            return task
+    return None

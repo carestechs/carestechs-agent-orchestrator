@@ -29,7 +29,12 @@ from app.modules.ai.executors.engine_create import EngineCreateExecutor
 from app.modules.ai.executors.human import HumanExecutor
 from app.modules.ai.executors.llm_content import LLMContentExecutor
 from app.modules.ai.executors.local import LocalExecutor
+from app.modules.ai.executors.propose_tasks import ProposeTasksExecutor
 from app.modules.ai.executors.registry import ExecutorRegistry
+from app.modules.ai.executors.sequence import SequenceEngineExecutor
+from app.modules.ai.executors.submit_implementation import (
+    SubmitImplementationExecutor,
+)
 
 _AGENTS_DIR = Path(__file__).resolve().parents[4] / "agents"
 _AGENT_REF = "lifecycle-agent@0.3.0"
@@ -73,7 +78,10 @@ class TestCoverageWiredV03:
             lifecycle_client=stub_lifecycle_client,
             llm_provider=stub_llm_provider,
             session_factory=session_factory,
-            workflow_ids={"work_item_workflow": uuid.uuid4()},
+            workflow_ids={
+                "work_item_workflow": uuid.uuid4(),
+                "task_workflow": uuid.uuid4(),
+            },
         )
 
         # Restrict coverage validation to just the v0.3.0 agent.
@@ -99,19 +107,26 @@ class TestCoverageWiredV03:
             lifecycle_client=stub_lifecycle_client,
             llm_provider=stub_llm_provider,
             session_factory=session_factory,
-            workflow_ids={"work_item_workflow": uuid.uuid4()},
+            workflow_ids={
+                "work_item_workflow": uuid.uuid4(),
+                "task_workflow": uuid.uuid4(),
+            },
         )
 
         expected: dict[str, type[Any]] = {
             "load_work_item": LLMContentExecutor,
             "register_work_item": EngineCreateExecutor,
-            "generate_tasks": CompositeLLMEngineExecutor,
+            "generate_tasks": LLMContentExecutor,
+            "propose_tasks": ProposeTasksExecutor,
             "assign_task": EngineExecutor,
             "generate_plan": CompositeLLMEngineExecutor,
+            "approve_plan": EngineExecutor,
             "request_implementation": HumanExecutor,
-            "review_implementation": CompositeLLMEngineExecutor,
+            "submit_implementation": SubmitImplementationExecutor,
+            "review_implementation": LLMContentExecutor,
+            "approve_review": EngineExecutor,
             "correct_implementation": LocalExecutor,
-            "close_work_item": EngineExecutor,
+            "close_work_item": SequenceEngineExecutor,
         }
         for node_name, expected_type in expected.items():
             binding = registry.resolve(_AGENT_REF, node_name)
@@ -134,10 +149,14 @@ class TestCoverageWithoutV03Wiring:
             "load_work_item",
             "register_work_item",
             "generate_tasks",
+            "propose_tasks",
             "assign_task",
             "generate_plan",
+            "approve_plan",
             "request_implementation",
+            "submit_implementation",
             "review_implementation",
+            "approve_review",
             "correct_implementation",
             "close_work_item",
             "terminate_correction_budget",

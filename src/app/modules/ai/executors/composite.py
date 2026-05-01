@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import EngineError
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
+from app.modules.ai.executors.engine import TargetIdResolver
 from app.modules.ai.executors.llm_content import LLMContentExecutor
 from app.modules.ai.models import PendingAuxWrite, RunMemory
 from app.modules.ai.schemas import DispatchEnvelope
@@ -96,6 +97,7 @@ class CompositeLLMEngineExecutor:
         session_factory: async_sessionmaker[AsyncSession],
         memory_patch_builder: MemoryPatchBuilder,
         actor: str | None = None,
+        target_id_resolver: TargetIdResolver | None = None,
     ) -> None:
         self.name = ref
         self._ref = ref
@@ -106,6 +108,7 @@ class CompositeLLMEngineExecutor:
         self._session_factory = session_factory
         self._memory_patch_builder = memory_patch_builder
         self._actor = actor
+        self._target_id_resolver = target_id_resolver
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
@@ -134,28 +137,53 @@ class CompositeLLMEngineExecutor:
                 detail=f"memory_patch_builder_failed: {type(exc).__name__}: {exc}",
             )
 
-        # 2. ``engineItemId`` resolution mirrors :class:`EngineExecutor`.
-        item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("itemId")
+        # 2. Resolve the engine target id.  BUG-004 task-lifecycle
+        # nodes install a custom resolver that reads the *current task's*
+        # engine id from memory; the default keeps the v0.1.0 behaviour.
         correlation_id = uuid.uuid4()
-        if item_id_raw is None:
-            return self._failed(
-                ctx,
-                started=started,
-                correlation_id=correlation_id,
-                detail=(
-                    "composite executor requires 'engineItemId' in dispatch intake; "
-                    f"got keys={sorted(ctx.intake.keys())!r}"
-                ),
-            )
-        try:
-            item_id = uuid.UUID(str(item_id_raw))
-        except ValueError as exc:
-            return self._failed(
-                ctx,
-                started=started,
-                correlation_id=correlation_id,
-                detail=f"composite executor: malformed engineItemId={item_id_raw!r}: {exc}",
-            )
+        item_id: uuid.UUID | None = None
+        if self._target_id_resolver is not None:
+            try:
+                item_id = await self._target_id_resolver(ctx)
+            except Exception as exc:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=f"target_id_resolver_failed: {type(exc).__name__}: {exc}",
+                )
+            if item_id is None:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=(
+                        "composite executor: target_id_resolver returned None — no engine "
+                        "target for this dispatch (e.g. current_task_id not set or task "
+                        "missing engine_item_id)"
+                    ),
+                )
+        else:
+            item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("itemId")
+            if item_id_raw is None:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=(
+                        "composite executor requires 'engineItemId' in dispatch intake; "
+                        f"got keys={sorted(ctx.intake.keys())!r}"
+                    ),
+                )
+            try:
+                item_id = uuid.UUID(str(item_id_raw))
+            except ValueError as exc:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=f"composite executor: malformed engineItemId={item_id_raw!r}: {exc}",
+                )
 
         # 3. One transaction: memory write + outbox row + engine call.
         signal_name = self._transition_key

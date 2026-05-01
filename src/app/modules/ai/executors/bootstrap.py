@@ -287,6 +287,12 @@ def register_lifecycle_v03(
             "register_work_item (BUG-003) needs the engine workflow id at boot. "
             "Ensure lifespan.ensure_workflows() ran before register_all_executors."
         )
+    task_workflow_id = workflow_ids.get("task_workflow")
+    if task_workflow_id is None:
+        raise RuntimeError(
+            "register_lifecycle_v03: workflow_ids missing 'task_workflow' — "
+            "propose_tasks (BUG-004) needs the engine task workflow id at boot."
+        )
 
     # Synthetic ``start`` entry node — the flow resolver treats
     # ``entryNode`` as the previous-node marker, so the YAML declares
@@ -314,6 +320,8 @@ def register_lifecycle_v03(
         LifecycleMemory,
         LifecycleTask,
         WorkItemRef,
+        find_current_task,
+        read_lifecycle_memory,
         write_lifecycle_memory,
     )
 
@@ -386,7 +394,8 @@ def register_lifecycle_v03(
     )
 
     # ------------------------------------------------------------------
-    # Composite: generate_tasks — LLM task list + engine T2+T4 (collapsed)
+    # generate_tasks — LLM task list only (BUG-004: was a misconfigured
+    # composite; the engine fanout moves to ``propose_tasks``).
     # ------------------------------------------------------------------
 
     def _patch_generate_tasks(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -407,28 +416,62 @@ def register_lifecycle_v03(
     registry.register(
         agent_ref,
         "generate_tasks",
-        CompositeLLMEngineExecutor(
-            ref="composite:generate_tasks",
-            llm_executor=LLMContentExecutor(
-                ref="llm:generate_tasks",
-                system_prompt=_load_prompt("generate_tasks"),
-                user_prompt_template="Generate the task breakdown for work item id: {workItemId}",
-                result_schema=GenerateTasksResult,
-                llm_provider=llm_provider,
-            ),
-            # T1xN fanout collapsed into a single self-approve transition.
-            # PR 4 may split into T1xN + T2+T4 once a fanout primitive lands.
-            transition_key="task.T2_T4",
-            to_status="approved",
+        LLMContentExecutor(
+            ref="llm:generate_tasks",
+            system_prompt=_load_prompt("generate_tasks"),
+            user_prompt_template="Generate the task breakdown for work item id: {workItemId}",
+            result_schema=GenerateTasksResult,
+            llm_provider=llm_provider,
+            memory_patch_builder=_patch_generate_tasks,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # propose_tasks — T1xN create_item + T2+T4 + W2 (BUG-004 / new node).
+    # ------------------------------------------------------------------
+
+    from app.modules.ai.executors.propose_tasks import ProposeTasksExecutor
+
+    registry.register(
+        agent_ref,
+        "propose_tasks",
+        ProposeTasksExecutor(
+            ref="propose_tasks",
+            task_workflow_id=task_workflow_id,
             lifecycle_client=lifecycle_client,
             session_factory=session_factory,
-            memory_patch_builder=_patch_generate_tasks,
             actor=actor,
         ),
     )
 
     # ------------------------------------------------------------------
-    # Pure engine: assign_task — T5
+    # Resolver shared by every per-task engine binding (BUG-004).
+    # Reads ``LifecycleMemory.current_task_id`` and returns the matching
+    # task's engine_item_id from memory.
+    # ------------------------------------------------------------------
+
+    from sqlalchemy import select as _select
+
+    from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+    async def _resolve_current_task_engine_id(
+        ctx: DispatchContext,
+    ) -> uuid.UUID | None:
+        async with session_factory() as session:
+            mem = await session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+            )
+        memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
+        task = find_current_task(memory)
+        if task is None or task.engine_item_id is None:
+            return None
+        try:
+            return uuid.UUID(task.engine_item_id)
+        except ValueError:
+            return None
+
+    # ------------------------------------------------------------------
+    # assign_task — T5: assigning → planning (current task).
     # ------------------------------------------------------------------
 
     register_engine_executor(
@@ -436,21 +479,20 @@ def register_lifecycle_v03(
         agent_ref,
         "assign_task",
         transition_key="task.T5",
-        to_status="assigned",
+        to_status="planning",
         lifecycle_client=lifecycle_client,
         session_factory=session_factory,
         actor=actor,
+        target_id_resolver=_resolve_current_task_engine_id,
     )
 
     # ------------------------------------------------------------------
-    # Composite: generate_plan — LLM plan + engine T6+T7 (collapsed)
+    # generate_plan — LLM plan + T6 only (current task).  T7 is a
+    # separate ``approve_plan`` node so the unplanned-tasks loop can
+    # branch on completion.
     # ------------------------------------------------------------------
 
     def _patch_generate_plan(result: Mapping[str, Any]) -> dict[str, Any]:
-        # Track that the named task now has a plan — the resolver's
-        # ``unplanned_tasks_remaining`` predicate reads
-        # ``memory['plans']`` (predicate-level dict, not the typed
-        # schema).  Keep both shapes coherent.
         task_id = str(result.get("task_id", ""))
         return {
             "plans": {task_id: {"plan_markdown": result.get("plan_markdown")}},
@@ -469,18 +511,34 @@ def register_lifecycle_v03(
                 result_schema=GeneratePlanResult,
                 llm_provider=llm_provider,
             ),
-            transition_key="task.T6_T7",
-            to_status="implementation_pending",
+            transition_key="task.T6",
+            to_status="plan_review",
             lifecycle_client=lifecycle_client,
             session_factory=session_factory,
             memory_patch_builder=_patch_generate_plan,
             actor=actor,
+            target_id_resolver=_resolve_current_task_engine_id,
         ),
     )
 
     # ------------------------------------------------------------------
-    # Human: request_implementation
-    # PR 3 simplification: post-resume T9 engine call deferred to PR 4.
+    # approve_plan — T7: plan_review → implementing (current task).
+    # ------------------------------------------------------------------
+
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "approve_plan",
+        transition_key="task.T7",
+        to_status="implementing",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+        target_id_resolver=_resolve_current_task_engine_id,
+    )
+
+    # ------------------------------------------------------------------
+    # Human: request_implementation — pause for operator signal.
     # ------------------------------------------------------------------
 
     registry.register(
@@ -493,20 +551,31 @@ def register_lifecycle_v03(
     )
 
     # ------------------------------------------------------------------
-    # Composite: review_implementation — LLM verdict + engine T10 (always)
-    # The ``review_passed`` predicate routes the failure case to
-    # ``correct_implementation`` based on the LLM's verdict — but the
-    # engine call itself fires on every dispatch (Composite cannot
-    # branch on its own LLM result mid-dispatch).  T-258 / PR 4 may
-    # gate the engine call on ``verdict=='pass'``; for PR 3 the engine
-    # leg fires unconditionally and the resolver handles the routing
-    # via ``last_dispatch_result.verdict``.
+    # submit_implementation — T9: implementing → impl_review (idempotent).
+    # ------------------------------------------------------------------
+
+    from app.modules.ai.executors.submit_implementation import (
+        SubmitImplementationExecutor,
+    )
+
+    registry.register(
+        agent_ref,
+        "submit_implementation",
+        SubmitImplementationExecutor(
+            ref="submit_implementation",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # review_implementation — LLM-only verdict (BUG-004: was a composite
+    # firing T10 unconditionally; now T10 lives in ``approve_review`` and
+    # only fires on the pass branch).
     # ------------------------------------------------------------------
 
     def _patch_review(result: Mapping[str, Any]) -> dict[str, Any]:
-        # Mirror the verdict + feedback into the predicate-readable
-        # shape and return them to the runtime via the dispatch result
-        # (``review_passed`` reads ``last['verdict']`` directly).
         return {
             "review_history": [
                 {
@@ -520,26 +589,35 @@ def register_lifecycle_v03(
     registry.register(
         agent_ref,
         "review_implementation",
-        CompositeLLMEngineExecutor(
-            ref="composite:review_implementation",
-            llm_executor=LLMContentExecutor(
-                ref="llm:review_implementation",
-                system_prompt=_load_prompt("review_implementation"),
-                user_prompt_template="Review the implementation for task: {taskId}",
-                result_schema=ReviewImplementationResult,
-                llm_provider=llm_provider,
-            ),
-            transition_key="task.T10",
-            to_status="ready_for_close",
-            lifecycle_client=lifecycle_client,
-            session_factory=session_factory,
+        LLMContentExecutor(
+            ref="llm:review_implementation",
+            system_prompt=_load_prompt("review_implementation"),
+            user_prompt_template="Review the implementation for task: {taskId}",
+            result_schema=ReviewImplementationResult,
+            llm_provider=llm_provider,
             memory_patch_builder=_patch_review,
-            actor=actor,
         ),
     )
 
     # ------------------------------------------------------------------
-    # Local: correct_implementation — placeholder rejection writer
+    # approve_review — T10: impl_review → done (current task).  Only
+    # selected on the verdict=pass branch.
+    # ------------------------------------------------------------------
+
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "approve_review",
+        transition_key="task.T10",
+        to_status="done",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+        target_id_resolver=_resolve_current_task_engine_id,
+    )
+
+    # ------------------------------------------------------------------
+    # correct_implementation — Approval inline; no engine call.
     # ------------------------------------------------------------------
 
     registry.register(
@@ -552,18 +630,23 @@ def register_lifecycle_v03(
     )
 
     # ------------------------------------------------------------------
-    # Pure engine: close_work_item — W6 (terminal)
+    # close_work_item — W4 (in_progress → ready) then W6 (ready → closed).
+    # SequenceEngineExecutor fires both hops on the work-item id supplied
+    # by Run.intake.engineItemId (default resolver).
     # ------------------------------------------------------------------
 
-    register_engine_executor(
-        registry,
+    from app.modules.ai.executors.sequence import SequenceEngineExecutor
+
+    registry.register(
         agent_ref,
         "close_work_item",
-        transition_key="work_item.W6",
-        to_status="closed",
-        lifecycle_client=lifecycle_client,
-        session_factory=session_factory,
-        actor=actor,
+        SequenceEngineExecutor(
+            ref="sequence:close_work_item",
+            hops=[("work_item.W4", "ready"), ("work_item.W6", "closed")],
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -721,6 +804,7 @@ def register_engine_executor(
     session_factory: async_sessionmaker[AsyncSession],
     actor: str | None = None,
     timeout_seconds: float | None = None,
+    target_id_resolver: Any | None = None,
 ) -> ExecutorBinding:
     """Register an :class:`EngineExecutor` for ``(agent_ref, node_name)``.
 
@@ -756,6 +840,7 @@ def register_engine_executor(
         lifecycle_client=lifecycle_client,
         session_factory=session_factory,
         actor=actor,
+        target_id_resolver=target_id_resolver,
     )
     return registry.register(
         agent_ref,

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -43,6 +43,17 @@ from app.core.exceptions import EngineError
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.models import PendingAuxWrite
 from app.modules.ai.schemas import DispatchEnvelope
+
+TargetIdResolver = Callable[[DispatchContext], Awaitable[uuid.UUID | None]]
+"""Resolve the engine item id for a single dispatch.
+
+Default behaviour reads ``engineItemId``/``itemId`` from ``DispatchContext.intake``
+— preserved for the v0.1.0 work-item-only callers.  BUG-004 task-lifecycle
+nodes (``assign_task``, ``generate_plan``, ``submit_implementation``,
+``approve_review``) install a custom resolver that reads the *current task's*
+``engine_item_id`` from ``LifecycleMemory.tasks[current_task_id]`` so the
+transition addresses the task, not the work item.
+"""
 
 if TYPE_CHECKING:
     # NEVER import at module scope — the import-quarantine test asserts
@@ -68,6 +79,7 @@ class EngineExecutor:
         lifecycle_client: FlowEngineLifecycleClient,
         session_factory: async_sessionmaker[AsyncSession],
         actor: str | None = None,
+        target_id_resolver: TargetIdResolver | None = None,
     ) -> None:
         """Bind one ``(agent_ref, node_name)`` to an engine transition.
 
@@ -94,35 +106,57 @@ class EngineExecutor:
         self._client = lifecycle_client
         self._session_factory = session_factory
         self._actor = actor
+        self._target_id_resolver = target_id_resolver
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
         correlation_id = uuid.uuid4()
 
-        # ``item_id`` (the engine's UUID for the work item / task) is
-        # supplied by the runtime via ``ctx.intake``.  FEAT-011 will
-        # thread it in from memory; in PR 1 we surface a clear failure
-        # if it's absent rather than letting ``transition_item`` 404.
-        item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("itemId")
-        if item_id_raw is None:
-            return self._failed(
-                ctx,
-                started=started,
-                correlation_id=correlation_id,
-                detail=(
-                    "engine executor requires 'engineItemId' in dispatch intake; "
-                    f"got keys={sorted(ctx.intake.keys())!r}"
-                ),
-            )
-        try:
-            item_id = uuid.UUID(str(item_id_raw))
-        except ValueError as exc:
-            return self._failed(
-                ctx,
-                started=started,
-                correlation_id=correlation_id,
-                detail=f"engine executor: malformed engineItemId={item_id_raw!r}: {exc}",
-            )
+        # BUG-004: if a custom resolver is installed, it takes precedence;
+        # the default path keeps the v0.1.0 ``engineItemId``-from-intake
+        # behaviour the work-item-only bindings rely on.
+        item_id: uuid.UUID | None = None
+        if self._target_id_resolver is not None:
+            try:
+                item_id = await self._target_id_resolver(ctx)
+            except Exception as exc:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=f"target_id_resolver_failed: {type(exc).__name__}: {exc}",
+                )
+            if item_id is None:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=(
+                        "engine executor: target_id_resolver returned None — no engine target "
+                        "for this dispatch (e.g. current_task_id not set or task missing engine_item_id)"
+                    ),
+                )
+        else:
+            item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("itemId")
+            if item_id_raw is None:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=(
+                        "engine executor requires 'engineItemId' in dispatch intake; "
+                        f"got keys={sorted(ctx.intake.keys())!r}"
+                    ),
+                )
+            try:
+                item_id = uuid.UUID(str(item_id_raw))
+            except ValueError as exc:
+                return self._failed(
+                    ctx,
+                    started=started,
+                    correlation_id=correlation_id,
+                    detail=f"engine executor: malformed engineItemId={item_id_raw!r}: {exc}",
+                )
 
         # One transaction: outbox row + engine call.  Engine 4xx/5xx
         # raises ``EngineError``; the ``async with begin()`` exit rolls
@@ -236,4 +270,4 @@ def _extract_engine_run_id(response: Mapping[str, Any] | None) -> str | None:
     return None
 
 
-__all__ = ["EngineExecutor"]
+__all__ = ["EngineExecutor", "TargetIdResolver"]
