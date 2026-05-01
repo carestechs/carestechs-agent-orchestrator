@@ -1,5 +1,7 @@
 # Feature Brief: FEAT-005 — Lifecycle Agent v1 + Self-Hosted Feature Delivery Proof
 
+> **Superseded:** `lifecycle-agent@0.3.0` (FEAT-011, 2026-04-30) is the deterministic-policy successor to v0.1.0. v0.1.0 remains on disk for the migration window — see `docs/migration/lifecycle-v01-to-v03.md`. v0.1.0 deletion is a future FEAT.
+
 > **Purpose**: Ship the first *real* agent — a lifecycle agent whose flow mirrors the ia-framework's 8-stage loop (intake → task generation → task assignment → plan creation → implementation → review → corrections → closure), runs against this very repo, and drives one real work item from a markdown brief to `Status: Completed` with every stage traced. This is the feature that converts Stakeholder Success Metric #1 ("≥1 feature of this repo shipped end-to-end via the orchestrator") from aspirational to proven. It rests on FEAT-002 (runtime loop), FEAT-003 (Anthropic policy), and FEAT-004 (trace streaming) — all of which ship infrastructure whose value is only realized once an actual agent plugs into them.
 > **Template reference**: `.ai-framework/templates/feature-brief.md`
 

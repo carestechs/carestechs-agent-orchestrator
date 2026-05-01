@@ -18,10 +18,11 @@
 | **ID** | FEAT-011 |
 | **Name** | Deterministic lifecycle agent port (`lifecycle-agent@0.3.0`) |
 | **Target Version** | v0.6.0 |
-| **Status** | Not Started |
+| **Status** | Completed (2026-04-30) |
 | **Priority** | High |
 | **Requested By** | Project owner (FEAT-009 closing review — v0.1.0 LLM-policy path is the only one driving real engine work; v0.2.0 demo doesn't prove the seam against production load) |
 | **Date Created** | 2026-04-26 |
+| **Date Completed** | 2026-04-30 |
 
 ---
 
