@@ -213,26 +213,17 @@ async def _drive_engine_with_webhooks(
 
     session_factory = _build_session_factory(test_database_url)
 
+    # BUG-003: ``register_work_item`` (W1 create_item) is the single
+    # entry point that mints ``engine_item_id`` and inserts the local
+    # ``work_items`` row.  The test no longer pre-seeds either — the
+    # respx-mocked engine returns a synthesised id below.
     engine_item_id = uuid.uuid4()
-    work_item_id: uuid.UUID
-    async with session_factory() as session:
-        wi = WorkItem(
-            external_ref=f"FEAT-{uuid.uuid4().hex[:6]}",
-            type="FEAT",
-            title="v03 e2e",
-            status="in_progress",
-            opened_by="admin",
-            engine_item_id=engine_item_id,
-        )
-        session.add(wi)
-        await session.commit()
-        await session.refresh(wi)
-        work_item_id = wi.id
+    work_item_id: uuid.UUID | None = None
+    work_item_workflow_id = uuid.uuid4()
 
     run = await _seed_run(
         session_factory,
         intake={
-            "engineItemId": str(engine_item_id),
             "workItemPath": "docs/work-items/FEAT-099.md",
             "workItemId": "FEAT-099",
             "taskId": "T-1",
@@ -251,6 +242,7 @@ async def _drive_engine_with_webhooks(
         lifecycle_client=fake_engine_client,
         llm_provider=provider,  # type: ignore[arg-type]
         session_factory=session_factory,
+        workflow_ids={"work_item_workflow": work_item_workflow_id},
     )
 
     agent = load_agent(_AGENT_REF, _AGENTS_DIR)
@@ -377,6 +369,12 @@ async def _drive_engine_with_webhooks(
 
             with respx.mock(base_url=_ENGINE_BASE, assert_all_called=False) as mock:
                 mock.post("/api/auth/token").respond(200, json=_TOKEN_RESPONSE)
+                # BUG-003: mock the W1 create_item endpoint —
+                # ``register_work_item`` posts here and persists the
+                # returned id into the local WorkItem + Run.intake.
+                mock.post(url__regex=r"/api/workflows/[^/]+/items").respond(
+                    201, json={"data": {"id": str(engine_item_id)}}
+                )
                 mock.post(url__regex=r"/api/items/[^/]+/transitions").mock(side_effect=_post_transition)
                 mock.get(url__regex=r"/api/workflows.*").respond(
                     200, json={"data": {"items": []}}
@@ -428,6 +426,13 @@ async def _drive_engine_with_webhooks(
     async with session_factory() as session:
         run_row = (await session.scalars(select(Run).where(Run.id == run.id))).one()
         actual_status = RunStatus(run_row.status) if isinstance(run_row.status, str) else run_row.status
+        # BUG-003: ``register_work_item`` inserted the local row keyed on
+        # the synthesised engine_item_id — discover its id for cleanup.
+        wi_row = await session.scalar(
+            select(WorkItem).where(WorkItem.engine_item_id == engine_item_id)
+        )
+        if wi_row is not None:
+            work_item_id = wi_row.id
     assert actual_status == expected_status, (
         f"expected {expected_status}, got {actual_status}; "
         f"final_state={run_row.final_state}, calls={[c[0] for c in provider.calls]}"

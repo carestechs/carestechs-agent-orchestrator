@@ -42,13 +42,24 @@ nodes:
 
   - name: load_work_item
     description: >
-      Synthesize the work-item brief (LLM-content) and register it with the
-      flow engine via the W1 transition.
+      Synthesize the work-item brief (LLM-content). Persists the parsed
+      external ref + title into `LifecycleMemory.work_item` for the
+      following `register_work_item` node to consume. No engine call.
     inputSchema:
       type: object
       properties:
         workItemPath: {type: string}
       required: [workItemPath]
+
+  - name: register_work_item
+    description: >
+      Create the engine work item (W1) using the brief persisted by
+      `load_work_item`. Calls the engine's `create_item` synchronously,
+      writes the returned `engineItemId` into `Run.intake` so downstream
+      engine-bound nodes can address the item, and inserts the local
+      `work_items` row. Local-mode dispatch — no webhook round-trip.
+    inputSchema:
+      type: object
 
   - name: generate_tasks
     description: >
@@ -139,7 +150,8 @@ flow:
   entryNode: start
   transitions:
     start: [load_work_item]
-    load_work_item: [generate_tasks]
+    load_work_item: [register_work_item]
+    register_work_item: [generate_tasks]
     generate_tasks: [assign_task]
     assign_task: [generate_plan]
     generate_plan:

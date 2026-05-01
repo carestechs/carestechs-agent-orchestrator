@@ -65,6 +65,7 @@ class LifecycleV03Collaborators:
     lifecycle_client: FlowEngineLifecycleClient
     llm_provider: LLMProvider
     session_factory: async_sessionmaker[AsyncSession]
+    workflow_ids: Mapping[str, uuid.UUID]
     actor: str | None = "lifecycle-agent"
     max_corrections: int = 2
 
@@ -105,6 +106,7 @@ def register_all_executors(
                     lifecycle_client=v03_collaborators.lifecycle_client,
                     llm_provider=v03_collaborators.llm_provider,
                     session_factory=v03_collaborators.session_factory,
+                    workflow_ids=v03_collaborators.workflow_ids,
                     actor=v03_collaborators.actor,
                     max_corrections=v03_collaborators.max_corrections,
                 )
@@ -245,6 +247,7 @@ def register_lifecycle_v03(
     lifecycle_client: FlowEngineLifecycleClient | None,
     llm_provider: LLMProvider,
     session_factory: async_sessionmaker[AsyncSession],
+    workflow_ids: Mapping[str, uuid.UUID],
     max_corrections: int = 2,
     actor: str | None = "lifecycle-agent",
 ) -> None:
@@ -276,6 +279,13 @@ def register_lifecycle_v03(
     if lifecycle_client is None:
         raise RuntimeError(
             "register_lifecycle_v03: lifecycle_client is required (engine-bound nodes need it)"
+        )
+    work_item_workflow_id = workflow_ids.get("work_item_workflow")
+    if work_item_workflow_id is None:
+        raise RuntimeError(
+            "register_lifecycle_v03: workflow_ids missing 'work_item_workflow' — "
+            "register_work_item (BUG-003) needs the engine workflow id at boot. "
+            "Ensure lifespan.ensure_workflows() ran before register_all_executors."
         )
 
     # Synthetic ``start`` entry node — the flow resolver treats
@@ -314,12 +324,20 @@ def register_lifecycle_v03(
         return path.read_text(encoding="utf-8")
 
     # ------------------------------------------------------------------
-    # Composite: load_work_item — LLM brief + engine W1
+    # BUG-003: split former composite ``load_work_item`` into two nodes —
+    #
+    #   load_work_item       LLMContentExecutor only — synthesises the
+    #                        brief and persists it into LifecycleMemory.
+    #   register_work_item   EngineCreateExecutor — calls W1 create_item
+    #                        with the brief's title + external ref,
+    #                        captures the new engine item id into Run.intake
+    #                        and inserts the local WorkItem row.
+    #
+    # The composite invariant ("transition existing item") stays clean;
+    # creation is its own seam alongside :class:`EngineExecutor`.
     # ------------------------------------------------------------------
 
     def _patch_load_work_item(result: Mapping[str, Any]) -> dict[str, Any]:
-        # Seed the typed lifecycle memory with the work-item ref the
-        # LLM parsed from the brief.  Subsequent nodes read this back.
         try:
             wi_type = str(result.get("work_item_id", "FEAT")).split("-", 1)[0] or "FEAT"
         except Exception:
@@ -339,21 +357,31 @@ def register_lifecycle_v03(
     registry.register(
         agent_ref,
         "load_work_item",
-        CompositeLLMEngineExecutor(
-            ref="composite:load_work_item",
-            llm_executor=LLMContentExecutor(
-                ref="llm:load_work_item",
-                system_prompt=_load_prompt("load_work_item"),
-                user_prompt_template="Synthesize the work-item brief at: {workItemPath}",
-                result_schema=LoadWorkItemResult,
-                llm_provider=llm_provider,
-            ),
-            transition_key="work_item.W1",
-            to_status="in_progress",
+        LLMContentExecutor(
+            ref="llm:load_work_item",
+            system_prompt=_load_prompt("load_work_item"),
+            user_prompt_template="Synthesize the work-item brief at: {workItemPath}",
+            result_schema=LoadWorkItemResult,
+            llm_provider=llm_provider,
+            memory_patch_builder=_patch_load_work_item,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Engine create: register_work_item — W1 (BUG-003)
+    # ------------------------------------------------------------------
+
+    from app.modules.ai.executors.engine_create import EngineCreateExecutor
+
+    registry.register(
+        agent_ref,
+        "register_work_item",
+        EngineCreateExecutor(
+            ref="engine:work_item.W1",
+            workflow_id=work_item_workflow_id,
             lifecycle_client=lifecycle_client,
             session_factory=session_factory,
-            memory_patch_builder=_patch_load_work_item,
-            actor=actor,
+            opened_by=actor or "lifecycle-agent",
         ),
     )
 
