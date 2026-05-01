@@ -104,7 +104,17 @@ class ProposeTasksExecutor:
                 ),
             )
 
-        # Per-task: create_item(task_workflow) → approve (T2) → assigning (T4)
+        # Per-task: create_item(task_workflow) → upsert local row →
+        # approve (T2) → assigning (T4) → merge engine_id into memory.
+        #
+        # BUG-007: the local ``tasks`` row MUST be inserted (and committed)
+        # before firing T2/T4 — the engine's webhook for those transitions
+        # arrives at the orchestrator's lifecycle reactor, which looks the
+        # task up by ``engine_item_id``.  When the row doesn't exist the
+        # reactor's status-cache write, effector dispatch, and W2/W5
+        # derivations all skip the event silently.  Memory is also patched
+        # per-task inside the loop so a later failure preserves earlier
+        # tasks' engine ids.
         per_task_engine_ids: dict[str, uuid.UUID] = {}
         for task in memory.tasks:
             external_ref = task.id
@@ -137,6 +147,19 @@ class ProposeTasksExecutor:
                 )
             per_task_engine_ids[external_ref] = engine_task_id
 
+            # Persist the local row + memory engine_item_id BEFORE the
+            # transitions fire, so the reactor's lookup-by-engine_item_id
+            # succeeds when the T2/T4 webhooks arrive.
+            await self._upsert_local_task(
+                work_item_id=work_item_local_id,
+                external_ref=external_ref,
+                title=task.title,
+                engine_task_id=engine_task_id,
+            )
+            await self._merge_engine_ids_into_memory(
+                ctx.run_id, {external_ref: engine_task_id}
+            )
+
             try:
                 await self._client.transition_item(
                     item_id=engine_task_id,
@@ -160,13 +183,6 @@ class ProposeTasksExecutor:
                     ),
                 )
 
-            await self._upsert_local_task(
-                work_item_id=work_item_local_id,
-                external_ref=external_ref,
-                title=task.title,
-                engine_task_id=engine_task_id,
-            )
-
         # W2 — approve-first-task: open → in_progress on the work item.
         # Idempotent in spirit: if the engine has already advanced (e.g.
         # a partial earlier run), the 422 surfaces as a ``failed`` and an
@@ -184,8 +200,6 @@ class ProposeTasksExecutor:
                 started=started,
                 detail=f"propose_tasks: engine_error firing W2 (open → in_progress): {exc}",
             )
-
-        await self._merge_engine_ids_into_memory(ctx.run_id, per_task_engine_ids)
 
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
