@@ -28,13 +28,14 @@ future FEAT — not this one.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ValidationError
 
-from app.core.llm import LLMProvider, ToolCall
+from app.core.llm import LLMProvider, ToolCall, ToolDefinition
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.schemas import DispatchEnvelope
 
@@ -72,6 +73,7 @@ class LLMContentExecutor:
         self._llm_provider = llm_provider
         self._max_retries = max_retries
         self._model = model
+        self._tool = _tool_from_result_schema(ref, result_schema)
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
@@ -95,7 +97,7 @@ class LLMContentExecutor:
                 tool_call = await self._llm_provider.chat_with_tools(
                     system=self._system_prompt,
                     messages=[{"role": "user", "content": user_prompt}],
-                    tools=[],
+                    tools=[self._tool],
                 )
             except Exception as exc:  # provider transient/permanent
                 logger.exception(
@@ -168,6 +170,26 @@ class _StrictMap(dict[str, Any]):
 
     def __missing__(self, key: str) -> Any:
         raise KeyError(key)
+
+
+_TOOL_NAME_SAFE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _tool_from_result_schema(ref: str, result_schema: type[BaseModel]) -> ToolDefinition:
+    """Build a single Anthropic-compatible tool spec from the Pydantic schema.
+
+    The model has exactly one tool to call; its arguments are the structured
+    payload the executor validates. Without this, the provider raises
+    ``policy selected no tool`` because ``tools=[]`` cannot satisfy a
+    tool-calling response.
+    """
+    sanitized = _TOOL_NAME_SAFE.sub("_", ref).strip("_") or "emit"
+    name = f"emit_{sanitized}"[:64]
+    return ToolDefinition(
+        name=name,
+        description=f"Emit a structured {result_schema.__name__} payload.",
+        parameters=result_schema.model_json_schema(),
+    )
 
 
 def _payload_from_tool_call(tool_call: ToolCall) -> Mapping[str, Any]:
