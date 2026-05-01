@@ -61,6 +61,7 @@ class LLMProvider(Protocol):
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall: ...
 
 
@@ -96,7 +97,9 @@ class StubLLMProvider:
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall:
+        del tool_choice  # stub ignores; the script is the contract
         if self._index >= len(self._script):
             raise ProviderError("stub-policy-exhausted")
 

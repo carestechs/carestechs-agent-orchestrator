@@ -97,8 +97,9 @@ class _ScriptedProvider:
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall:
-        del tools
+        del tools, tool_choice
         # Identify the node from the system prompt's first line.
         # The bootstrap loads a ``<node>.md`` system prompt; we encode
         # the node name by inspecting the first H1.

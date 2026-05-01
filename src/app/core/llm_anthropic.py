@@ -140,6 +140,7 @@ class AnthropicLLMProvider:
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall:
         """Return a policy decision by calling Anthropic's Messages API.
 
@@ -153,6 +154,13 @@ class AnthropicLLMProvider:
           (terminates the run with ``stop_reason=error``).
         """
         tool_schemas = _to_anthropic_tools(tools)
+        # Default to ``"auto"`` (model picks) — preserves the LLM-policy
+        # runtime's behaviour where the model selects from many tools.
+        # The single-tool LLMContentExecutor passes
+        # ``{"type": "tool", "name": <the_only_tool>}`` to force a tool
+        # call and eliminate the "model decides to chat instead" failure
+        # mode (PolicyError: "policy selected no tool").
+        effective_tool_choice = tool_choice if tool_choice is not None else {"type": "auto"}
 
         response = None
         cumulative_latency_ms = 0
@@ -165,7 +173,7 @@ class AnthropicLLMProvider:
                     system=system,
                     messages=list(messages),  # type: ignore[arg-type]
                     tools=tool_schemas,  # type: ignore[arg-type]
-                    tool_choice={"type": "auto"},
+                    tool_choice=effective_tool_choice,  # type: ignore[arg-type]
                 )
                 cumulative_latency_ms += int(
                     (time.perf_counter() - attempt_start) * 1000
