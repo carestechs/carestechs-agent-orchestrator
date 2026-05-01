@@ -107,8 +107,12 @@ src/app/
 │   │   ├── remote.py           — RemoteExecutor (HTTP POST + bounded retry)
 │   │   ├── human.py            — HumanExecutor (operator signal as dispatch result)
 │   │   ├── engine.py           — EngineExecutor (FEAT-010: outbox row + transition_item in one tx)
+│   │   ├── llm_content.py      — LLMContentExecutor (FEAT-011: LLM call wrapped as a local-mode dispatch)
+│   │   ├── composite.py        — CompositeLLMEngineExecutor (FEAT-011: LLM-content step → engine transition in one tx)
+│   │   ├── lifecycle_schemas.py — Pydantic v2 result schemas for v0.3.0 LLM-content nodes (FEAT-011)
+│   │   ├── prompts/lifecycle/  — System-prompt files consumed by LLMContentExecutor bindings (FEAT-011)
 │   │   ├── reconcile.py        — Restart reconciler (orphan dispatch cleanup; engine-aware path used by `reconcile-dispatches`)
-│   │   └── bootstrap.py        — register_all_executors + register_engine_executor (FEAT-010)
+│   │   └── bootstrap.py        — register_all_executors + register_engine_executor + register_lifecycle_v03 (FEAT-011)
 │   ├── lifecycle/              — FEAT-006 deterministic-flow submodule
 │   │   ├── declarations.py     — work_item_workflow + task_workflow state/transition constants
 │   │   ├── engine_client.py    — FlowEngineLifecycleClient (JWT, retries, correlation-id encoding)
@@ -124,9 +128,11 @@ src/app/
 └── migrations/                 — Alembic
 
 agents/                         — YAML agent definitions
-                                   - lifecycle-agent@0.1.0.yaml (full lifecycle, llm-policy)
+                                   - lifecycle-agent@0.1.0.yaml (full lifecycle, llm-policy — superseded by 0.3.0; kept for migration window)
                                    - lifecycle-agent@0.2.0.yaml (FEAT-009 demo, deterministic-policy)
+                                   - lifecycle-agent@0.3.0.yaml (FEAT-011 production deterministic-policy port; default for new runs)
 docs/                           — Framework docs (stakeholder, architecture, data-model, api-spec, ui-specification, personas, work-items)
+                                   - migration/lifecycle-v01-to-v03.md — v0.1.0 → v0.3.0 cutover guide (FEAT-011)
 tests/                          — conftest + modules/ai + integration/ + contract/
 ```
 
@@ -204,6 +210,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 - **Don't call `lifecycle_client.transition_item` inline from a deterministic agent's executor handler (FEAT-010).** Register an `EngineExecutor` via `register_engine_executor` in `executors/bootstrap.py` instead. Inline calls bypass the `PendingAuxWrite` outbox, the reactor wake-dispatch step, and the `reconcile-dispatches` reconciler — exactly the drift FEAT-010 closed. The legacy `lifecycle-agent@0.1.0` LLM-policy path is the lone exception: it goes through `lifecycle/service.py` signal adapters by design, not through the executor seam.
 - **Don't add a parallel persistence surface for engine round-trips.** Reuse `pending_aux_writes` and the FEAT-008 reactor. The engine executor is a *producer of outbox rows*, not a separate mechanism. New columns on `Dispatch` to mirror what the outbox already carries is a smell — the design carries `correlation_id` + `transition_key` in `Dispatch.intake` JSONB precisely to avoid that drift.
 - **Don't ask an LLM what node comes next when the YAML can answer.** For `flow.policy: deterministic`, multi-target transitions must declare a `branch:` block (predicate name or `result.<field> <op> <literal>`). If a flow truly can't express its branches in YAML, that's the right time to flip the agent to `flow.policy: llm` — but reach for that only after confirming the data on the dispatch-result envelope can't capture the decision.
+- **Don't add a `policy.systemPrompts` block to a deterministic agent (FEAT-011).** System prompts are an executor-construction concern — they live with each `LLMContentExecutor` binding in `register_lifecycle_v03` (loaded from `src/app/modules/ai/executors/prompts/<agent>/<node>.md`), not at the agent-YAML level. The runtime loop never reads a system prompt; only the executor does.
 
 ---
 
