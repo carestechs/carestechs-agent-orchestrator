@@ -99,8 +99,9 @@ class _ScriptedProvider:
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall:
-        del tools, messages
+        del tools, messages, tool_choice
         first_line = system.splitlines()[0] if system else ""
         node_name = _node_from_headline(first_line)
         self.calls.append(node_name)

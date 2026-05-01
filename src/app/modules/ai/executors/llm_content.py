@@ -35,6 +35,7 @@ from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ValidationError
 
+from app.core.exceptions import PolicyError
 from app.core.llm import LLMProvider, ToolCall, ToolDefinition
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.schemas import DispatchEnvelope
@@ -73,7 +74,9 @@ class LLMContentExecutor:
     (``mode="local"``).  On success the validated payload is the dispatch
     ``result``; on schema-validation failure (after retries are exhausted)
     the envelope is ``failed`` with ``outcome="error"`` and
-    ``detail="result_schema_validation_failed"``.
+    ``detail="llm_content_retries_exhausted: …"`` (carries
+    ``last_error=validation_error: …`` or ``policy_error: …`` so
+    operators can tell which retry path exhausted).
     """
 
     mode: ClassVar[ExecutorMode] = "local"
@@ -135,14 +138,35 @@ class LLMContentExecutor:
 
         attempts_total = 1 + max(0, self._max_retries)
         last_error: str | None = None
+        # Force the (single) tool call.  The schema-or-die contract
+        # makes "model chats instead" an unrecoverable failure mode for
+        # this executor, so disabling that branch entirely is the right
+        # default.  See the protocol's ``tool_choice`` parameter.
+        tool_choice: dict[str, Any] = {"type": "tool", "name": self._tool.name}
         for attempt in range(attempts_total):
             try:
                 tool_call = await self._llm_provider.chat_with_tools(
                     system=self._system_prompt,
                     messages=[{"role": "user", "content": user_prompt}],
                     tools=[self._tool],
+                    tool_choice=tool_choice,
                 )
-            except Exception as exc:  # provider transient/permanent
+            except PolicyError as exc:
+                # Provider raised PolicyError because the response had
+                # zero or multiple tool_use blocks.  Same class of "model
+                # misbehaved on this turn" failure as a ValidationError;
+                # retry within the budget rather than terminating.
+                last_error = f"policy_error: {exc}"
+                logger.warning(
+                    "LLMContentExecutor %s policy_error on attempt %d/%d (retrying within budget): %s",
+                    self._ref,
+                    attempt + 1,
+                    attempts_total,
+                    exc,
+                    extra={"dispatch_id": str(ctx.dispatch_id)},
+                )
+                continue
+            except Exception as exc:  # provider transient/permanent (non-policy)
                 logger.exception(
                     "LLMContentExecutor %s provider call raised on attempt %d",
                     self._ref,
@@ -162,7 +186,7 @@ class LLMContentExecutor:
             try:
                 validated = self._result_schema.model_validate(payload)
             except ValidationError as exc:
-                last_error = str(exc)
+                last_error = f"validation_error: {exc}"
                 logger.warning(
                     "LLMContentExecutor %s schema validation failed on attempt %d/%d: %s",
                     self._ref,
@@ -195,13 +219,19 @@ class LLMContentExecutor:
                 result=result_dict,
             )
 
+        # ``last_error`` is prefixed with the failure kind
+        # (``validation_error: …`` or ``policy_error: …``) so operators
+        # can tell at a glance which retry path exhausted.
         return _envelope(
             ctx,
             ref=self._ref,
             started=started,
             state="failed",
             outcome="error",
-            detail=("result_schema_validation_failed: " f"{attempts_total} attempt(s); last_error={last_error!s}"),
+            detail=(
+                f"llm_content_retries_exhausted: {attempts_total} attempt(s); "
+                f"last_error={last_error!s}"
+            ),
         )
 
     # ------------------------------------------------------------------

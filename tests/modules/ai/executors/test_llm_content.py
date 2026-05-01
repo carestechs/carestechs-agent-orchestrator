@@ -44,6 +44,7 @@ class _ScriptedProvider:
         self._index = 0
         self.calls: list[tuple[str, str]] = []  # (system, user) per call
         self.tools_seen: list[Sequence[ToolDefinition]] = []
+        self.tool_choice_seen: list[Mapping[str, Any] | None] = []
 
     async def chat_with_tools(
         self,
@@ -51,8 +52,10 @@ class _ScriptedProvider:
         system: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
+        tool_choice: Mapping[str, Any] | None = None,
     ) -> ToolCall:
         self.tools_seen.append(list(tools))
+        self.tool_choice_seen.append(tool_choice)
         # Single-turn user message — the executor builds it from the template.
         user = ""
         for message in messages:
@@ -172,7 +175,8 @@ class TestSchemaValidationRetry:
         assert env.outcome is not None
         assert env.outcome.value == "error"
         assert env.detail is not None
-        assert env.detail.startswith("result_schema_validation_failed")
+        assert env.detail.startswith("llm_content_retries_exhausted")
+        assert "validation_error" in env.detail
         assert len(provider.calls) == 2
 
     async def test_max_retries_zero_means_one_attempt(self) -> None:
@@ -337,6 +341,101 @@ class TestToolSpecDerivedFromSchema:
 
 
 # ---------------------------------------------------------------------------
+# Tool-choice + PolicyError retry — the executor MUST force the (single)
+# tool call and treat PolicyError the same as ValidationError for retry.
+# ---------------------------------------------------------------------------
+
+
+@_async
+class TestForcedToolChoice:
+    async def test_executor_passes_tool_choice_pinned_to_the_only_tool(self) -> None:
+        provider = _ScriptedProvider(script=[{"title": "T", "summary": "S"}])
+        executor = LLMContentExecutor(
+            ref="local:load",
+            system_prompt="sys",
+            user_prompt_template="user",
+            result_schema=_BriefResult,
+            llm_provider=provider,  # type: ignore[arg-type]
+        )
+
+        await executor.dispatch(_ctx())
+
+        assert len(provider.tool_choice_seen) == 1
+        choice = provider.tool_choice_seen[0]
+        assert choice is not None
+        assert choice.get("type") == "tool"
+        # The tool name is derived from result_schema by the executor;
+        # we don't pin to a specific value, only that the same name was
+        # also passed in ``tools=[...]``.
+        assert choice.get("name") == provider.tools_seen[0][0].name
+
+
+@_async
+class TestPolicyErrorRetried:
+    async def test_policy_error_first_then_success_yields_completed(self) -> None:
+        from app.core.exceptions import PolicyError as _PolicyError
+
+        attempts: list[int] = []
+
+        class _FlakyPolicyProvider:
+            name: str = "flaky"
+            model: str = "flaky-1"
+
+            async def chat_with_tools(  # type: ignore[no-untyped-def]
+                self, *, system, messages, tools, tool_choice=None
+            ):
+                del system, messages, tools, tool_choice
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise _PolicyError("policy selected no tool")
+                return ToolCall(
+                    name="content",
+                    arguments={"title": "T", "summary": "S"},
+                    usage=Usage(input_tokens=0, output_tokens=0, latency_ms=0),
+                    raw_response=None,
+                )
+
+        executor = LLMContentExecutor(
+            ref="local:r",
+            system_prompt="sys",
+            user_prompt_template="user",
+            result_schema=_BriefResult,
+            llm_provider=_FlakyPolicyProvider(),  # type: ignore[arg-type]
+            max_retries=1,
+        )
+        env = await executor.dispatch(_ctx())
+        assert env.state.value == "completed"
+        assert len(attempts) == 2
+
+    async def test_policy_error_exhausted_yields_failed_envelope(self) -> None:
+        from app.core.exceptions import PolicyError as _PolicyError
+
+        class _AlwaysPolicyError:
+            name: str = "boom"
+            model: str = "boom-1"
+
+            async def chat_with_tools(  # type: ignore[no-untyped-def]
+                self, *, system, messages, tools, tool_choice=None
+            ):
+                del system, messages, tools, tool_choice
+                raise _PolicyError("policy selected no tool")
+
+        executor = LLMContentExecutor(
+            ref="local:r",
+            system_prompt="sys",
+            user_prompt_template="user",
+            result_schema=_BriefResult,
+            llm_provider=_AlwaysPolicyError(),  # type: ignore[arg-type]
+            max_retries=1,
+        )
+        env = await executor.dispatch(_ctx())
+        assert env.state.value == "failed"
+        assert env.detail is not None
+        assert env.detail.startswith("llm_content_retries_exhausted")
+        assert "policy_error" in env.detail
+
+
+# ---------------------------------------------------------------------------
 # Provider error handling
 # ---------------------------------------------------------------------------
 
@@ -349,8 +448,9 @@ class TestProviderErrors:
             model = "boom-1"
 
             async def chat_with_tools(  # type: ignore[no-untyped-def]
-                self, *, system, messages, tools
+                self, *, system, messages, tools, tool_choice=None
             ):
+                del tool_choice
                 raise RuntimeError("upstream offline")
 
         executor = LLMContentExecutor(
