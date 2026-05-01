@@ -142,11 +142,13 @@ class TestSuccessPath:
             assert row.payload["to_status"] == "review"
             assert row.payload["aux_type"] == "engine_dispatch"
 
-    async def test_correlation_id_encoded_into_engine_comment(
+    async def test_correlation_id_sent_as_structured_field(
         self,
         lifecycle_client: FlowEngineLifecycleClient,
         session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
+        import json as _json
+
         item_id = uuid.uuid4()
         with respx.mock(base_url=_BASE, assert_all_mocked=False) as rx:
             rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
@@ -156,8 +158,15 @@ class TestSuccessPath:
             executor = _executor(lifecycle_client, session_factory)
             env = await executor.dispatch(_ctx(item_id=item_id))
 
-        body = transition_route.calls.last.request.content.decode("utf-8")
-        assert f"orchestrator-corr:{env.correlation_id}" in body
+        body = _json.loads(transition_route.calls.last.request.content.decode("utf-8"))
+        # correlationId is now a top-level structured field; the engine
+        # echoes it back on the webhook so the reactor can match the
+        # outbox row + wake the parked dispatch.  No "orchestrator-corr:"
+        # in any field — that comment-encoding hack never worked
+        # because the engine's triggered_by is the actor id, not the
+        # comment.
+        assert body["correlationId"] == str(env.correlation_id)
+        assert "orchestrator-corr" not in body.get("comment", "")
 
     async def test_task_transition_key_parses_entity_type(
         self,

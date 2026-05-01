@@ -35,9 +35,6 @@ def _build_webhook(
     from_status: str | None,
     to_status: str,
 ) -> reactor.LifecycleWebhookEvent:
-    triggered_by = (
-        f"orchestrator-corr:{correlation_id}" if correlation_id else "engine"
-    )
     return reactor.LifecycleWebhookEvent(
         delivery_id=uuid.uuid4(),
         event_type="item.transitioned",
@@ -48,7 +45,8 @@ def _build_webhook(
         data=reactor.LifecycleWebhookData(
             from_status=from_status,
             to_status=to_status,
-            triggered_by=triggered_by,
+            triggered_by="engine",
+            correlation_id=correlation_id,
         ),
     )
 

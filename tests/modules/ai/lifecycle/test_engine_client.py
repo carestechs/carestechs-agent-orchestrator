@@ -11,7 +11,6 @@ from httpx import Response
 from app.core.exceptions import EngineError
 from app.modules.ai.lifecycle.engine_client import (
     FlowEngineLifecycleClient,
-    extract_correlation_id,
 )
 
 _ASYNC = pytest.mark.asyncio(loop_scope="function")
@@ -131,7 +130,9 @@ class TestCreateWorkflow:
 
 @_ASYNC
 class TestTransitionItem:
-    async def test_encodes_correlation_in_comment(self) -> None:
+    async def test_sends_correlation_id_as_structured_field(self) -> None:
+        import json as _json
+
         item_id = uuid.uuid4()
         corr = uuid.uuid4()
         with respx.mock(base_url=_BASE, assert_all_mocked=False) as rx:
@@ -147,10 +148,13 @@ class TestTransitionItem:
                 actor="admin",
             )
             await client.aclose()
-            call = route.calls[0]
-            sent = call.request.content.decode()
-            assert f"orchestrator-corr:{corr}" in sent
-            assert "admin" in sent
+            sent = _json.loads(route.calls[0].request.content.decode())
+            # correlationId is a top-level structured field — the engine
+            # echoes it back on the resulting webhook.  No "orchestrator-corr:"
+            # in the comment any more.
+            assert sent["correlationId"] == str(corr)
+            assert "orchestrator-corr" not in sent.get("comment", "")
+            assert "admin" in sent.get("comment", "")
 
     async def test_422_surfaces_detail(self) -> None:
         item_id = uuid.uuid4()
@@ -172,20 +176,10 @@ class TestTransitionItem:
             assert "not allowed" in ex.value.original_body  # type: ignore[operator]
 
 
-class TestExtractCorrelationId:
-    def test_happy(self) -> None:
-        corr = uuid.uuid4()
-        parsed = extract_correlation_id(f"orchestrator-corr:{corr}")
-        assert parsed == corr
-
-    def test_with_surrounding_text(self) -> None:
-        corr = uuid.uuid4()
-        parsed = extract_correlation_id(f"user:alice orchestrator-corr:{corr} [actor=admin]")
-        assert parsed == corr
-
-    def test_absent_returns_none(self) -> None:
-        assert extract_correlation_id("user:alice") is None
-        assert extract_correlation_id(None) is None
-
-    def test_malformed_uuid_returns_none(self) -> None:
-        assert extract_correlation_id("orchestrator-corr:not-a-uuid") is None
+# ``extract_correlation_id`` was the legacy helper that parsed
+# ``orchestrator-corr:<uuid>`` out of the engine's ``triggered_by``
+# field on the assumption that the engine echoed the transition's
+# comment.  It does not — ``triggered_by`` is the engine's actor id.
+# The function and its tests were removed when the orchestrator
+# switched to sending ``correlationId`` as a structured request field
+# (echoed back as ``correlationId`` on the webhook).

@@ -118,12 +118,7 @@ async def _deliver_webhook(
     from_status: str | None,
     to_status: str,
 ) -> None:
-    triggered_by = (
-        f"orchestrator-corr:{correlation_id}"
-        if correlation_id is not None
-        else "engine"
-    )
-    body_dict = {
+    body_dict: dict[str, Any] = {
         "deliveryId": str(uuid.uuid4()),
         "eventType": "item.transitioned",
         "tenantId": str(uuid.uuid4()),
@@ -133,9 +128,11 @@ async def _deliver_webhook(
         "data": {
             "fromStatus": from_status,
             "toStatus": to_status,
-            "triggeredBy": triggered_by,
+            "triggeredBy": "engine",
         },
     }
+    if correlation_id is not None:
+        body_dict["data"]["correlationId"] = str(correlation_id)
     body = json.dumps(body_dict).encode()
     resp = await client.post(
         "/hooks/engine/lifecycle/item-transitioned",

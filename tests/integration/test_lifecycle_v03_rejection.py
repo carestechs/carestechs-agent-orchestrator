@@ -290,13 +290,11 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
 
     async def _post_transition(request: Any) -> Response:
         body = json.loads(request.content.decode())
-        comment = body.get("comment", "")
-        for tok in comment.split():
-            if tok.startswith("orchestrator-corr:"):
-                correlation_log.append(
-                    (uuid.UUID(tok[len("orchestrator-corr:") :]), str(request.url.path))
-                )
-                break
+        corr_raw = body.get("correlationId")
+        if corr_raw:
+            correlation_log.append(
+                (uuid.UUID(corr_raw), str(request.url.path))
+            )
         return Response(
             200, json={"data": {"id": str(uuid.uuid4()), "transitionRunId": str(uuid.uuid4())}}
         )
@@ -331,7 +329,8 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
                             "data": {
                                 "fromStatus": "in_progress",
                                 "toStatus": "ready",
-                                "triggeredBy": f"orchestrator-corr:{corr}",
+                                "triggeredBy": "engine",
+                                "correlationId": str(corr),
                             },
                         }
                         raw = json.dumps(body).encode()
