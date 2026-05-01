@@ -34,6 +34,8 @@ class _FakeClient:
         self.lookup_calls: list[str] = []
         self.recognize_calls: list[uuid.UUID] = []
         self.subscription_calls: list[dict[str, Any]] = []
+        self.list_subscriptions_calls: list[uuid.UUID | None] = []
+        self.list_subscriptions_response: list[dict[str, Any]] = []
         self._create_effects = list(create_side_effect or [])
         self._lookup_effects = list(lookup_side_effect or [])
         # ``recognize_side_effect`` defaults to "engine recognizes everything"
@@ -63,6 +65,14 @@ class _FakeClient:
         if isinstance(effect, Exception):
             raise effect
         return effect
+
+    async def list_webhook_subscriptions(
+        self,
+        *,
+        workflow_id: uuid.UUID | None = None,
+    ) -> list[dict[str, Any]]:
+        self.list_subscriptions_calls.append(workflow_id)
+        return list(self.list_subscriptions_response)
 
     async def create_workflow(
         self,
@@ -322,6 +332,69 @@ class TestEnsureEngineSubscriptions:
             assert call["secret"] == "hunter2"
         seen_workflows = {c["workflow_id"] for c in client.subscription_calls}
         assert seen_workflows == {wf_a, wf_b}
+
+    async def test_skips_post_when_existing_sub_matches_url_and_event(self) -> None:
+        callback_url = "http://orch.test/hooks/engine/lifecycle/item-transitioned"
+        client = _FakeClient()
+        client.list_subscriptions_response = [
+            {"id": str(uuid.uuid4()), "url": callback_url, "eventType": "item.transitioned"},
+        ]
+
+        await bootstrap.ensure_engine_subscriptions(
+            client,  # type: ignore[arg-type]
+            workflow_ids={"work_item_workflow": uuid.uuid4()},
+            public_base_url="http://orch.test",
+            webhook_secret="x",
+        )
+
+        # Pre-flight GET ran for the workflow; POST was skipped.
+        assert len(client.list_subscriptions_calls) == 1
+        assert client.subscription_calls == []
+
+    async def test_camelcase_and_snakecase_response_shapes_both_dedupe(self) -> None:
+        callback_url = "http://orch.test/hooks/engine/lifecycle/item-transitioned"
+        wf_a = uuid.uuid4()
+        wf_b = uuid.uuid4()
+        client = _FakeClient()
+        # Engine could return either field naming convention; both must
+        # be recognised as a match.
+        client.list_subscriptions_response = [
+            {"callbackUrl": callback_url, "event_type": "item.transitioned"},
+        ]
+
+        await bootstrap.ensure_engine_subscriptions(
+            client,  # type: ignore[arg-type]
+            workflow_ids={"work_item_workflow": wf_a, "task_workflow": wf_b},
+            public_base_url="http://orch.test",
+            webhook_secret="x",
+        )
+
+        # Both workflows hit the dedupe path → no POSTs.
+        assert client.subscription_calls == []
+
+    async def test_list_failure_falls_through_to_post(self) -> None:
+        from app.core.exceptions import EngineError
+
+        client = _FakeClient(
+            ensure_subscription_side_effect=[uuid.uuid4()],
+        )
+
+        # First test the list-failure path by overriding the method
+        # to raise.  We monkeypatch via subclass to keep the fake simple.
+        async def _raising_list(**_kwargs: Any) -> list[dict[str, Any]]:
+            raise EngineError("transient", engine_http_status=503)
+
+        client.list_webhook_subscriptions = _raising_list  # type: ignore[method-assign]
+
+        await bootstrap.ensure_engine_subscriptions(
+            client,  # type: ignore[arg-type]
+            workflow_ids={"work_item_workflow": uuid.uuid4()},
+            public_base_url="http://orch.test",
+            webhook_secret="x",
+        )
+
+        # POST still happened despite the list failure.
+        assert len(client.subscription_calls) == 1
 
     async def test_409_already_exists_is_swallowed(self) -> None:
         from app.core.exceptions import EngineError

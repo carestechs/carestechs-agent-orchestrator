@@ -171,29 +171,51 @@ async def ensure_engine_subscriptions(
     ``CompositeLLMEngineExecutor`` / ``SequenceEngineExecutor`` dispatch
     would park on its supervisor future and time out.
 
-    Idempotent: a second boot for the same (workflow, url, event_type)
-    that returns ``409`` (or whatever the engine emits for "already
-    subscribed") is treated as success.  Any other ``EngineError`` is
-    surfaced — a misconfigured ingress URL or auth failure should fail
-    boot rather than silently swallow.
+    Idempotency strategy: the engine's POST creates a new subscription
+    on every call (no server-side dedupe by url+event+workflow), so we
+    GET the existing list per workflow and skip the POST when a row
+    matches our (url, event_type) for that workflow.  Engine 409 is
+    also tolerated as a defensive belt-and-braces for engines that do
+    dedupe server-side.
 
     The callback URL is derived from ``Settings.public_base_url`` plus
-    the existing ``/hooks/engine/lifecycle/item-transitioned`` route
-    declared in ``modules/ai/router.py``.  The HMAC secret is the same
-    one ``RawBodyMiddleware`` uses to verify inbound signatures.
+    the existing ``/hooks/engine/lifecycle/item-transitioned`` route.
+    Container deploys must set ``PUBLIC_BASE_URL`` to the orchestrator's
+    container DNS name (e.g. ``http://orchestrator-api:8000``) so the
+    engine can reach it on the shared network — ``localhost`` resolves
+    to the engine itself from inside the engine container.
     """
     callback_url = public_base_url.rstrip("/") + "/hooks/engine/lifecycle/item-transitioned"
+    event_type = "item.transitioned"
     for name, workflow_id in workflow_ids.items():
+        try:
+            existing = await client.list_webhook_subscriptions(workflow_id=workflow_id)
+        except EngineError as exc:
+            logger.warning(
+                "could not list webhook subscriptions for workflow %s before subscribing "
+                "(continuing with POST; engine 409 will still be tolerated): %s",
+                name,
+                exc,
+            )
+            existing = []
+
+        if _subscription_matches(existing, url=callback_url, event_type=event_type):
+            logger.info(
+                "engine webhook subscription already present for workflow %s — skipping POST",
+                name,
+            )
+            continue
+
         try:
             sub_id = await client.ensure_webhook_subscription(
                 url=callback_url,
-                event_type="item.transitioned",
+                event_type=event_type,
                 workflow_id=workflow_id,
                 secret=webhook_secret,
             )
             logger.info(
                 "subscribed to engine %s webhook for workflow %s (subscription_id=%s, url=%s)",
-                "item.transitioned",
+                event_type,
                 name,
                 sub_id,
                 callback_url,
@@ -212,3 +234,23 @@ async def ensure_engine_subscriptions(
                 exc,
             )
             raise
+
+
+def _subscription_matches(
+    existing: list[dict[str, Any]],
+    *,
+    url: str,
+    event_type: str,
+) -> bool:
+    """Return True if any row already matches our (url, event_type) pair.
+
+    Tolerates the engine's response shape variations: ``url`` vs
+    ``callbackUrl``, ``eventType`` vs ``event_type``.  workflow_id is
+    pre-filtered by the caller's ``list_webhook_subscriptions`` call.
+    """
+    for row in existing:
+        row_url = row.get("url") or row.get("callbackUrl")
+        row_event = row.get("eventType") or row.get("event_type")
+        if row_url == url and row_event == event_type:
+            return True
+    return False
