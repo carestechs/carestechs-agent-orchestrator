@@ -63,17 +63,27 @@ nodes:
 
   - name: generate_tasks
     description: >
-      Generate the task breakdown (LLM-content) and propose each task to the
-      engine (T1 x N + self-approve T2+T4).
+      Generate the task breakdown (LLM-content). Persists the task list
+      into LifecycleMemory.tasks; engine fanout happens in propose_tasks.
     inputSchema:
       type: object
       properties:
         workItemId: {type: string}
       required: [workItemId]
 
+  - name: propose_tasks
+    description: >
+      For every task in memory: T1 create_item against the task workflow,
+      then T2 (proposed → approved) and T4 (approved → assigning).  After
+      all tasks are advanced, fire W2 (open → in_progress) on the work
+      item.  Local-mode synchronous executor (BUG-004).
+    inputSchema:
+      type: object
+
   - name: assign_task
     description: >
-      Assign the current task to its executor via the engine T5 transition.
+      Advance the current task via T5 (assigning → planning).  Resolves the
+      engine target from LifecycleMemory.current_task_id (BUG-004).
     inputSchema:
       type: object
       properties:
@@ -83,8 +93,17 @@ nodes:
   - name: generate_plan
     description: >
       Author an implementation plan for the current task (LLM-content) and
-      submit + self-approve it through the engine (T6 + T7). Self-loops
-      while `unplanned_tasks_remaining` is true.
+      fire T6 (planning → plan_review). Self-loops while
+      `unplanned_tasks_remaining` is true.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: approve_plan
+    description: >
+      Fire T7 (plan_review → implementing) on the current task (BUG-004).
     inputSchema:
       type: object
       properties:
@@ -94,18 +113,37 @@ nodes:
   - name: request_implementation
     description: >
       Pause and wait for an operator-injected `implementation-complete`
-      signal; on resume advance the task via the engine T9 transition.
+      signal.  Engine state advance is handled by submit_implementation.
     inputSchema:
       type: object
       properties:
         taskId: {type: string}
       required: [taskId]
 
+  - name: submit_implementation
+    description: >
+      Idempotent T9 (implementing → impl_review) on the current task.
+      Skips the engine call if the task has already been submitted (memory
+      flag set), so the rejection-resubmit loop does not re-fire T9.
+    inputSchema:
+      type: object
+
   - name: review_implementation
     description: >
-      Judge the submitted implementation (LLM-content). On `verdict=pass`
-      advance the task via T10 and proceed to closure; on `verdict=fail`
-      route to `correct_implementation`.
+      Judge the submitted implementation (LLM-content).  Writes the verdict
+      into memory; the resolver's `review_passed` predicate routes to
+      `approve_review` (T10) on pass or `correct_implementation` on fail.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: approve_review
+    description: >
+      Fire T10 (impl_review → done) on the current task.  Selected only on
+      verdict=pass branch; rejection path bypasses this node so the engine
+      task does not silently advance to done (BUG-004 + FEAT-008 contract).
     inputSchema:
       type: object
       properties:
@@ -126,7 +164,8 @@ nodes:
 
   - name: close_work_item
     description: >
-      Close the work item via the engine W6 transition (terminal).
+      Close the work item by chaining W4 (in_progress → ready) and then
+      W6 (ready → closed) via SequenceEngineExecutor.  Terminal node.
     inputSchema:
       type: object
       properties:
@@ -152,19 +191,23 @@ flow:
     start: [load_work_item]
     load_work_item: [register_work_item]
     register_work_item: [generate_tasks]
-    generate_tasks: [assign_task]
+    generate_tasks: [propose_tasks]
+    propose_tasks: [assign_task]
     assign_task: [generate_plan]
     generate_plan:
       branch:
         rule: unplanned_tasks_remaining
         "true": generate_plan
-        "false": request_implementation
-    request_implementation: [review_implementation]
+        "false": approve_plan
+    approve_plan: [request_implementation]
+    request_implementation: [submit_implementation]
+    submit_implementation: [review_implementation]
     review_implementation:
       branch:
         rule: review_passed
-        "true": close_work_item
+        "true": approve_review
         "false": correct_implementation
+    approve_review: [close_work_item]
     correct_implementation:
       branch:
         rule: correction_attempts_under_bound
@@ -182,4 +225,4 @@ intakeSchema:
 terminalNodes: [close_work_item, terminate_correction_budget]
 
 defaultBudget:
-  maxSteps: 300
+  maxSteps: 600

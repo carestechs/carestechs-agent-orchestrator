@@ -261,13 +261,17 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
         base_url=_ENGINE_BASE, api_key=_ENGINE_API_KEY, max_retries=1
     )
     registry = ExecutorRegistry()
+    task_workflow_id = uuid.uuid4()
     register_lifecycle_v03(
         registry,
         _AGENT_REF,
         lifecycle_client=fake_engine_client,
         llm_provider=provider,  # type: ignore[arg-type]
         session_factory=session_factory,
-        workflow_ids={"work_item_workflow": work_item_workflow_id},
+        workflow_ids={
+            "work_item_workflow": work_item_workflow_id,
+            "task_workflow": task_workflow_id,
+        },
     )
 
     agent = load_agent(_AGENT_REF, _AGENTS_DIR)
@@ -370,13 +374,19 @@ async def test_ac3_rejection_writes_approval_row_and_calls_no_rejection_engine_e
                         signaled.add(human_row.dispatch_id)
                     await asyncio.sleep(0.05)
 
+            async def _post_create_item(request: Any) -> Response:
+                # BUG-003 + BUG-004: W1 returns the pre-seeded
+                # engine_item_id; T1 task creates return fresh ids.
+                path = str(request.url.path)
+                wf_id = path.split("/")[-2]
+                if wf_id == str(work_item_workflow_id):
+                    return Response(201, json={"data": {"id": str(engine_item_id)}})
+                return Response(201, json={"data": {"id": str(uuid.uuid4())}})
+
             with respx.mock(base_url=_ENGINE_BASE, assert_all_called=False) as mock:
                 mock.post("/api/auth/token").respond(200, json=_TOKEN_RESPONSE)
-                # BUG-003: register_work_item posts W1 to create_item.
-                # Return the same engine_item_id the test pre-seeded so
-                # the executor's idempotent lookup reuses the row.
-                mock.post(url__regex=r"/api/workflows/[^/]+/items").respond(
-                    201, json={"data": {"id": str(engine_item_id)}}
+                mock.post(url__regex=r"/api/workflows/[^/]+/items").mock(
+                    side_effect=_post_create_item
                 )
                 mock.post(url__regex=r"/api/items/[^/]+/transitions").mock(side_effect=_post_transition)
                 mock.get(url__regex=r"/api/workflows.*").respond(

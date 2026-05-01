@@ -249,6 +249,61 @@ class TestFailurePaths:
         assert "malformed" in (env.detail or "")
 
 
+class TestTargetIdResolver:
+    async def test_resolver_takes_precedence_over_intake(
+        self,
+        lifecycle_client: FlowEngineLifecycleClient,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        intake_item = uuid.uuid4()
+        resolved_item = uuid.uuid4()
+
+        async def _resolver(_ctx):  # type: ignore[no-untyped-def]
+            return resolved_item
+
+        with respx.mock(base_url=_BASE, assert_all_mocked=False, assert_all_called=False) as rx:
+            rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
+            transition_route = rx.post(f"/api/items/{resolved_item}/transitions").mock(
+                return_value=Response(200, json={"data": {"id": "ok"}})
+            )
+            executor = EngineExecutor(
+                ref="engine:test",
+                transition_key="task.T5",
+                to_status="planning",
+                lifecycle_client=lifecycle_client,
+                session_factory=session_factory,
+                target_id_resolver=_resolver,
+            )
+            env = await executor.dispatch(_ctx(item_id=intake_item))
+
+        assert env.state.value == "dispatched"
+        assert transition_route.call_count == 1, "transition fired against the resolved id, not intake"
+
+    async def test_resolver_returning_none_fails_before_engine_call(
+        self,
+        lifecycle_client: FlowEngineLifecycleClient,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        async def _resolver(_ctx):  # type: ignore[no-untyped-def]
+            return None
+
+        with respx.mock(base_url=_BASE, assert_all_mocked=False, assert_all_called=False) as rx:
+            rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
+            executor = EngineExecutor(
+                ref="engine:test",
+                transition_key="task.T5",
+                to_status="planning",
+                lifecycle_client=lifecycle_client,
+                session_factory=session_factory,
+                target_id_resolver=_resolver,
+            )
+            env = await executor.dispatch(_ctx(item_id=None))
+
+        assert env.state.value == "failed"
+        assert env.detail is not None
+        assert "target_id_resolver returned None" in env.detail
+
+
 # Import-quarantine assertion lives in ``tests/test_engine_executor_import_quarantine.py``
 # (T-237).  Kept out of this file so the deferred wakeup of ``runtime_deterministic``
 # is exercised in a fresh subprocess, not inside the executor unit-test module.
