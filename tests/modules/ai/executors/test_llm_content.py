@@ -43,6 +43,7 @@ class _ScriptedProvider:
         self._script = list(script)
         self._index = 0
         self.calls: list[tuple[str, str]] = []  # (system, user) per call
+        self.tools_seen: list[Sequence[ToolDefinition]] = []
 
     async def chat_with_tools(
         self,
@@ -51,7 +52,7 @@ class _ScriptedProvider:
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[ToolDefinition],
     ) -> ToolCall:
-        del tools
+        self.tools_seen.append(list(tools))
         # Single-turn user message — the executor builds it from the template.
         user = ""
         for message in messages:
@@ -252,6 +253,36 @@ class TestPromptRendering:
         assert "prompt_render_failed" in env.detail
         assert "workItemPath" in env.detail
         assert provider.calls == []  # provider never invoked
+
+
+# ---------------------------------------------------------------------------
+# Tool spec is derived from result_schema (regression — empty tools yielded
+# "policy selected no tool" against the real Anthropic provider).
+# ---------------------------------------------------------------------------
+
+
+@_async
+class TestToolSpecDerivedFromSchema:
+    async def test_single_tool_carries_schema_as_input_parameters(self) -> None:
+        provider = _ScriptedProvider(script=[{"title": "T", "summary": "S"}])
+        executor = LLMContentExecutor(
+            ref="local:load_work_item",
+            system_prompt="sys",
+            user_prompt_template="user",
+            result_schema=_BriefResult,
+            llm_provider=provider,  # type: ignore[arg-type]
+        )
+
+        await executor.dispatch(_ctx())
+
+        assert len(provider.tools_seen) == 1
+        tools = provider.tools_seen[0]
+        assert len(tools) == 1, "executor must pass exactly one tool derived from the schema"
+        tool = tools[0]
+        assert tool.name.startswith("emit_")
+        # Tool name must satisfy the Anthropic ^[a-zA-Z0-9_-]{1,64}$ contract.
+        assert re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", tool.name)
+        assert tool.parameters == _BriefResult.model_json_schema()
 
 
 # ---------------------------------------------------------------------------
