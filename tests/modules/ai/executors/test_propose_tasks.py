@@ -238,6 +238,81 @@ class TestRowExistsBeforeTransitions:
                 await session.commit()
 
 
+class TestExpandedTaskBodyRoundTrip:
+    """The new body fields (description, acceptance_criteria, complexity,
+    depends_on, files_hint) flow LLM → memory → propose_tasks → memory."""
+
+    async def test_task_body_survives_propose_tasks(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        run_id, wi_local_id, _ = await _seed_run_with_tasks(
+            session_factory,
+            tasks=[
+                LifecycleTask(
+                    id="T-001",
+                    title="Add SSE endpoint",
+                    executor="claude-code",
+                    description="Expose a streaming endpoint for run traces.",
+                    acceptance_criteria=[
+                        "GET /api/v1/runs/{id}/trace returns text/event-stream",
+                        "Stream closes cleanly when run terminates",
+                    ],
+                    complexity="medium",
+                    depends_on=[],
+                    files_hint=["src/app/modules/ai/router.py"],
+                ),
+            ],
+        )
+        client = _RecordingClient()
+        executor = ProposeTasksExecutor(
+            ref="propose_tasks",
+            task_workflow_id=uuid.uuid4(),
+            lifecycle_client=client,  # type: ignore[arg-type]
+            session_factory=session_factory,
+        )
+        env = await executor.dispatch(_ctx(run_id))
+
+        try:
+            assert env.state.value == "completed", env.detail
+
+            async with session_factory() as session:
+                mem = await session.scalar(
+                    select(RunMemory).where(RunMemory.run_id == run_id)
+                )
+                assert mem is not None
+                ns = (mem.data or {}).get(LIFECYCLE_MEMORY_NS) or {}
+                tasks_in_mem = ns.get("tasks") or []
+
+            assert len(tasks_in_mem) == 1
+            t = tasks_in_mem[0]
+            # by_alias=True → camelCase keys in JSON
+            assert t["id"] == "T-001"
+            assert t["title"] == "Add SSE endpoint"
+            assert t["description"] == "Expose a streaming endpoint for run traces."
+            assert t["acceptanceCriteria"] == [
+                "GET /api/v1/runs/{id}/trace returns text/event-stream",
+                "Stream closes cleanly when run terminates",
+            ]
+            assert t["complexity"] == "medium"
+            assert t["filesHint"] == ["src/app/modules/ai/router.py"]
+            # engineItemId set by propose_tasks itself
+            assert t["engineItemId"] is not None
+        finally:
+            async with session_factory() as session:
+                await session.execute(
+                    Task.__table__.delete().where(Task.work_item_id == wi_local_id)
+                )
+                await session.execute(
+                    RunMemory.__table__.delete().where(RunMemory.run_id == run_id)
+                )
+                await session.execute(Run.__table__.delete().where(Run.id == run_id))
+                await session.execute(
+                    WorkItem.__table__.delete().where(WorkItem.id == wi_local_id)
+                )
+                await session.commit()
+
+
 class TestMemoryEngineIdPersistedPerTask:
     """BUG-007: per-task engine_item_id must land in memory inside the
     loop, so a later task's failure preserves earlier tasks' ids."""

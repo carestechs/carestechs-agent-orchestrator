@@ -65,3 +65,52 @@ class TestV01BackwardCompat:
         v01_data = to_run_memory(original)
         result = read_lifecycle_memory(v01_data)
         assert result == original
+
+
+class TestExpandedTaskBody:
+    """The expanded task fields (description, acceptance_criteria,
+    complexity, depends_on, files_hint) round-trip cleanly and stay
+    backward-compatible with task rows that omit them."""
+
+    def test_expanded_task_round_trips(self) -> None:
+        original = LifecycleMemory(
+            tasks=[
+                LifecycleTask(
+                    id="T-1",
+                    title="Add SSE endpoint",
+                    executor="claude-code",
+                    description="Stream a run's trace as SSE.",
+                    acceptance_criteria=[
+                        "GET returns text/event-stream",
+                        "Stream closes on terminal state",
+                    ],
+                    complexity="medium",
+                    depends_on=[],
+                    files_hint=["src/app/modules/ai/router.py"],
+                ),
+            ],
+        )
+        patch = write_lifecycle_memory(original)
+        result = read_lifecycle_memory(patch)
+        task = result.tasks[0]
+        assert task.description == "Stream a run's trace as SSE."
+        assert task.acceptance_criteria == [
+            "GET returns text/event-stream",
+            "Stream closes on terminal state",
+        ]
+        assert task.complexity == "medium"
+        assert task.files_hint == ["src/app/modules/ai/router.py"]
+
+    def test_minimal_task_validates_with_defaults(self) -> None:
+        """Older payloads (or a degraded LLM response) carrying only the
+        three core fields still validate; defaults backfill the body."""
+        minimal = LifecycleMemory(
+            tasks=[LifecycleTask(id="T-1", title="legacy", executor="claude-code")],
+        )
+        roundtripped = read_lifecycle_memory(write_lifecycle_memory(minimal))
+        task = roundtripped.tasks[0]
+        assert task.description == ""
+        assert task.acceptance_criteria == []
+        assert task.complexity == "medium"
+        assert task.depends_on == []
+        assert task.files_hint == []
