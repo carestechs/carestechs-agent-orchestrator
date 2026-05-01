@@ -30,6 +30,16 @@ description: >
   `HumanExecutor`. The runtime loop never imports `core.llm`.
 
 nodes:
+  - name: start
+    description: >
+      Synthetic entry marker.  The flow resolver treats `entryNode` as
+      the *previous* node before the first dispatch — its outgoing
+      transition selects the first node actually executed.  `start` has
+      no executor binding (registered via `no_executor`) and is never
+      dispatched.
+    inputSchema:
+      type: object
+
   - name: load_work_item
     description: >
       Synthesize the work-item brief (LLM-content) and register it with the
@@ -126,8 +136,9 @@ nodes:
 
 flow:
   policy: deterministic
-  entryNode: load_work_item
+  entryNode: start
   transitions:
+    start: [load_work_item]
     load_work_item: [generate_tasks]
     generate_tasks: [assign_task]
     assign_task: [generate_plan]
