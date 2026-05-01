@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
@@ -39,16 +41,51 @@ if TYPE_CHECKING:
     # importing ``runtime_deterministic`` (which imports the registry's
     # bootstrap surface transitively) does not pull the engine HTTP
     # client into ``sys.modules``.
+    from app.core.llm import LLMProvider
     from app.modules.ai.lifecycle.engine_client import FlowEngineLifecycleClient
 
 logger = logging.getLogger(__name__)
 
 
-def register_all_executors(registry: ExecutorRegistry, agents_dir: Path) -> None:
+# ---------------------------------------------------------------------------
+# v0.3.0 collaborator bundle
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleV03Collaborators:
+    """Bundle of collaborators ``register_lifecycle_v03`` needs.
+
+    The lifespan composition root constructs these once and hands them
+    in.  Tests that don't load v0.3.0 omit them; the bootstrap then
+    falls back to no_executor exemptions so the coverage validator
+    still boots.
+    """
+
+    lifecycle_client: FlowEngineLifecycleClient
+    llm_provider: LLMProvider
+    session_factory: async_sessionmaker[AsyncSession]
+    actor: str | None = "lifecycle-agent"
+    max_corrections: int = 2
+
+
+def register_all_executors(
+    registry: ExecutorRegistry,
+    agents_dir: Path,
+    *,
+    v03_collaborators: LifecycleV03Collaborators | None = None,
+) -> None:
     """Register an executor for every node of every loaded agent.
 
     The function is the single source of truth for the executor wiring;
     lifespan calls it once at boot and then runs the coverage validator.
+
+    ``v03_collaborators`` is required to wire the production
+    ``lifecycle-agent@0.3.0`` bindings (FEAT-011 / T-254).  When absent,
+    every v0.3.0 node is declared as an explicit no_executor exemption
+    so the coverage validator still boots — useful for tests that don't
+    exercise v0.3.0 directly.  A run against the v0.3.0 agent without
+    real bindings would fail at dispatch time naming the unbound node.
     """
     from app.modules.ai.agents import list_agents
 
@@ -59,15 +96,18 @@ def register_all_executors(registry: ExecutorRegistry, agents_dir: Path) -> None
         elif agent.ref.startswith("lifecycle-agent@0.2"):
             _register_lifecycle_v02(registry, agent.ref)
         elif agent.ref.startswith("lifecycle-agent@0.3"):
-            # FEAT-011 / PR 2: the v0.3.0 YAML lands on disk but real
-            # executor wiring (LLMContentExecutor + EngineExecutor +
-            # HumanExecutor + LocalExecutor for `correct_implementation`)
-            # is deferred to PR 3 / T-254 (`register_lifecycle_v03`).  Until
-            # then declare every node as an explicit no_executor exemption
-            # so the lifespan-time coverage validator boots cleanly.  No
-            # caller starts a run against this agent in PR 2 (it would
-            # fail at dispatch time, naming the unbound node).
-            _exempt_lifecycle_v03(agent.ref, [n.name for n in agent.nodes])
+            if v03_collaborators is None:
+                _exempt_lifecycle_v03(agent.ref, [n.name for n in agent.nodes])
+            else:
+                register_lifecycle_v03(
+                    registry,
+                    agent.ref,
+                    lifecycle_client=v03_collaborators.lifecycle_client,
+                    llm_provider=v03_collaborators.llm_provider,
+                    session_factory=v03_collaborators.session_factory,
+                    actor=v03_collaborators.actor,
+                    max_corrections=v03_collaborators.max_corrections,
+                )
 
     logger.info(
         "executor registry: %d binding(s) across %d agent(s)",
@@ -182,15 +222,400 @@ async def _handle_request_closure(_ctx: DispatchContext) -> Mapping[str, Any]:
 def _exempt_lifecycle_v03(agent_ref: str, node_names: list[str]) -> None:
     """Declare every v0.3.0 node as an explicit no_executor exemption.
 
-    PR 2 lands the YAML and the new ``LLMContentExecutor`` module but
-    intentionally does NOT bind executors to nodes — that's PR 3 (T-254
-    ``register_lifecycle_v03``).  Without this exemption the lifespan
-    coverage validator would refuse to boot.  PR 3 deletes this helper
-    when it registers real bindings.
+    Used when ``register_all_executors`` is called without
+    ``v03_collaborators`` (e.g. test contexts where the LLM provider /
+    engine client / session factory aren't built).  Coverage validation
+    boots cleanly; a run started against this agent would still fail at
+    dispatch time naming the unbound node.
     """
-    reason = "FEAT-011 PR 2 scaffold; real executor binding lands in PR 3 (T-254)"
+    reason = "v0.3.0 collaborators not provided to register_all_executors"
     for node_name in node_names:
         no_executor(agent_ref, node_name, reason)
+
+
+# ---------------------------------------------------------------------------
+# v0.3.0 — production bindings (FEAT-011 / T-254)
+# ---------------------------------------------------------------------------
+
+
+def register_lifecycle_v03(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    llm_provider: LLMProvider,
+    session_factory: async_sessionmaker[AsyncSession],
+    max_corrections: int = 2,
+    actor: str | None = "lifecycle-agent",
+) -> None:
+    """Register the eight production bindings for ``lifecycle-agent@0.3.0``.
+
+    The mapping table lives in ``docs/design/feat-011-lifecycle-deterministic-port.md``
+    (section "Node-to-executor mapping table (v0.3.0)").  Composite nodes
+    chain LLM-content + engine via :class:`CompositeLLMEngineExecutor`
+    (Option 1 from the design doc).
+
+    PR 3 simplifications (documented in the FEAT-011 PR 3 body):
+
+    * ``generate_tasks`` collapses the T1xN fanout into a single engine
+      call — the production T1 fanout lands in a follow-up PR.
+    * ``request_implementation`` registers as a plain
+      :class:`HumanExecutor`; the post-resume T9 engine call is deferred
+      to PR 4 (T-256 may extend this with a composite human+engine
+      adapter).
+    * ``correct_implementation`` is a placeholder
+      :class:`LocalExecutor` that increments
+      ``correction_attempts[task_id]`` via ``__memory_patch`` and
+      returns ``outcome="rejected"`` — enough for the resolver's
+      ``correction_attempts_under_bound`` predicate.  T-258 (PR 4)
+      polishes this with the Approval-row write.
+    * ``terminate_correction_budget`` declares a ``no_executor``
+      exemption — it's a terminal failure node the runtime maps to
+      ``RunStatus.FAILED`` via the existing stop-condition pipeline.
+    """
+    if lifecycle_client is None:
+        raise RuntimeError(
+            "register_lifecycle_v03: lifecycle_client is required (engine-bound nodes need it)"
+        )
+
+    # Synthetic ``start`` entry node — the flow resolver treats
+    # ``entryNode`` as the previous-node marker, so the YAML declares
+    # ``start`` solely so its outgoing transition selects
+    # ``load_work_item`` as the first dispatched node.  ``start`` itself
+    # is never dispatched; satisfy coverage with an explicit exemption.
+    no_executor(
+        agent_ref,
+        "start",
+        "synthetic entry marker; never dispatched (resolver-level only)",
+    )
+
+    # Local imports to keep the bootstrap module's import graph small —
+    # mirrors the ``register_engine_executor`` pattern.
+    from app.modules.ai.executors.composite import CompositeLLMEngineExecutor
+    from app.modules.ai.executors.human import HumanExecutor
+    from app.modules.ai.executors.lifecycle_schemas import (
+        GeneratePlanResult,
+        GenerateTasksResult,
+        LoadWorkItemResult,
+        ReviewImplementationResult,
+    )
+    from app.modules.ai.executors.llm_content import LLMContentExecutor
+    from app.modules.ai.tools.lifecycle.memory import (
+        LifecycleMemory,
+        LifecycleTask,
+        WorkItemRef,
+        write_lifecycle_memory,
+    )
+
+    prompts_dir = Path(__file__).parent / "prompts" / "lifecycle"
+
+    def _load_prompt(name: str) -> str:
+        path = prompts_dir / f"{name}.md"
+        return path.read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Composite: load_work_item — LLM brief + engine W1
+    # ------------------------------------------------------------------
+
+    def _patch_load_work_item(result: Mapping[str, Any]) -> dict[str, Any]:
+        # Seed the typed lifecycle memory with the work-item ref the
+        # LLM parsed from the brief.  Subsequent nodes read this back.
+        try:
+            wi_type = str(result.get("work_item_id", "FEAT")).split("-", 1)[0] or "FEAT"
+        except Exception:
+            wi_type = "FEAT"
+        if wi_type not in ("FEAT", "BUG", "IMP"):
+            wi_type = "FEAT"
+        memory = LifecycleMemory(
+            work_item=WorkItemRef(
+                id=str(result.get("work_item_id", "")),
+                type=wi_type,  # type: ignore[arg-type]
+                title=str(result.get("title", "")),
+                path="",
+            )
+        )
+        return write_lifecycle_memory(memory)
+
+    registry.register(
+        agent_ref,
+        "load_work_item",
+        CompositeLLMEngineExecutor(
+            ref="composite:load_work_item",
+            llm_executor=LLMContentExecutor(
+                ref="llm:load_work_item",
+                system_prompt=_load_prompt("load_work_item"),
+                user_prompt_template="Synthesize the work-item brief at: {workItemPath}",
+                result_schema=LoadWorkItemResult,
+                llm_provider=llm_provider,
+            ),
+            transition_key="work_item.W1",
+            to_status="in_progress",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            memory_patch_builder=_patch_load_work_item,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Composite: generate_tasks — LLM task list + engine T2+T4 (collapsed)
+    # ------------------------------------------------------------------
+
+    def _patch_generate_tasks(result: Mapping[str, Any]) -> dict[str, Any]:
+        tasks_in: list[Mapping[str, Any]] = list(result.get("tasks") or [])
+        memory = LifecycleMemory(
+            tasks=[
+                LifecycleTask(
+                    id=str(t.get("id", "")),
+                    title=str(t.get("title", "")),
+                    executor=str(t.get("executor", "")) or None,
+                )
+                for t in tasks_in
+            ],
+            current_task_id=(str(tasks_in[0].get("id")) if tasks_in else None),
+        )
+        return write_lifecycle_memory(memory)
+
+    registry.register(
+        agent_ref,
+        "generate_tasks",
+        CompositeLLMEngineExecutor(
+            ref="composite:generate_tasks",
+            llm_executor=LLMContentExecutor(
+                ref="llm:generate_tasks",
+                system_prompt=_load_prompt("generate_tasks"),
+                user_prompt_template="Generate the task breakdown for work item id: {workItemId}",
+                result_schema=GenerateTasksResult,
+                llm_provider=llm_provider,
+            ),
+            # T1xN fanout collapsed into a single self-approve transition.
+            # PR 4 may split into T1xN + T2+T4 once a fanout primitive lands.
+            transition_key="task.T2_T4",
+            to_status="approved",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            memory_patch_builder=_patch_generate_tasks,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Pure engine: assign_task — T5
+    # ------------------------------------------------------------------
+
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "assign_task",
+        transition_key="task.T5",
+        to_status="assigned",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+    )
+
+    # ------------------------------------------------------------------
+    # Composite: generate_plan — LLM plan + engine T6+T7 (collapsed)
+    # ------------------------------------------------------------------
+
+    def _patch_generate_plan(result: Mapping[str, Any]) -> dict[str, Any]:
+        # Track that the named task now has a plan — the resolver's
+        # ``unplanned_tasks_remaining`` predicate reads
+        # ``memory['plans']`` (predicate-level dict, not the typed
+        # schema).  Keep both shapes coherent.
+        task_id = str(result.get("task_id", ""))
+        return {
+            "plans": {task_id: {"plan_markdown": result.get("plan_markdown")}},
+            "tasks": {task_id: {}},
+        }
+
+    registry.register(
+        agent_ref,
+        "generate_plan",
+        CompositeLLMEngineExecutor(
+            ref="composite:generate_plan",
+            llm_executor=LLMContentExecutor(
+                ref="llm:generate_plan",
+                system_prompt=_load_prompt("generate_plan"),
+                user_prompt_template="Author an implementation plan for task: {taskId}",
+                result_schema=GeneratePlanResult,
+                llm_provider=llm_provider,
+            ),
+            transition_key="task.T6_T7",
+            to_status="implementation_pending",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            memory_patch_builder=_patch_generate_plan,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Human: request_implementation
+    # PR 3 simplification: post-resume T9 engine call deferred to PR 4.
+    # ------------------------------------------------------------------
+
+    registry.register(
+        agent_ref,
+        "request_implementation",
+        HumanExecutor(
+            ref="human:request_implementation",
+            expected_signal_name="implementation-complete",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Composite: review_implementation — LLM verdict + engine T10 (always)
+    # The ``review_passed`` predicate routes the failure case to
+    # ``correct_implementation`` based on the LLM's verdict — but the
+    # engine call itself fires on every dispatch (Composite cannot
+    # branch on its own LLM result mid-dispatch).  T-258 / PR 4 may
+    # gate the engine call on ``verdict=='pass'``; for PR 3 the engine
+    # leg fires unconditionally and the resolver handles the routing
+    # via ``last_dispatch_result.verdict``.
+    # ------------------------------------------------------------------
+
+    def _patch_review(result: Mapping[str, Any]) -> dict[str, Any]:
+        # Mirror the verdict + feedback into the predicate-readable
+        # shape and return them to the runtime via the dispatch result
+        # (``review_passed`` reads ``last['verdict']`` directly).
+        return {
+            "review_history": [
+                {
+                    "task_id": str(result.get("task_id", "")),
+                    "verdict": str(result.get("verdict", "")),
+                    "feedback": str(result.get("feedback", "")),
+                }
+            ]
+        }
+
+    registry.register(
+        agent_ref,
+        "review_implementation",
+        CompositeLLMEngineExecutor(
+            ref="composite:review_implementation",
+            llm_executor=LLMContentExecutor(
+                ref="llm:review_implementation",
+                system_prompt=_load_prompt("review_implementation"),
+                user_prompt_template="Review the implementation for task: {taskId}",
+                result_schema=ReviewImplementationResult,
+                llm_provider=llm_provider,
+            ),
+            transition_key="task.T10",
+            to_status="ready_for_close",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            memory_patch_builder=_patch_review,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Local: correct_implementation — placeholder rejection writer
+    # ------------------------------------------------------------------
+
+    registry.register(
+        agent_ref,
+        "correct_implementation",
+        LocalExecutor(
+            ref="local:correct_implementation",
+            handler=_make_correct_implementation_handler(session_factory),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Pure engine: close_work_item — W6 (terminal)
+    # ------------------------------------------------------------------
+
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "close_work_item",
+        transition_key="work_item.W6",
+        to_status="closed",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+    )
+
+    # ------------------------------------------------------------------
+    # Terminal failure: terminate_correction_budget — emits an error
+    # envelope so the runtime's _ExecutorFailure handler maps the run to
+    # RunStatus.FAILED with stop_reason=ERROR.  Carries
+    # ``final_state.reason=correction_budget_exceeded`` via the
+    # envelope's ``detail`` for operator forensics.
+    # ------------------------------------------------------------------
+
+    async def _terminate_correction_budget_handler(_ctx: DispatchContext) -> Mapping[str, Any]:
+        # Returning outcome=error via a raised exception is the simplest
+        # path through LocalExecutor: it catches the exception and emits
+        # a failed envelope, which the runtime treats as terminal-with-error.
+        raise _CorrectionBudgetExceeded("correction_budget_exceeded")
+
+    registry.register(
+        agent_ref,
+        "terminate_correction_budget",
+        LocalExecutor(
+            ref="local:terminate_correction_budget",
+            handler=_terminate_correction_budget_handler,
+        ),
+    )
+
+
+class _CorrectionBudgetExceeded(RuntimeError):
+    """Sentinel: ``terminate_correction_budget`` reached.
+
+    Surfaced as a failed local-executor envelope; the runtime maps it to
+    ``RunStatus.FAILED`` via the ``_ExecutorFailure`` path.
+    """
+
+
+def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """Build the placeholder ``correct_implementation`` LocalExecutor handler.
+
+    Reads the current attempt count from ``RunMemory.data`` via the
+    injected session factory, increments it for the active task, and
+    returns the new count via ``__memory_patch``.  The returned envelope
+    also carries ``outcome="rejected"`` and ``task_id`` so the
+    resolver's ``correction_attempts_under_bound`` predicate can route
+    on the next iteration.
+
+    PR 3 simplification: no Approval row write yet (T-258 / PR 4).
+    """
+    from app.modules.ai.models import RunMemory as _RunMemory
+
+    async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
+        # Surface the active task id from the dispatch intake or the
+        # resolver's last-result echo (the runtime threads it via
+        # memory bookkeeping).
+        task_id = (
+            str(ctx.intake.get("taskId") or ctx.intake.get("task_id") or "")
+            or "unknown"
+        )
+
+        # Read-modify-write the counter inside the same handler.  The
+        # runtime's ``__memory_patch`` merge is shallow on the top-level
+        # ``correction_attempts`` key — it would overwrite the whole
+        # dict.  We read the existing value first so the patch carries
+        # the full updated map.
+        async with session_factory() as session:
+            row = await session.scalar(
+                select(_RunMemory).where(_RunMemory.run_id == ctx.run_id)
+            )
+            existing: dict[str, Any] = ((row.data if row is not None else {}) or {}).copy()
+        attempts: dict[str, Any] = dict(existing.get("correction_attempts") or {})
+        current = int(attempts.get(task_id, 0))
+        attempts[task_id] = current + 1
+
+        return {
+            "outcome": "rejected",
+            "task_id": task_id,
+            "__memory_patch": {"correction_attempts": attempts},
+        }
+
+    return _handler
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +680,9 @@ def register_engine_executor(
 
 __all__ = [
     "ExecutorCoverageError",
+    "LifecycleV03Collaborators",
     "register_all_executors",
     "register_engine_executor",
+    "register_lifecycle_v03",
     "run_coverage_validation",
 ]

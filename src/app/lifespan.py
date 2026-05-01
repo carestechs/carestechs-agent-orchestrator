@@ -102,7 +102,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _bootstrap_effector_registry(app)
 
     # FEAT-009/T-218: build the executor registry + coverage validation.
-    _bootstrap_executor_registry(app)
+    _bootstrap_executor_registry(app, session_factory=session_factory)
 
     try:
         yield
@@ -158,21 +158,32 @@ def _bootstrap_effector_registry(app: FastAPI) -> None:
     )
 
 
-def _bootstrap_executor_registry(app: FastAPI) -> None:
+def _bootstrap_executor_registry(
+    app: FastAPI,
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
     """Build the executor registry, register all v0.1.0 nodes, validate coverage.
 
     FEAT-009/T-218: every loaded agent's nodes must have a registered
     executor or a ``no_executor`` exemption. A gap raises at startup
     with the offending ``(agent_ref, node_name)`` tuples listed.
 
-    The registry is consumed by the runtime loop after the T-220 swap;
-    until then, the bindings exist solely to satisfy this validator.
+    FEAT-011/T-254: when ``lifecycle-agent@0.3.0`` is loaded and the
+    lifecycle engine client is available, build the v0.3.0 collaborator
+    bundle (engine client + LLM provider + session factory) and pass
+    it to ``register_all_executors``.  Without the collaborators, v0.3.0
+    nodes are exempted so the validator still boots — useful for dev
+    environments without an engine configured.
     """
     import os
     from pathlib import Path
 
+    from app.config import get_settings
+    from app.core.llm import get_llm_provider
     from app.modules.ai.executors.bootstrap import (
         ExecutorCoverageError,
+        LifecycleV03Collaborators,
         register_all_executors,
         run_coverage_validation,
     )
@@ -180,7 +191,19 @@ def _bootstrap_executor_registry(app: FastAPI) -> None:
 
     agents_dir = Path(os.environ.get("AGENTS_DIR", "agents"))
     registry = ExecutorRegistry()
-    register_all_executors(registry, agents_dir)
+
+    lifecycle_client = getattr(app.state, "lifecycle_engine_client", None)
+    v03_collaborators: LifecycleV03Collaborators | None
+    if lifecycle_client is None:
+        v03_collaborators = None
+    else:
+        v03_collaborators = LifecycleV03Collaborators(
+            lifecycle_client=lifecycle_client,
+            llm_provider=get_llm_provider(get_settings()),
+            session_factory=session_factory,
+        )
+
+    register_all_executors(registry, agents_dir, v03_collaborators=v03_collaborators)
     try:
         run_coverage_validation(registry, agents_dir)
     except ExecutorCoverageError as exc:

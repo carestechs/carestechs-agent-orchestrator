@@ -165,9 +165,16 @@ async def _write_state(
     memory_patch: dict[str, Any] | None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    import copy as _copy
+
+    from sqlalchemy.orm.attributes import flag_modified
+
     async with session_factory() as session:
         memory_row = await session.scalar(select(RunMemory).where(RunMemory.run_id == run_id))
-        data: dict[str, Any] = ((memory_row.data if memory_row is not None else {}) or {}).copy()
+        # Deep-copy to avoid mutating the SQLAlchemy-tracked snapshot in
+        # place — without it the JSON column's equality check sees the
+        # "old" value as already mutated and skips the UPDATE.
+        data: dict[str, Any] = _copy.deepcopy(memory_row.data if memory_row is not None else {}) or {}
         bookkeeping: dict[str, Any] = data.get(_MEMORY_NS) or {}
         bookkeeping["current_node"] = current_node
         bookkeeping["last_dispatch_result"] = last_dispatch_result
@@ -180,6 +187,7 @@ async def _write_state(
             session.add(RunMemory(run_id=run_id, data=data))
         else:
             memory_row.data = data
+            flag_modified(memory_row, "data")
         await session.commit()
 
 

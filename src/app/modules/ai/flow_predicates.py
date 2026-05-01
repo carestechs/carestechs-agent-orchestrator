@@ -86,22 +86,30 @@ def _correction_attempts_under_bound(  # pyright: ignore[reportUnusedFunction] -
 
 @register("review_passed")
 def _review_passed(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
-    _memory: Mapping[str, Any], last: Mapping[str, Any] | None
+    memory: Mapping[str, Any], last: Mapping[str, Any] | None
 ) -> bool:
-    """True iff ``last.verdict == "pass"``; False on ``"fail"``; raises otherwise.
+    """True iff the latest review verdict is ``"pass"``; False on ``"fail"``; raises otherwise.
 
     Reads ``result.verdict`` produced by the ``review_implementation`` node
     (LLM-content executor that returns a structured ``{verdict, feedback}``
-    payload). Any value other than ``"pass"`` / ``"fail"`` — including a
-    missing field — is a contract violation: the upstream executor must
-    constrain its output via ``result_schema`` so the predicate is total.
+    payload).  The v0.3.0 composite executor pattern wraps the LLM verdict
+    behind an engine transition, and the wake-delivered envelope's
+    ``result`` carries engine metadata only — so the predicate also falls
+    back to ``memory.review_history[-1].verdict``, which the composite
+    persists via its memory-patch builder.  Any value other than
+    ``"pass"`` / ``"fail"`` is a contract violation.
     """
-    if last is None:
-        raise ValueError(
-            "review_passed predicate: no dispatch result available; "
-            "the producing node (review_implementation) must run before this branch"
-        )
-    verdict = last.get("verdict")
+    verdict: Any = None
+    if last is not None:
+        verdict = last.get("verdict")
+    if verdict is None:
+        history_raw: Any = memory.get("review_history")
+        if isinstance(history_raw, list) and history_raw:
+            history_list = cast(list[Any], history_raw)
+            tail: Any = history_list[-1]
+            if isinstance(tail, Mapping):
+                tail_typed = cast(Mapping[str, Any], tail)
+                verdict = tail_typed.get("verdict")
     if verdict == "pass":
         return True
     if verdict == "fail":

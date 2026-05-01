@@ -43,18 +43,35 @@ class TestReviewPassedPredicate:
         with pytest.raises(ValueError, match="must be 'pass' or 'fail'"):
             predicate({}, {"task_id": "T-1"})
 
-    def test_no_last_raises(self) -> None:
+    def test_no_last_and_no_memory_history_raises(self) -> None:
         predicate = flow_predicates.get("review_passed")
-        with pytest.raises(ValueError, match="no dispatch result available"):
+        with pytest.raises(ValueError, match="must be 'pass' or 'fail'"):
             predicate({}, None)
 
-    def test_ignores_memory(self) -> None:
-        """Predicate is a pure function of the dispatch result; memory is irrelevant."""
+    def test_falls_back_to_memory_review_history(self) -> None:
+        """When ``last`` lacks ``verdict``, predicate reads ``memory.review_history[-1].verdict``.
+
+        FEAT-011 composite executors persist the LLM verdict to memory
+        before the engine wake leg, but the wake-delivered envelope's
+        ``result`` carries engine metadata only.  The fallback lets the
+        predicate stay accurate after the engine round-trip.
+        """
         predicate = flow_predicates.get("review_passed")
-        memory_one: dict[str, Any] = {"correction_attempts": {"T-1": 5}}
-        memory_two: dict[str, Any] = {}
-        envelope: dict[str, Any] = {"verdict": "pass"}
-        assert predicate(memory_one, envelope) == predicate(memory_two, envelope)
+        memory: dict[str, Any] = {
+            "review_history": [
+                {"task_id": "T-1", "verdict": "fail", "feedback": "older"},
+                {"task_id": "T-1", "verdict": "pass", "feedback": "later"},
+            ]
+        }
+        # ``last`` is the wake-delivered envelope: only engine metadata.
+        last: dict[str, Any] = {"correlation_id": "x", "transition_key": "task.T10"}
+        assert predicate(memory, last) is True
+
+    def test_last_verdict_takes_precedence_over_memory(self) -> None:
+        predicate = flow_predicates.get("review_passed")
+        memory: dict[str, Any] = {"review_history": [{"verdict": "fail"}]}
+        last: dict[str, Any] = {"verdict": "pass"}
+        assert predicate(memory, last) is True
 
 
 # ---------------------------------------------------------------------------
