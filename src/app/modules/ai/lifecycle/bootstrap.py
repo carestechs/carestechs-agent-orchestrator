@@ -150,3 +150,65 @@ async def _upsert_cache(
         .on_conflict_do_nothing(index_elements=["tenant_id", "name"])
     )
     await db.execute(stmt)
+
+
+# ---------------------------------------------------------------------------
+# BUG-005 — webhook subscription registration
+# ---------------------------------------------------------------------------
+
+
+async def ensure_engine_subscriptions(
+    client: FlowEngineLifecycleClient,
+    *,
+    workflow_ids: dict[str, uuid.UUID],
+    public_base_url: str,
+    webhook_secret: str,
+) -> None:
+    """Subscribe the orchestrator to ``item.transitioned`` for each workflow.
+
+    Without this, the engine fires transitions but has no active webhook
+    subscription to deliver them to — every ``EngineExecutor`` /
+    ``CompositeLLMEngineExecutor`` / ``SequenceEngineExecutor`` dispatch
+    would park on its supervisor future and time out.
+
+    Idempotent: a second boot for the same (workflow, url, event_type)
+    that returns ``409`` (or whatever the engine emits for "already
+    subscribed") is treated as success.  Any other ``EngineError`` is
+    surfaced — a misconfigured ingress URL or auth failure should fail
+    boot rather than silently swallow.
+
+    The callback URL is derived from ``Settings.public_base_url`` plus
+    the existing ``/hooks/engine/lifecycle/item-transitioned`` route
+    declared in ``modules/ai/router.py``.  The HMAC secret is the same
+    one ``RawBodyMiddleware`` uses to verify inbound signatures.
+    """
+    callback_url = public_base_url.rstrip("/") + "/hooks/engine/lifecycle/item-transitioned"
+    for name, workflow_id in workflow_ids.items():
+        try:
+            sub_id = await client.ensure_webhook_subscription(
+                url=callback_url,
+                event_type="item.transitioned",
+                workflow_id=workflow_id,
+                secret=webhook_secret,
+            )
+            logger.info(
+                "subscribed to engine %s webhook for workflow %s (subscription_id=%s, url=%s)",
+                "item.transitioned",
+                name,
+                sub_id,
+                callback_url,
+            )
+        except EngineError as exc:
+            if exc.engine_http_status == 409:
+                logger.info(
+                    "engine reports webhook subscription already exists for workflow %s "
+                    "(treating as success)",
+                    name,
+                )
+                continue
+            logger.error(
+                "failed to register engine webhook subscription for workflow %s: %s",
+                name,
+                exc,
+            )
+            raise

@@ -354,16 +354,56 @@ def register_lifecycle_v03(
         )
         return write_lifecycle_memory(memory)
 
+    async def _load_work_item_brief_file(ctx: DispatchContext) -> Mapping[str, Any]:
+        # BUG-005: the user prompt previously only carried the path
+        # string; the LLM had no way to read the file and would invent
+        # a title from the external ref.  Read the file from disk
+        # (resolved relative to ``Settings.repo_root``) and expose it
+        # as ``{workItemBrief}`` for the prompt template.
+        from pathlib import Path as _Path
+
+        from app.config import get_settings as _get_settings
+
+        raw_path = ctx.intake.get("workItemPath")
+        if not raw_path:
+            return {"workItemBrief": ""}
+        path = _Path(str(raw_path))
+        if not path.is_absolute():
+            path = _Path(_get_settings().repo_root) / path
+        try:
+            return {"workItemBrief": path.read_text(encoding="utf-8")}
+        except FileNotFoundError:
+            return {
+                "workItemBrief": (
+                    f"<!-- file not found at {path!s}; "
+                    "synthesize from the path's external ref alone -->"
+                )
+            }
+        except OSError as exc:
+            return {
+                "workItemBrief": (
+                    f"<!-- could not read {path!s}: {exc}; "
+                    "synthesize from the path's external ref alone -->"
+                )
+            }
+
     registry.register(
         agent_ref,
         "load_work_item",
         LLMContentExecutor(
             ref="llm:load_work_item",
             system_prompt=_load_prompt("load_work_item"),
-            user_prompt_template="Synthesize the work-item brief at: {workItemPath}",
+            user_prompt_template=(
+                "Synthesize a brief for the work item described in the file below. "
+                "The path is {workItemPath}; the full content follows.\n\n"
+                "----- BEGIN WORK ITEM BRIEF -----\n"
+                "{workItemBrief}\n"
+                "----- END WORK ITEM BRIEF -----\n"
+            ),
             result_schema=LoadWorkItemResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_load_work_item,
+            prompt_context_loader=_load_work_item_brief_file,
         ),
     )
 
