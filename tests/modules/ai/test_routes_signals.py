@@ -250,3 +250,94 @@ class TestNamespacedMemoryShape:
             headers=auth_headers,
         )
         assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# BUG-011 regression: duplicate signal with an active human dispatch must
+# wake the dispatch.  Pre-fix the wake was gated on ``created`` (the
+# dedupe-key check), so a second iteration of ``request_implementation``
+# (after a correction loop) parked indefinitely because the operator
+# re-sent the same ``(name, taskId)`` and the audit-trail dedupe
+# returned ``alreadyReceived=true`` → the wake never fired.
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateSignalWakesActiveDispatch:
+    @staticmethod
+    async def _seed_run_and_dispatch(
+        db: AsyncSession,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        from app.modules.ai.enums import DispatchMode, DispatchState
+        from app.modules.ai.models import Dispatch, Step
+
+        run = await _seed_run_with_tasks(db)
+        step = Step(
+            run_id=run.id,
+            step_number=1,
+            node_name="request_implementation",
+            node_inputs={},
+            status="dispatched",
+        )
+        db.add(step)
+        await db.flush()
+        dispatch = Dispatch(
+            step_id=step.id,
+            run_id=run.id,
+            executor_ref="human:request_implementation",
+            mode=DispatchMode.HUMAN.value,
+            state=DispatchState.DISPATCHED.value,
+            intake={},
+            started_at=datetime.now(UTC),
+            dispatched_at=datetime.now(UTC),
+        )
+        db.add(dispatch)
+        await db.commit()
+        await db.refresh(dispatch)
+        return run.id, dispatch.dispatch_id
+
+    async def test_duplicate_signal_completes_active_dispatch(
+        self,
+        client: AsyncClient,
+        auth_headers: dict[str, str],
+        db_session: AsyncSession,
+    ) -> None:
+        from app.modules.ai.enums import DispatchState
+        from app.modules.ai.models import Dispatch
+
+        run_id, dispatch_id = await self._seed_run_and_dispatch(db_session)
+        body = {"name": "implementation-complete", "taskId": "T-001"}
+
+        # First signal — created=true, RunSignal row inserted, dispatch
+        # wakes (no-op for this assertion since the dispatch is fresh).
+        first = await client.post(
+            f"/api/v1/runs/{run_id}/signals", json=body, headers=auth_headers
+        )
+        assert first.status_code == 202, first.text
+        assert first.json().get("meta") is None
+
+        # The first call already completed the dispatch.  Reset it to
+        # DISPATCHED to simulate the second iteration of the same
+        # ``request_implementation`` node (correction loop).
+        await db_session.refresh(await db_session.get(Dispatch, dispatch_id))
+        d = await db_session.get(Dispatch, dispatch_id)
+        assert d is not None
+        d.state = DispatchState.DISPATCHED.value
+        d.completed_at = None
+        await db_session.commit()
+
+        # Second signal — RunSignal dedupe says alreadyReceived=true,
+        # but the wake MUST fire and complete the new active dispatch.
+        second = await client.post(
+            f"/api/v1/runs/{run_id}/signals", json=body, headers=auth_headers
+        )
+        assert second.status_code == 202, second.text
+        assert second.json()["meta"] == {"alreadyReceived": True}
+
+        db_session.expire_all()
+        d_after = await db_session.get(Dispatch, dispatch_id)
+        assert d_after is not None
+        assert d_after.state == DispatchState.COMPLETED.value, (
+            f"BUG-011 regression: duplicate signal must wake the active "
+            f"human dispatch even when alreadyReceived=true; "
+            f"dispatch.state={d_after.state!r}"
+        )
