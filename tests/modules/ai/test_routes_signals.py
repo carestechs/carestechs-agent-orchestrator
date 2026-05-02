@@ -166,3 +166,87 @@ class TestRejections:
             json={"name": "implementation-complete", "taskId": "T-001"},
         )
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# BUG-009 regression: signal endpoint reader uses ``read_lifecycle_memory``
+# so the v0.3.0 namespaced memory shape (``lifecycle.v1.tasks``) is
+# accepted instead of returning 404 because the legacy hand-rolled
+# ``memory_data.get("tasks")`` only saw the top-level v0.1.0 list.
+# ---------------------------------------------------------------------------
+
+
+class TestNamespacedMemoryShape:
+    @staticmethod
+    async def _seed_run_with_namespaced_tasks(
+        db: AsyncSession,
+        *,
+        task_ids: tuple[str, ...] = ("T-001",),
+    ) -> Run:
+        from app.modules.ai.tools.lifecycle.memory import (
+            LIFECYCLE_MEMORY_NS,
+            LifecycleMemory,
+            LifecycleTask,
+            to_run_memory,
+        )
+
+        run = Run(
+            agent_ref="lifecycle-agent@0.3.0",
+            agent_definition_hash="sha256:" + "0" * 64,
+            intake={},
+            status=RunStatus.RUNNING,
+            started_at=datetime.now(UTC),
+            trace_uri="file:///tmp/t.jsonl",
+        )
+        db.add(run)
+        await db.flush()
+        memory_model = LifecycleMemory(
+            tasks=[LifecycleTask(id=tid, title=f"Task {tid}") for tid in task_ids],
+        )
+        memory_data: dict[str, Any] = {
+            LIFECYCLE_MEMORY_NS: to_run_memory(memory_model),
+            # Sidecar dicts that real v0.3.0 runs carry; the reader must
+            # NOT regress to looking at the top-level "tasks" slot just
+            # because something else writes one.
+            "plans": {"T-001": {"plan_markdown": "# x"}},
+            "__feat009": {"current_node": "request_implementation"},
+        }
+        db.add(RunMemory(run_id=run.id, data=memory_data))
+        await db.commit()
+        await db.refresh(run)
+        return run
+
+    async def test_v03_namespaced_task_accepted(
+        self,
+        client: AsyncClient,
+        auth_headers: dict[str, str],
+        db_session: AsyncSession,
+    ) -> None:
+        """Regression for the live lifecycle-agent@0.3.0 run that 404'd
+        on every signal because the reader looked at the top-level
+        ``tasks`` slot instead of the canonical ``lifecycle.v1.tasks``."""
+        run = await self._seed_run_with_namespaced_tasks(
+            db_session, task_ids=("T-001",)
+        )
+        resp = await client.post(
+            f"/api/v1/runs/{run.id}/signals",
+            json={"name": "implementation-complete", "taskId": "T-001"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 202, resp.text
+
+    async def test_v03_unknown_task_still_404s(
+        self,
+        client: AsyncClient,
+        auth_headers: dict[str, str],
+        db_session: AsyncSession,
+    ) -> None:
+        run = await self._seed_run_with_namespaced_tasks(
+            db_session, task_ids=("T-001",)
+        )
+        resp = await client.post(
+            f"/api/v1/runs/{run.id}/signals",
+            json={"name": "implementation-complete", "taskId": "T-999"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 404, resp.text

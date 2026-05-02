@@ -291,14 +291,18 @@ async def send_signal(
 
     memory_row = await db.scalar(select(RunMemory).where(RunMemory.run_id == run_id))
     memory_data: dict[str, Any] = (memory_row.data if memory_row is not None else {}) or {}
-    tasks_raw: Any = memory_data.get("tasks") or []
-    known_task_ids: set[str] = set()
-    if isinstance(tasks_raw, list):
-        for t in tasks_raw:  # type: ignore[assignment]
-            if isinstance(t, dict):
-                raw_id = t.get("id")  # type: ignore[attr-defined]
-                if isinstance(raw_id, str):
-                    known_task_ids.add(raw_id)
+    # Use the canonical accessor so this reader stays aligned with every
+    # other ``RunMemory`` reader in the codebase.  ``read_lifecycle_memory``
+    # honours the ``lifecycle.v1`` namespace first (FEAT-011 shape) and
+    # falls back to the v0.1.0 top-level shape — the previous hand-rolled
+    # ``memory_data.get("tasks")`` only worked under v0.1.0 and was a
+    # silent 404 under v0.3.0 because the canonical list lives at
+    # ``lifecycle.v1.tasks`` and the top-level ``tasks`` slot is either
+    # absent or a sidecar dict written by other patches.
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(memory_data)
+    known_task_ids: set[str] = {task.id for task in lifecycle_memory.tasks}
     if task_id not in known_task_ids:
         raise NotFoundError(f"task not found in run: {task_id}")
 
