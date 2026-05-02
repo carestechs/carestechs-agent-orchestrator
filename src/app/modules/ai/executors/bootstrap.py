@@ -548,7 +548,6 @@ def register_lifecycle_v03(
         task_id = str(result.get("task_id", ""))
         return {
             "plans": {task_id: {"plan_markdown": result.get("plan_markdown")}},
-            "tasks": {task_id: {}},
         }
 
     async def _load_current_task_body(ctx: DispatchContext) -> Mapping[str, Any]:

@@ -53,10 +53,25 @@ def known() -> frozenset[str]:
 def _unplanned_tasks_remaining(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     memory: Mapping[str, Any], _last: Mapping[str, Any] | None
 ) -> bool:
-    """True iff ``memory.tasks`` contains a task without an entry in ``memory.plans``."""
-    tasks = cast(Mapping[str, Any], memory.get("tasks") or {})
+    """True iff any task in ``lifecycle.v1.tasks`` has no entry in ``memory.plans``.
+
+    Reads the canonical task list via ``read_lifecycle_memory`` (the
+    same accessor used by every other lifecycle reader) and matches it
+    against the top-level ``plans`` dict written by ``_patch_generate_plan``.
+
+    Previously this read top-level ``memory["tasks"]`` directly — that
+    slot is a sidecar written *only* by ``_patch_generate_plan`` for
+    already-planned tasks, so the predicate was always-False on
+    multi-task work items (the not-yet-planned tasks never appeared in
+    the sidecar to compare against).  Single-task items got lucky.
+    """
+    # Lazy import — flow_predicates is reachable from the resolver
+    # before any lifecycle module has been imported.
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(memory)
     plans = cast(Mapping[str, Any], memory.get("plans") or {})
-    return any(task_id not in plans for task_id in tasks)
+    return any(task.id not in plans for task in lifecycle_memory.tasks)
 
 
 @register("correction_attempts_under_bound")

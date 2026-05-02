@@ -98,13 +98,37 @@ class TestExecutorTerminalShortCircuit:
 
 
 class TestPredicateBranch:
+    @staticmethod
+    def _memory(*, task_ids: tuple[str, ...], planned: tuple[str, ...]) -> dict[str, Any]:
+        """Build memory in the canonical ``lifecycle.v1`` shape.
+
+        BUG-009: pre-fix this test seeded a top-level ``{"tasks": {id:{}}}``
+        sidecar that the predicate happened to read, codifying the broken
+        always-False behaviour for the multi-task case.  The predicate
+        now reads ``lifecycle.v1.tasks`` via ``read_lifecycle_memory``.
+        """
+        from app.modules.ai.tools.lifecycle.memory import (
+            LIFECYCLE_MEMORY_NS,
+            LifecycleMemory,
+            LifecycleTask,
+            to_run_memory,
+        )
+
+        memory_model = LifecycleMemory(
+            tasks=[LifecycleTask(id=tid, title=f"Task {tid}") for tid in task_ids],
+        )
+        return {
+            LIFECYCLE_MEMORY_NS: to_run_memory(memory_model),
+            "plans": {tid: "..." for tid in planned},
+        }
+
     def test_unplanned_tasks_remaining_true(self) -> None:
-        memory = {"tasks": {"T-1": {}, "T-2": {}}, "plans": {"T-1": "..."}}
+        memory = self._memory(task_ids=("T-1", "T-2"), planned=("T-1",))
         result = resolve_next(_DECLARATION, "request_plan", memory=memory, last_dispatch_result={})
         assert result == NextNode(name="request_plan")
 
     def test_unplanned_tasks_remaining_false(self) -> None:
-        memory = {"tasks": {"T-1": {}}, "plans": {"T-1": "..."}}
+        memory = self._memory(task_ids=("T-1",), planned=("T-1",))
         result = resolve_next(_DECLARATION, "request_plan", memory=memory, last_dispatch_result={})
         assert result == NextNode(name="request_implementation")
 
