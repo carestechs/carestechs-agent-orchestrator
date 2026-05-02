@@ -195,6 +195,127 @@ class TestSuccessPath:
             assert row.entity_type == "task"
 
 
+class TestWakeRaceFix:
+    """The dispatch row's ``intake.correlation_id`` must be visible to a
+    fresh session *before* the engine's ``transition_item`` HTTP call
+    returns, so a webhook firing within the call window can still match.
+
+    Without the split-tx fix the engine fires the webhook back faster
+    than the originating tx commits, the reactor's wake query
+    (``Dispatch.intake['correlation_id'].astext == str(corr)``) misses,
+    and the dispatch parks until the runtime times out.
+    """
+
+    async def test_intake_correlation_id_committed_before_http_call(
+        self,
+        engine: AsyncEngine,
+        lifecycle_client: FlowEngineLifecycleClient,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        from datetime import UTC
+        from datetime import datetime as _dt
+
+        from app.modules.ai.enums import DispatchMode, DispatchState
+        from app.modules.ai.models import Dispatch, Run, RunStatus, Step
+
+        # Seed a real Dispatch row so the executor has something to
+        # update (mimics what the runtime commits before invoking the
+        # executor).
+        item_id = uuid.uuid4()
+        dispatch_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+        step_id = uuid.uuid4()
+        async with session_factory() as session:
+            session.add(
+                Run(
+                    id=run_id,
+                    agent_ref="t@0.1.0",
+                    agent_definition_hash="sha256:" + "0" * 64,
+                    intake={},
+                    status=RunStatus.PENDING,
+                    started_at=_dt.now(UTC),
+                    trace_uri="file:///tmp/x.jsonl",
+                )
+            )
+            session.add(
+                Step(
+                    id=step_id,
+                    run_id=run_id,
+                    step_number=1,
+                    node_name="n",
+                    node_inputs={},
+                    status="pending",
+                )
+            )
+            await session.flush()
+            d = Dispatch(
+                dispatch_id=dispatch_id,
+                step_id=step_id,
+                run_id=run_id,
+                executor_ref="engine:work_item.W2",
+                mode=DispatchMode.ENGINE.value,
+                state=DispatchState.DISPATCHED.value,
+                intake={"engineItemId": str(item_id), "runId": str(run_id), "nodeName": "n"},
+                started_at=_dt.now(UTC),
+                dispatched_at=_dt.now(UTC),
+            )
+            session.add(d)
+            await session.commit()
+
+        observed_intake_during_http: list[dict[str, object]] = []
+
+        async def _on_http(_request: object) -> Response:
+            # The HTTP call is firing — at this exact moment the
+            # outbox + intake commit MUST already be visible to a
+            # fresh session, otherwise a webhook arriving here would
+            # miss the wake.
+            async with session_factory() as session:
+                row = await session.get(Dispatch, dispatch_id)
+                assert row is not None
+                observed_intake_during_http.append(dict(row.intake or {}))
+            return Response(200, json={"data": {"id": "run-abc"}})
+
+        with respx.mock(base_url=_BASE, assert_all_mocked=False) as rx:
+            rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
+            rx.post(f"/api/items/{item_id}/transitions").mock(side_effect=_on_http)
+            executor = _executor(lifecycle_client, session_factory)
+            ctx = DispatchContext(
+                dispatch_id=dispatch_id,
+                run_id=run_id,
+                step_id=step_id,
+                agent_ref="t@0.1.0",
+                node_name="n",
+                intake={"engineItemId": str(item_id)},
+            )
+            env = await executor.dispatch(ctx)
+
+        assert env.state.value == "dispatched"
+        assert len(observed_intake_during_http) == 1
+        intake_during = observed_intake_during_http[0]
+        try:
+            assert intake_during.get("correlation_id") == str(env.correlation_id), (
+                "BUG/wake-race regression: Dispatch.intake.correlation_id must be "
+                "committed BEFORE the transition_item HTTP call returns — "
+                "otherwise webhooks arriving inside the call window can't match."
+            )
+            assert intake_during.get("transition_key") == "work_item.W2"
+            # Runtime keys preserved.
+            assert intake_during.get("runId") == str(run_id)
+            assert intake_during.get("nodeName") == "n"
+        finally:
+            # The test seeds Run/Step/Dispatch rows that bypass the
+            # SAVEPOINT-rolled-back ``db_session`` fixture (because we
+            # use ``session_factory`` directly to commit the seed).
+            # Tear them down explicitly to keep cross-test isolation.
+            async with session_factory() as session:
+                await session.execute(
+                    Dispatch.__table__.delete().where(Dispatch.dispatch_id == dispatch_id)
+                )
+                await session.execute(Step.__table__.delete().where(Step.id == step_id))
+                await session.execute(Run.__table__.delete().where(Run.id == run_id))
+                await session.commit()
+
+
 class TestFailurePaths:
     async def test_engine_4xx_returns_failed_no_outbox_row(
         self,

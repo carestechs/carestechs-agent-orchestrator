@@ -37,10 +37,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sqlalchemy import delete as _sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import EngineError
+from app.modules.ai.enums import DispatchOutcome, DispatchState
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
+from app.modules.ai.models import Dispatch as _Dispatch
 from app.modules.ai.models import PendingAuxWrite
 from app.modules.ai.schemas import DispatchEnvelope
 
@@ -158,12 +161,36 @@ class EngineExecutor:
                     detail=f"engine executor: malformed engineItemId={item_id_raw!r}: {exc}",
                 )
 
-        # One transaction: outbox row + engine call.  Engine 4xx/5xx
-        # raises ``EngineError``; the ``async with begin()`` exit rolls
-        # the outbox insert back, so on failure no aux row leaks.
-        signal_name = self._transition_key  # carries the transition tag
+        # Split-tx wake-race fix.  The engine fires its
+        # ``item.transitioned`` webhook back to the orchestrator within
+        # tens of milliseconds of accepting the transition — often
+        # *before* the originating ``transition_item`` call returns.
+        # When that happens, the reactor's wake-leg query
+        # (``Dispatch.intake['correlation_id'].astext == str(corr)``)
+        # cannot match this dispatch unless ``intake.correlation_id`` is
+        # already committed.  So:
+        #
+        #   tx 1 (commits *before* HTTP): write the outbox row + stamp
+        #     correlation_id / transition_key / engineItemId onto
+        #     ``Dispatch.intake``.  Webhook arriving any time after this
+        #     point can match.
+        #   HTTP call: ``transition_item``.  Outside any tx.
+        #   tx 2 (only on engine failure, compensating): mark Dispatch
+        #     FAILED and remove the outbox row.
+        #
+        # Restart safety is preserved: if the orchestrator crashes
+        # between tx 1 commit and the HTTP call, ``reconcile-dispatches``
+        # observes a dispatched row with no engine effect, calls
+        # ``get_item_state`` to confirm, and resolves accordingly.
+        signal_name = self._transition_key
+        envelope_intake: dict[str, Any] = {
+            **ctx.intake,
+            "correlation_id": str(correlation_id),
+            "transition_key": self._transition_key,
+            "engineItemId": str(item_id),
+        }
+        dispatched_at = datetime.now(UTC)
         try:
-            engine_run_id: str | None = None
             async with self._session_factory() as session, session.begin():
                 session.add(
                     PendingAuxWrite(
@@ -178,14 +205,50 @@ class EngineExecutor:
                         },
                     )
                 )
-                response = await self._client.transition_item(
-                    item_id=item_id,
-                    to_status=self._to_status,
-                    correlation_id=correlation_id,
-                    actor=self._actor,
-                )
-                engine_run_id = _extract_engine_run_id(response)
+                dispatch_row = await session.get(_Dispatch, ctx.dispatch_id)
+                if dispatch_row is not None:
+                    merged = {**(dispatch_row.intake or {}), **envelope_intake}
+                    # Never let executor stamps stomp the runtime's own
+                    # bookkeeping keys.
+                    merged.pop("runId", None)
+                    merged.pop("nodeName", None)
+                    merged.update(
+                        {
+                            k: v
+                            for k, v in (dispatch_row.intake or {}).items()
+                            if k in ("runId", "nodeName")
+                        }
+                    )
+                    dispatch_row.intake = merged
+        except Exception as exc:
+            logger.exception(
+                "engine executor %s pre-flight tx failed",
+                self._ref,
+                extra={"dispatch_id": str(ctx.dispatch_id)},
+            )
+            return self._failed(
+                ctx,
+                started=started,
+                correlation_id=correlation_id,
+                detail=f"pre_flight_tx_failed: {type(exc).__name__}: {exc}",
+            )
+
+        # HTTP call — outside any tx, after the outbox + intake commit.
+        engine_run_id: str | None = None
+        try:
+            response = await self._client.transition_item(
+                item_id=item_id,
+                to_status=self._to_status,
+                correlation_id=correlation_id,
+                actor=self._actor,
+            )
+            engine_run_id = _extract_engine_run_id(response)
         except EngineError as exc:
+            await self._compensate_failure(
+                dispatch_id=ctx.dispatch_id,
+                correlation_id=correlation_id,
+                reason=f"engine_error: {exc}",
+            )
             return self._failed(
                 ctx,
                 started=started,
@@ -194,9 +257,14 @@ class EngineExecutor:
             )
         except Exception as exc:
             logger.exception(
-                "engine executor %s dispatch failed unexpectedly",
+                "engine executor %s HTTP call raised unexpectedly",
                 self._ref,
                 extra={"dispatch_id": str(ctx.dispatch_id)},
+            )
+            await self._compensate_failure(
+                dispatch_id=ctx.dispatch_id,
+                correlation_id=correlation_id,
+                reason=f"{type(exc).__name__}: {exc}",
             )
             return self._failed(
                 ctx,
@@ -205,14 +273,9 @@ class EngineExecutor:
                 detail=f"{type(exc).__name__}: {exc}",
             )
 
-        # The envelope's intake reflects the *resolved* engine target so
-        # the persisted dispatch row is a truthful audit record.  The
-        # runtime merges this back into ``Dispatch.intake`` after the
-        # executor returns; without this, the intake would still show
-        # the run-level engineItemId (work item) for task-scoped
-        # dispatches whose resolver picked a different id.
-        envelope_intake: dict[str, Any] = dict(ctx.intake)
-        envelope_intake["engineItemId"] = str(item_id)
+        # ``envelope_intake`` was already built + committed to the
+        # dispatch row in tx 1 above; reuse it on the envelope for
+        # symmetry with the runtime's post-dispatch update path.
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
             step_id=ctx.step_id,
@@ -222,11 +285,46 @@ class EngineExecutor:
             state="dispatched",  # type: ignore[arg-type]
             intake=envelope_intake,
             started_at=started,
-            dispatched_at=datetime.now(UTC),
+            dispatched_at=dispatched_at,
             correlation_id=correlation_id,
             transition_key=self._transition_key,
             engine_run_id=engine_run_id,
         )
+
+    async def _compensate_failure(
+        self,
+        *,
+        dispatch_id: uuid.UUID,
+        correlation_id: uuid.UUID,
+        reason: str,
+    ) -> None:
+        """Reverse the pre-flight tx after the engine call fails.
+
+        Marks the dispatch as ``failed`` (state-machine transition
+        DISPATCHED → FAILED) and removes the outbox row so a stray
+        webhook for an unrelated transition can't accidentally
+        materialise it.  Idempotent: missing rows are no-ops.
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                dispatch_row = await session.get(_Dispatch, dispatch_id)
+                if dispatch_row is not None and dispatch_row.state == DispatchState.DISPATCHED.value:
+                    dispatch_row.mark_failed(
+                        at=datetime.now(UTC),
+                        outcome=DispatchOutcome.ERROR,
+                        detail=reason,
+                    )
+                await session.execute(
+                    _sql_delete(PendingAuxWrite).where(
+                        PendingAuxWrite.correlation_id == correlation_id
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "engine executor %s compensating tx failed (dispatch_id=%s)",
+                self._ref,
+                dispatch_id,
+            )
 
     def _failed(
         self,
