@@ -323,19 +323,35 @@ async def send_signal(
             await trace.record_operator_signal(run_id, dto)
         except Exception:
             logger.warning("trace write failed for operator signal", exc_info=True)
-        supervisor.deliver_signal(run_id, name, task_id, payload)
-        # FEAT-009 / T-217: if a human-executor dispatch is awaiting this
-        # signal, deliver to its future as well. Pre-FEAT-009 callers (no
-        # dispatch row in flight) hit a no-op; the legacy ``deliver_signal``
-        # path above is what wakes them.
-        await _deliver_to_human_dispatch(
-            db,
-            run_id=run_id,
-            signal_name=name,
-            task_id=task_id,
-            payload=payload,
-            supervisor=supervisor,
-        )
+
+    # BUG-011: wake mechanisms fire on every signal, not just the first.
+    # The ``RunSignal`` row's ``(run_id, name, task_id)`` dedupe key is an
+    # audit-trail contract — second iterations of the same human-pause
+    # node (e.g. ``request_implementation`` after a correction loop) get
+    # ``created=False`` because the *audit row* already exists, but the
+    # *dispatch* awaiting this signal is a brand-new row.  Gating the
+    # wake on ``created`` left the second pause hung indefinitely.
+    #
+    # Both wake paths are safe under duplicate delivery:
+    #   * ``supervisor.deliver_signal`` (legacy v0.1.0 buffered path)
+    #     overwrites the buffer for ``(run_id, name, task_id)`` and sets
+    #     the event if a waiter is parked — no-op when no waiter exists.
+    #   * ``_deliver_to_human_dispatch`` filters by ``state=DISPATCHED``
+    #     so it only matches an *active* dispatch row; the previous
+    #     iteration's dispatch is already ``COMPLETED`` and is skipped.
+    supervisor.deliver_signal(run_id, name, task_id, payload)
+    # FEAT-009 / T-217: if a human-executor dispatch is awaiting this
+    # signal, deliver to its future as well. Pre-FEAT-009 callers (no
+    # dispatch row in flight) hit a no-op; the legacy ``deliver_signal``
+    # path above is what wakes them.
+    await _deliver_to_human_dispatch(
+        db,
+        run_id=run_id,
+        signal_name=name,
+        task_id=task_id,
+        payload=payload,
+        supervisor=supervisor,
+    )
 
     return dto, created
 
