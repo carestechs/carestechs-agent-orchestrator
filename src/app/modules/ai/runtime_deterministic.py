@@ -215,11 +215,36 @@ async def _execute_node(
     started_at = datetime.now(UTC)
 
     # Thread the run's intake into every dispatch so executors can read
-    # caller-supplied parameters (e.g. ``workItemPath``).
+    # caller-supplied parameters (e.g. ``workItemPath``).  Also surface
+    # ``taskId`` from ``LifecycleMemory.current_task_id`` so per-task
+    # bindings (``generate_plan``, ``review_implementation``,
+    # ``correct_implementation``) can read it from the dispatch intake
+    # without each binding repeating the memory-lookup boilerplate.
+    # This is the runtime-layer counterpart to FEAT-011's per-binding
+    # ``target_id_resolver`` (which addresses the *engine* item id);
+    # ``taskId`` is the *symbolic* external ref (e.g. ``T-001``) that
+    # LLM-content templates substitute into prompts and that
+    # ``correct_implementation`` keys its Approval lookup on.
     async with session_factory() as session:
         run_row = await session.get(Run, run_id)
         run_intake: dict[str, Any] = (run_row.intake if run_row is not None else {}) or {}
+        mem_row = await session.scalar(
+            select(RunMemory).where(RunMemory.run_id == run_id)
+        )
+        mem_data: dict[str, Any] = (mem_row.data if mem_row is not None else {}) or {}
     intake = {**run_intake, **_build_node_intake(agent, run_id, node_name)}
+    # Ingest the lifecycle agent's current_task_id from memory.  Lazy
+    # import keeps the runtime's import-quarantine guard intact (the
+    # ``app.modules.ai.tools.lifecycle`` namespace is only reachable
+    # when the runtime *runs* against a lifecycle agent, not when the
+    # module is imported).  Skipped when the agent has no lifecycle
+    # namespace — ``read_lifecycle_memory`` returns an empty model and
+    # the ``setdefault`` is a no-op.
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(mem_data)
+    if lifecycle_memory.current_task_id is not None:
+        intake.setdefault("taskId", lifecycle_memory.current_task_id)
 
     async with session_factory() as session:
         step = Step(
