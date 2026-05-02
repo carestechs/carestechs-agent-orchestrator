@@ -229,6 +229,7 @@ FEAT-002's runtime loop has a few non-obvious invariants worth calling out:
 - **Priority order in `stop_conditions.evaluate`** (first match wins): `cancelled > error > budget_exceeded > policy_terminated > done_node`. User intent never masks a concurrent failure; a failure never masks a budget trip; etc.
 - **Reserved tool name `terminate`.** The tool builder appends it to every tool list; selecting it stops the run with `policy_terminated`. Node names MUST NOT collide — the agent loader rejects them.
 - **Step status is monotonic.** `reconciliation.next_step_state` rejects any event that would roll the step backward. A late `node_started` after `node_finished` is a no-op; the event is still persisted for forensics.
+- **`Run.status` flips to `paused` while parked on a `mode=human` dispatch (IMP-002 / T-269); engine and remote waits keep `running`.** The deterministic runtime owns the flip — `HumanExecutor` stays a passive descriptor. The flip-back to `running` happens in a `finally` so the resume covers normal delivery, timeout, and exception paths, and is terminal-guarded so a concurrent cancel that lands during the wait stays `cancelled`. Reach for `paused` to mean "blocked on an external party that owes work back" — not "waiting on an internal callback that's about to arrive."
 
 ### LLM Providers
 
