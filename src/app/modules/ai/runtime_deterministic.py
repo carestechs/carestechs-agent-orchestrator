@@ -336,6 +336,14 @@ async def _execute_node(
                     await session.commit()
         # Non-terminal: webhook will deliver the terminal envelope.
         timeout = binding.timeout_seconds if binding.timeout_seconds is not None else float(dispatch_timeout_seconds)
+        # IMP-002 / T-269: flip Run.status → PAUSED while parked on a
+        # ``mode=human`` dispatch.  Engine and remote waits keep
+        # ``running`` — those are not human-handoff waits.  Use the
+        # binding's mode (a ClassVar source-of-truth), not envelope.mode
+        # which can lie if the executor synthesised a failure.
+        is_human_pause = binding.executor.mode == DispatchMode.HUMAN
+        if is_human_pause:
+            await _mark_paused(run_id, session_factory)
         try:
             envelope = await asyncio.wait_for(supervisor.await_dispatch(dispatch_id), timeout=timeout)
         except TimeoutError:
@@ -349,6 +357,12 @@ async def _execute_node(
             await _mark_dispatch_failed(
                 dispatch_id, detail=envelope.detail or "timeout", session_factory=session_factory
             )
+        finally:
+            if is_human_pause:
+                # Resume.  ``_mark_running`` is terminal-guarded — a
+                # concurrent cancel that landed during the wait stays
+                # cancelled.
+                await _mark_running(run_id, session_factory)
 
     # Record terminal state on the persisted Dispatch + Step rows.
     await _commit_terminal(
@@ -553,7 +567,36 @@ async def _mark_running(
         run_row = await session.get(Run, run_id)
         if run_row is None:
             return
+        if RunStatus(run_row.status) in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        ):
+            return
         run_row.status = RunStatus.RUNNING
+        await session.commit()
+
+
+async def _mark_paused(
+    run_id: uuid.UUID,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Flip the run to PAUSED while awaiting an external (human) action.
+
+    Idempotent and terminal-guarded — a concurrent cancel that lands
+    while the loop is parked must not be stomped back to ``paused``.
+    """
+    async with session_factory() as session:
+        run_row = await session.get(Run, run_id)
+        if run_row is None:
+            return
+        if RunStatus(run_row.status) in (
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+        ):
+            return
+        run_row.status = RunStatus.PAUSED
         await session.commit()
 
 
