@@ -131,6 +131,24 @@ async def handle_transition(
     test fixtures that don't care about effectors free of registry
     boilerplate.
     """
+    # Diagnostic: log every webhook arrival at the top of the pipeline
+    # so an operator can see (a) what the engine actually sent, (b) what
+    # the orchestrator parsed.  The downstream reactor steps mostly
+    # succeed silently or log only at DEBUG, so without this line a run
+    # whose webhooks all delivered cleanly produces no output and
+    # masquerades as the reactor never running.
+    corr = webhook_correlation_id(event)
+    logger.info(
+        "lifecycle webhook arrived: item_id=%s workflow_id=%s "
+        "to_status=%s from_status=%s correlation_id=%s triggered_by=%r",
+        event.item_id,
+        event.workflow_id,
+        event.data.to_status,
+        event.data.from_status,
+        corr,
+        event.data.triggered_by,
+    )
+
     workflow_name = None
     if workflow_name_by_id is not None:
         workflow_name = workflow_name_by_id.get(event.workflow_id)
@@ -150,7 +168,6 @@ async def handle_transition(
     # correlation before firing derivations — downstream work that reads
     # aux rows (W5 via child-task counts, effectors that inspect latest
     # Approval/TaskImplementation) expects them already committed.
-    corr = webhook_correlation_id(event)
     if corr is not None:
         await _materialize_aux(db, corr)
 
