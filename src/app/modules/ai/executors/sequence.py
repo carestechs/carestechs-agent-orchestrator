@@ -39,11 +39,14 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sqlalchemy import delete as _sql_delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import EngineError
+from app.modules.ai.enums import DispatchOutcome, DispatchState
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.executors.engine import TargetIdResolver
+from app.modules.ai.models import Dispatch as _Dispatch
 from app.modules.ai.models import PendingAuxWrite
 from app.modules.ai.schemas import DispatchEnvelope
 
@@ -93,15 +96,40 @@ class SequenceEngineExecutor:
                 detail=item_id.detail,
             )
 
-        last_engine_run_id: str | None = None
-        for hop_index, (transition_key, to_status) in enumerate(self._hops, start=1):
-            correlation_id = uuid.uuid4()
-            last_correlation_id = correlation_id
-            try:
-                async with self._session_factory() as session, session.begin():
+        # Split-tx wake-race fix.  Mirrors ``EngineExecutor`` /
+        # ``CompositeLLMEngineExecutor``: pre-commit ALL outbox rows +
+        # stamp the *last* hop's correlation onto Dispatch.intake
+        # before any HTTP call fires.  The last hop's correlation is
+        # what the reactor's wake-leg matches; intermediate webhooks
+        # log a wake-miss WARNING (correctly — they shouldn't wake)
+        # but materialise their own outbox rows on arrival.
+        #
+        #   tx 1 (commits *before* HTTP):
+        #     - INSERT N PendingAuxWrite rows (one per hop)
+        #     - stamp Dispatch.intake.correlation_id = LAST hop's correlation
+        #   HTTP iterate: transition_item per hop in order.
+        #   tx 2 (compensating, on hop k failure):
+        #     - mark Dispatch FAILED
+        #     - DELETE remaining outbox rows (hops k..N already-fired
+        #       hops' rows may have been materialised by the reactor;
+        #       deletion is idempotent / silent on missing rows).
+        hop_correlations: list[uuid.UUID] = [uuid.uuid4() for _ in self._hops]
+        last_correlation_id = hop_correlations[-1]
+        envelope_intake: dict[str, Any] = {
+            **ctx.intake,
+            "correlation_id": str(last_correlation_id),
+            "transition_key": self._hops[-1][0],
+            "engineItemId": str(item_id),
+        }
+        dispatched_at = datetime.now(UTC)
+        try:
+            async with self._session_factory() as session, session.begin():
+                for hop_corr, (transition_key, to_status) in zip(
+                    hop_correlations, self._hops, strict=True
+                ):
                     session.add(
                         PendingAuxWrite(
-                            correlation_id=correlation_id,
+                            correlation_id=hop_corr,
                             signal_name=transition_key,
                             entity_type=_entity_type_from_key(transition_key),
                             entity_id=item_id,
@@ -112,14 +140,49 @@ class SequenceEngineExecutor:
                             },
                         )
                     )
-                    response = await self._client.transition_item(
-                        item_id=item_id,
-                        to_status=to_status,
-                        correlation_id=correlation_id,
-                        actor=self._actor,
-                    )
-                    last_engine_run_id = _extract_engine_run_id(response)
+                dispatch_row = await session.get(_Dispatch, ctx.dispatch_id)
+                if dispatch_row is not None:
+                    merged = {**(dispatch_row.intake or {}), **envelope_intake}
+                    for k in ("runId", "nodeName"):
+                        if k in (dispatch_row.intake or {}):
+                            merged[k] = (dispatch_row.intake or {})[k]
+                    dispatch_row.intake = merged
+        except Exception as exc:
+            logger.exception(
+                "sequence executor %s pre-flight tx failed",
+                self._ref,
+                extra={"dispatch_id": str(ctx.dispatch_id)},
+            )
+            return self._failed(
+                ctx,
+                started=started,
+                correlation_id=last_correlation_id,
+                transition_key=self._hops[-1][0],
+                detail=f"pre_flight_tx_failed: {type(exc).__name__}: {exc}",
+            )
+
+        # HTTP iterate — outside any tx, after the outbox + intake commit.
+        last_engine_run_id: str | None = None
+        for hop_index, (correlation_id, (transition_key, to_status)) in enumerate(
+            zip(hop_correlations, self._hops, strict=True), start=1
+        ):
+            try:
+                response = await self._client.transition_item(
+                    item_id=item_id,
+                    to_status=to_status,
+                    correlation_id=correlation_id,
+                    actor=self._actor,
+                )
+                last_engine_run_id = _extract_engine_run_id(response)
             except EngineError as exc:
+                await self._compensate_failure(
+                    dispatch_id=ctx.dispatch_id,
+                    correlation_ids=hop_correlations,
+                    reason=(
+                        f"sequence_failed at hop {hop_index}/{len(self._hops)} "
+                        f"({transition_key}, to_status={to_status!r}): {exc}"
+                    ),
+                )
                 return self._failed(
                     ctx,
                     started=started,
@@ -138,6 +201,11 @@ class SequenceEngineExecutor:
                     len(self._hops),
                     extra={"dispatch_id": str(ctx.dispatch_id)},
                 )
+                await self._compensate_failure(
+                    dispatch_id=ctx.dispatch_id,
+                    correlation_ids=hop_correlations,
+                    reason=f"hop {hop_index} crashed: {type(exc).__name__}: {exc}",
+                )
                 return self._failed(
                     ctx,
                     started=started,
@@ -146,10 +214,6 @@ class SequenceEngineExecutor:
                     detail=f"hop {hop_index} crashed: {type(exc).__name__}: {exc}",
                 )
 
-        # Reflect the resolved engine target id in the envelope intake
-        # so the persisted dispatch row is truthful (mirrors EngineExecutor).
-        envelope_intake: dict[str, Any] = dict(ctx.intake)
-        envelope_intake["engineItemId"] = str(item_id)
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
             step_id=ctx.step_id,
@@ -159,11 +223,45 @@ class SequenceEngineExecutor:
             state="dispatched",  # type: ignore[arg-type]
             intake=envelope_intake,
             started_at=started,
-            dispatched_at=datetime.now(UTC),
+            dispatched_at=dispatched_at,
             correlation_id=last_correlation_id,
             transition_key=self._hops[-1][0],
             engine_run_id=last_engine_run_id,
         )
+
+    async def _compensate_failure(
+        self,
+        *,
+        dispatch_id: uuid.UUID,
+        correlation_ids: list[uuid.UUID],
+        reason: str,
+    ) -> None:
+        """Reverse the pre-flight tx after a hop fails.
+
+        Marks the dispatch FAILED and deletes ALL the sequence's
+        outbox rows (rows for already-materialised hops are no-ops,
+        so the bulk delete is safe).  Idempotent.
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                dispatch_row = await session.get(_Dispatch, dispatch_id)
+                if dispatch_row is not None and dispatch_row.state == DispatchState.DISPATCHED.value:
+                    dispatch_row.mark_failed(
+                        at=datetime.now(UTC),
+                        outcome=DispatchOutcome.ERROR,
+                        detail=reason,
+                    )
+                await session.execute(
+                    _sql_delete(PendingAuxWrite).where(
+                        PendingAuxWrite.correlation_id.in_(correlation_ids)
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "sequence executor %s compensating tx failed (dispatch_id=%s)",
+                self._ref,
+                dispatch_id,
+            )
 
     async def _resolve_target(
         self, ctx: DispatchContext

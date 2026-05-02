@@ -43,13 +43,16 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sqlalchemy import delete as _sql_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import EngineError
+from app.modules.ai.enums import DispatchOutcome, DispatchState
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.executors.engine import TargetIdResolver
 from app.modules.ai.executors.llm_content import LLMContentExecutor
+from app.modules.ai.models import Dispatch as _Dispatch
 from app.modules.ai.models import PendingAuxWrite, RunMemory
 from app.modules.ai.schemas import DispatchEnvelope
 
@@ -185,9 +188,30 @@ class CompositeLLMEngineExecutor:
                     detail=f"composite executor: malformed engineItemId={item_id_raw!r}: {exc}",
                 )
 
-        # 3. One transaction: memory write + outbox row + engine call.
+        # 3. Split-tx wake-race fix.  See ``EngineExecutor`` for the
+        # full rationale — same race here: the engine fires its
+        # ``item.transitioned`` webhook back faster than the originating
+        # tx commits, so the reactor's wake-leg query
+        # (``Dispatch.intake['correlation_id'].astext == str(corr)``)
+        # cannot match unless intake.correlation_id is committed first.
+        #
+        #   tx 1 (commits *before* HTTP):
+        #     - memory write (LLM-content patch under lifecycle.v1)
+        #     - outbox row
+        #     - stamp correlation_id / transition_key / engineItemId
+        #       onto Dispatch.intake
+        #   HTTP: transition_item.
+        #   tx 2 (compensating, on engine failure):
+        #     - mark dispatch FAILED
+        #     - delete outbox row
         signal_name = self._transition_key
-        engine_run_id: str | None = None
+        envelope_intake: dict[str, Any] = {
+            **ctx.intake,
+            "correlation_id": str(correlation_id),
+            "transition_key": self._transition_key,
+            "engineItemId": str(item_id),
+        }
+        dispatched_at = datetime.now(UTC)
         try:
             async with self._session_factory() as session, session.begin():
                 # Memory write — merge the LLM patch under the namespace.
@@ -205,14 +229,43 @@ class CompositeLLMEngineExecutor:
                         },
                     )
                 )
-                response = await self._client.transition_item(
-                    item_id=item_id,
-                    to_status=self._to_status,
-                    correlation_id=correlation_id,
-                    actor=self._actor,
-                )
-                engine_run_id = _extract_engine_run_id(response)
+                dispatch_row = await session.get(_Dispatch, ctx.dispatch_id)
+                if dispatch_row is not None:
+                    merged = {**(dispatch_row.intake or {}), **envelope_intake}
+                    # Preserve runtime keys.
+                    for k in ("runId", "nodeName"):
+                        if k in (dispatch_row.intake or {}):
+                            merged[k] = (dispatch_row.intake or {})[k]
+                    dispatch_row.intake = merged
+        except Exception as exc:
+            logger.exception(
+                "composite executor %s pre-flight tx failed",
+                self._ref,
+                extra={"dispatch_id": str(ctx.dispatch_id)},
+            )
+            return self._failed(
+                ctx,
+                started=started,
+                correlation_id=correlation_id,
+                detail=f"pre_flight_tx_failed: {type(exc).__name__}: {exc}",
+            )
+
+        # HTTP call — outside any tx, after the outbox + intake commit.
+        engine_run_id: str | None = None
+        try:
+            response = await self._client.transition_item(
+                item_id=item_id,
+                to_status=self._to_status,
+                correlation_id=correlation_id,
+                actor=self._actor,
+            )
+            engine_run_id = _extract_engine_run_id(response)
         except EngineError as exc:
+            await self._compensate_failure(
+                dispatch_id=ctx.dispatch_id,
+                correlation_id=correlation_id,
+                reason=f"engine_error: {exc}",
+            )
             return self._failed(
                 ctx,
                 started=started,
@@ -221,9 +274,14 @@ class CompositeLLMEngineExecutor:
             )
         except Exception as exc:
             logger.exception(
-                "composite executor %s dispatch failed unexpectedly",
+                "composite executor %s HTTP call raised unexpectedly",
                 self._ref,
                 extra={"dispatch_id": str(ctx.dispatch_id)},
+            )
+            await self._compensate_failure(
+                dispatch_id=ctx.dispatch_id,
+                correlation_id=correlation_id,
+                reason=f"{type(exc).__name__}: {exc}",
             )
             return self._failed(
                 ctx,
@@ -232,10 +290,6 @@ class CompositeLLMEngineExecutor:
                 detail=f"{type(exc).__name__}: {exc}",
             )
 
-        # Reflect the resolved engine target id in the envelope intake
-        # so the persisted dispatch row is truthful (matches EngineExecutor).
-        envelope_intake: dict[str, Any] = dict(ctx.intake)
-        envelope_intake["engineItemId"] = str(item_id)
         return DispatchEnvelope(
             dispatch_id=ctx.dispatch_id,
             step_id=ctx.step_id,
@@ -245,11 +299,46 @@ class CompositeLLMEngineExecutor:
             state="dispatched",  # type: ignore[arg-type]
             intake=envelope_intake,
             started_at=started,
-            dispatched_at=datetime.now(UTC),
+            dispatched_at=dispatched_at,
             correlation_id=correlation_id,
             transition_key=self._transition_key,
             engine_run_id=engine_run_id,
         )
+
+    async def _compensate_failure(
+        self,
+        *,
+        dispatch_id: uuid.UUID,
+        correlation_id: uuid.UUID,
+        reason: str,
+    ) -> None:
+        """Reverse the pre-flight tx after the engine call fails.
+
+        Marks the dispatch FAILED and removes the outbox row so a
+        stray webhook for an unrelated transition can't accidentally
+        materialise it.  Idempotent: missing rows are no-ops.
+        Mirrors :meth:`EngineExecutor._compensate_failure`.
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                dispatch_row = await session.get(_Dispatch, dispatch_id)
+                if dispatch_row is not None and dispatch_row.state == DispatchState.DISPATCHED.value:
+                    dispatch_row.mark_failed(
+                        at=datetime.now(UTC),
+                        outcome=DispatchOutcome.ERROR,
+                        detail=reason,
+                    )
+                await session.execute(
+                    _sql_delete(PendingAuxWrite).where(
+                        PendingAuxWrite.correlation_id == correlation_id
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "composite executor %s compensating tx failed (dispatch_id=%s)",
+                self._ref,
+                dispatch_id,
+            )
 
     # ------------------------------------------------------------------
     # Internals
