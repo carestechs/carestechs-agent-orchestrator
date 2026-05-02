@@ -34,10 +34,13 @@ from datetime import UTC, datetime
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import PolicyError
 from app.core.llm import LLMProvider, ToolCall, ToolDefinition
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
+from app.modules.ai.models import RunMemory
 from app.modules.ai.schemas import DispatchEnvelope
 
 PromptContextLoader = Callable[[DispatchContext], Awaitable[Mapping[str, Any]]]
@@ -51,8 +54,19 @@ file from disk and exposes it as ``{workItemBrief}``.
 """
 
 
-MemoryPatchBuilder = Callable[[Mapping[str, Any]], dict[str, Any]]
+MemoryPatchBuilder = Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
 """Callable that converts the validated LLM result dict into a memory patch.
+
+Signature ``(result, current_memory) -> patch`` — the second positional
+argument is the current contents of ``RunMemory.data`` (an empty dict
+when the row is missing or no ``session_factory`` was wired into the
+executor).  Builders that need to *append* to a list inside
+``RunMemory.data`` (e.g. ``reviewHistory``) read the existing entries
+from ``current_memory`` and produce a fully-merged patch — the runtime's
+``__memory_patch`` applier replaces top-level keys verbatim, so a partial
+write under ``lifecycle.v1`` would otherwise stomp the rest of the
+namespace.  Builders that don't need memory accept it as an unused
+parameter.
 
 When supplied, the executor merges the patch into the envelope's
 ``result`` under the ``__memory_patch`` key so the runtime's standard
@@ -93,6 +107,7 @@ class LLMContentExecutor:
         model: str | None = None,
         memory_patch_builder: MemoryPatchBuilder | None = None,
         prompt_context_loader: PromptContextLoader | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self.name = ref
         self._ref = ref
@@ -105,6 +120,13 @@ class LLMContentExecutor:
         self._tool = _tool_from_result_schema(ref, result_schema)
         self._memory_patch_builder = memory_patch_builder
         self._prompt_context_loader = prompt_context_loader
+        # When the builder needs to *append* to data already in
+        # ``RunMemory.data`` (e.g. ``reviewHistory`` under
+        # ``lifecycle.v1``), the executor reads the current row before
+        # the builder runs and passes the data dict in.  Wired by
+        # ``register_lifecycle_v03`` for every binding that has a
+        # ``memory_patch_builder``.
+        self._session_factory = session_factory
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)
@@ -198,8 +220,9 @@ class LLMContentExecutor:
                 continue
             result_dict: dict[str, Any] = validated.model_dump(mode="json")
             if self._memory_patch_builder is not None:
+                current_memory: Mapping[str, Any] = await self._read_memory(ctx)
                 try:
-                    patch = self._memory_patch_builder(result_dict)
+                    patch = self._memory_patch_builder(result_dict, current_memory)
                 except Exception as exc:
                     return _envelope(
                         ctx,
@@ -233,6 +256,25 @@ class LLMContentExecutor:
                 f"last_error={last_error!s}"
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Memory access (BUG-010 — append-mode patch builders)
+    # ------------------------------------------------------------------
+
+    async def _read_memory(self, ctx: DispatchContext) -> Mapping[str, Any]:
+        """Snapshot ``RunMemory.data`` for the patch builder.
+
+        Returns ``{}`` when no ``session_factory`` is wired or the row is
+        missing — builders that don't care about current memory take an
+        unused argument and the empty mapping is a no-op.
+        """
+        if self._session_factory is None:
+            return {}
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(RunMemory).where(RunMemory.run_id == ctx.run_id)
+            )
+        return (row.data if row is not None else {}) or {}
 
     # ------------------------------------------------------------------
     # Prompt rendering

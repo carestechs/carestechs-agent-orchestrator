@@ -66,12 +66,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-MemoryPatchBuilder = Callable[[Mapping[str, Any]], dict[str, Any]]
+MemoryPatchBuilder = Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
 """Callable that converts the validated LLM result dict into a memory patch.
 
-Receives the dict the inner :class:`LLMContentExecutor` returned (already
-validated against its schema).  The patch is merged shallowly into
-``RunMemory.data`` (top-level keys overwrite their previous values).
+Signature ``(result, current_memory) -> patch`` — symmetric with
+:data:`app.modules.ai.executors.llm_content.MemoryPatchBuilder`.  The
+second positional argument is the current contents of ``RunMemory.data``
+read by the executor before invoking the builder.  Builders that need to
+*append* to a list under ``lifecycle.v1`` (e.g. ``reviewHistory``) read
+it from ``current_memory`` and produce a fully-merged patch — the
+runtime's ``__memory_patch`` applier replaces top-level keys verbatim.
+Builders that don't care take it as an unused parameter.
+
 Use :func:`app.modules.ai.tools.lifecycle.memory.write_lifecycle_memory`
 for the canonical lifecycle shape.
 """
@@ -127,11 +133,19 @@ class CompositeLLMEngineExecutor:
             )
 
         # The LLM result is the validated dict the inner executor
-        # returned.  The patch builder converts it into a JSON-safe
-        # ``RunMemory.data`` patch.
+        # returned.  Read current memory (BUG-010 — append-mode builders
+        # need it) and the patch builder converts ``(result, memory)``
+        # into a JSON-safe ``RunMemory.data`` patch.
         llm_result: dict[str, Any] = dict(llm_envelope.result or {})
+        async with self._session_factory() as session:
+            mem_row = await session.scalar(
+                select(RunMemory).where(RunMemory.run_id == ctx.run_id)
+            )
+        current_memory: Mapping[str, Any] = (
+            mem_row.data if mem_row is not None else {}
+        ) or {}
         try:
-            memory_patch = self._memory_patch_builder(llm_result)
+            memory_patch = self._memory_patch_builder(llm_result, current_memory)
         except Exception as exc:
             return self._failed(
                 ctx,
