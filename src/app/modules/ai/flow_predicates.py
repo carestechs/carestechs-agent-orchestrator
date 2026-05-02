@@ -80,16 +80,27 @@ def _correction_attempts_under_bound(  # pyright: ignore[reportUnusedFunction] -
 ) -> bool:
     """True iff the bound has not yet been reached for the task in ``last.task_id``.
 
-    Reads ``memory.correction_attempts[task_id]`` and ``memory.correction_bound``.
-    Defaults: attempts=0, bound=2 (matches ``LIFECYCLE_MAX_CORRECTIONS`` default).
+    Reads ``lifecycle.v1.correctionAttempts[task_id]`` via
+    ``read_lifecycle_memory`` and ``memory.correction_bound`` (top
+    level, sidecar — set by tests; production uses
+    ``LIFECYCLE_MAX_CORRECTIONS=2`` as default).
+
+    BUG-010: this previously read ``memory["correction_attempts"]``
+    (top level, snake_case) — a slot no writer wrote to once
+    ``correct_implementation`` migrated to the typed namespace, so the
+    predicate was always-True and the correction budget never tripped.
     """
     if last is None:
         return True
     task_id = last.get("task_id")
     if task_id is None:
         return True
-    attempts_map = cast(Mapping[str, Any], memory.get("correction_attempts") or {})
-    attempts = cast(int, attempts_map.get(task_id, 0))
+    # Lazy import — flow_predicates is reachable from the resolver
+    # before any lifecycle module has been imported.
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(memory)
+    attempts = lifecycle_memory.correction_attempts.get(str(task_id), 0)
     bound = cast(int, memory.get("correction_bound", 2))
     return int(attempts) < int(bound)
 

@@ -84,6 +84,30 @@ def _lifecycle_memory(*, task_ids: tuple[str, ...], planned: tuple[str, ...]) ->
     }
 
 
+def _lifecycle_memory_with_corrections(
+    *,
+    task_ids: tuple[str, ...],
+    corrections: dict[str, int],
+    correction_bound: int,
+) -> dict[str, Any]:
+    """Build memory with ``correctionAttempts`` under the canonical namespace (BUG-010)."""
+    from app.modules.ai.tools.lifecycle.memory import (
+        LIFECYCLE_MEMORY_NS,
+        LifecycleMemory,
+        LifecycleTask,
+        to_run_memory,
+    )
+
+    memory_model = LifecycleMemory(
+        tasks=[LifecycleTask(id=tid, title=f"Task {tid}") for tid in task_ids],
+        correction_attempts=corrections,
+    )
+    return {
+        LIFECYCLE_MEMORY_NS: to_run_memory(memory_model),
+        "correction_bound": correction_bound,
+    }
+
+
 _BRANCH_SCENARIOS: dict[str, list[tuple[str, dict[str, Any], dict[str, Any] | None]]] = {
     "generate_plan": [
         (
@@ -106,12 +130,16 @@ _BRANCH_SCENARIOS: dict[str, list[tuple[str, dict[str, Any], dict[str, Any] | No
     "correct_implementation": [
         (
             "true",
-            {"correction_attempts": {"T-1": 0}, "correction_bound": 2},
+            _lifecycle_memory_with_corrections(
+                task_ids=("T-1",), corrections={"T-1": 0}, correction_bound=2
+            ),
             {"task_id": "T-1"},
         ),
         (
             "false",
-            {"correction_attempts": {"T-1": 5}, "correction_bound": 2},
+            _lifecycle_memory_with_corrections(
+                task_ids=("T-1",), corrections={"T-1": 5}, correction_bound=2
+            ),
             {"task_id": "T-1"},
         ),
     ],

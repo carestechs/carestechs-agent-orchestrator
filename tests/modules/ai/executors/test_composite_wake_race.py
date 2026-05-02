@@ -12,7 +12,7 @@ until the runtime times out.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -86,7 +86,9 @@ async def session_factory(engine: AsyncEngine) -> AsyncIterator[async_sessionmak
         await session.commit()
 
 
-def _patch_builder(_result: dict[str, Any]) -> dict[str, Any]:
+def _patch_builder(
+    _result: Mapping[str, Any], _current_memory: Mapping[str, Any]
+) -> dict[str, Any]:
     return {"composite_marker": True}
 
 
