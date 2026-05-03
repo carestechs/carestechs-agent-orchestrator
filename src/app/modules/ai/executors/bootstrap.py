@@ -240,6 +240,41 @@ def _exempt_lifecycle_v03(agent_ref: str, node_names: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _patch_review(result: Mapping[str, Any], current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonical writer for ``lifecycle.v1.reviewHistory`` (BUG-010).
+
+    Lifted to module scope (IMP-003 / T-270) so the stub-pass reviewer
+    can reuse the exact same shape contract — drift between the LLM
+    path and the stub is impossible by construction when both run
+    through this single builder.
+
+    The runtime's ``__memory_patch`` applier replaces top-level keys
+    verbatim, so we read the existing namespace, append the new entry,
+    and return the full merged blob.
+    """
+    from app.modules.ai.tools.lifecycle.memory import (
+        LIFECYCLE_MEMORY_NS,
+        LifecycleMemory,
+        LifecycleReview,
+        read_lifecycle_memory,
+        to_run_memory,
+    )
+
+    memory_model: LifecycleMemory = read_lifecycle_memory(current_memory)
+    attempt = sum(1 for r in memory_model.review_history if r.task_id == str(result.get("task_id", ""))) + 1
+    verdict_raw = str(result.get("verdict", ""))
+    verdict: Literal["pass", "fail"] = "pass" if verdict_raw == "pass" else "fail"
+    new_review = LifecycleReview(
+        task_id=str(result.get("task_id", "")),
+        attempt=attempt,
+        verdict=verdict,
+        feedback=str(result.get("feedback", "")),
+        written_to="memory",
+    )
+    memory_model.review_history.append(new_review)
+    return {LIFECYCLE_MEMORY_NS: to_run_memory(memory_model)}
+
+
 def register_lifecycle_v03(
     registry: ExecutorRegistry,
     agent_ref: str,
@@ -277,9 +312,7 @@ def register_lifecycle_v03(
       ``RunStatus.FAILED`` via the existing stop-condition pipeline.
     """
     if lifecycle_client is None:
-        raise RuntimeError(
-            "register_lifecycle_v03: lifecycle_client is required (engine-bound nodes need it)"
-        )
+        raise RuntimeError("register_lifecycle_v03: lifecycle_client is required (engine-bound nodes need it)")
     work_item_workflow_id = workflow_ids.get("work_item_workflow")
     if work_item_workflow_id is None:
         raise RuntimeError(
@@ -345,9 +378,7 @@ def register_lifecycle_v03(
     # creation is its own seam alongside :class:`EngineExecutor`.
     # ------------------------------------------------------------------
 
-    def _patch_load_work_item(
-        result: Mapping[str, Any], _current_memory: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _patch_load_work_item(result: Mapping[str, Any], _current_memory: Mapping[str, Any]) -> dict[str, Any]:
         try:
             wi_type = str(result.get("work_item_id", "FEAT")).split("-", 1)[0] or "FEAT"
         except Exception:
@@ -385,15 +416,13 @@ def register_lifecycle_v03(
         except FileNotFoundError:
             return {
                 "workItemBrief": (
-                    f"<!-- file not found at {path!s}; "
-                    "synthesize from the path's external ref alone -->"
+                    f"<!-- file not found at {path!s}; " "synthesize from the path's external ref alone -->"
                 )
             }
         except OSError as exc:
             return {
                 "workItemBrief": (
-                    f"<!-- could not read {path!s}: {exc}; "
-                    "synthesize from the path's external ref alone -->"
+                    f"<!-- could not read {path!s}: {exc}; " "synthesize from the path's external ref alone -->"
                 )
             }
 
@@ -441,24 +470,18 @@ def register_lifecycle_v03(
     # composite; the engine fanout moves to ``propose_tasks``).
     # ------------------------------------------------------------------
 
-    def _patch_generate_tasks(
-        result: Mapping[str, Any], _current_memory: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _patch_generate_tasks(result: Mapping[str, Any], _current_memory: Mapping[str, Any]) -> dict[str, Any]:
         tasks_in: list[Mapping[str, Any]] = list(result.get("tasks") or [])
 
         def _task(t: Mapping[str, Any]) -> LifecycleTask:
             complexity_raw = str(t.get("complexity", "medium") or "medium")
-            complexity = (
-                complexity_raw if complexity_raw in ("small", "medium", "large") else "medium"
-            )
+            complexity = complexity_raw if complexity_raw in ("small", "medium", "large") else "medium"
             return LifecycleTask(
                 id=str(t.get("id", "")),
                 title=str(t.get("title", "")),
                 executor=str(t.get("executor", "")) or None,
                 description=str(t.get("description", "") or ""),
-                acceptance_criteria=[
-                    str(c) for c in cast(list[Any], t.get("acceptance_criteria") or [])
-                ],
+                acceptance_criteria=[str(c) for c in cast(list[Any], t.get("acceptance_criteria") or [])],
                 complexity=complexity,  # type: ignore[arg-type]
                 depends_on=[str(d) for d in cast(list[Any], t.get("depends_on") or [])],
                 files_hint=[str(f) for f in cast(list[Any], t.get("files_hint") or [])],
@@ -516,9 +539,7 @@ def register_lifecycle_v03(
         ctx: DispatchContext,
     ) -> uuid.UUID | None:
         async with session_factory() as session:
-            mem = await session.scalar(
-                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
-            )
+            mem = await session.scalar(_select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id))
         memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
         task = find_current_task(memory)
         if task is None or task.engine_item_id is None:
@@ -550,9 +571,7 @@ def register_lifecycle_v03(
     # branch on completion.
     # ------------------------------------------------------------------
 
-    def _patch_generate_plan(
-        result: Mapping[str, Any], _current_memory: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def _patch_generate_plan(result: Mapping[str, Any], _current_memory: Mapping[str, Any]) -> dict[str, Any]:
         task_id = str(result.get("task_id", ""))
         return {
             "plans": {task_id: {"plan_markdown": result.get("plan_markdown")}},
@@ -574,9 +593,7 @@ def register_lifecycle_v03(
         from app.modules.ai.models import RunMemory as _RunMemoryModel
 
         async with session_factory() as session:
-            mem = await session.scalar(
-                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
-            )
+            mem = await session.scalar(_select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id))
         memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
         task = find_current_task(memory)
         if task is None:
@@ -688,41 +705,6 @@ def register_lifecycle_v03(
     # only fires on the pass branch).
     # ------------------------------------------------------------------
 
-    def _patch_review(
-        result: Mapping[str, Any], current_memory: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        # BUG-010: append the new review entry to ``lifecycle.v1.reviewHistory``.
-        # Previously this wrote ``review_history`` (snake_case) at the
-        # top level of ``RunMemory.data`` — a slot no other reader sees.
-        # The runtime's ``__memory_patch`` applier replaces top-level
-        # keys verbatim, so we read the existing namespace, append, and
-        # return the full merged blob.
-        from app.modules.ai.tools.lifecycle.memory import (
-            LIFECYCLE_MEMORY_NS,
-            LifecycleMemory,
-            LifecycleReview,
-            read_lifecycle_memory,
-            to_run_memory,
-        )
-
-        memory_model: LifecycleMemory = read_lifecycle_memory(current_memory)
-        attempt = sum(
-            1
-            for r in memory_model.review_history
-            if r.task_id == str(result.get("task_id", ""))
-        ) + 1
-        verdict_raw = str(result.get("verdict", ""))
-        verdict: Literal["pass", "fail"] = "pass" if verdict_raw == "pass" else "fail"
-        new_review = LifecycleReview(
-            task_id=str(result.get("task_id", "")),
-            attempt=attempt,
-            verdict=verdict,
-            feedback=str(result.get("feedback", "")),
-            written_to="memory",
-        )
-        memory_model.review_history.append(new_review)
-        return {LIFECYCLE_MEMORY_NS: to_run_memory(memory_model)}
-
     async def _load_review_context(ctx: DispatchContext) -> Mapping[str, Any]:
         """Surface the task body, the plan markdown, and any operator-supplied
         implementation evidence as template variables.
@@ -750,15 +732,11 @@ def register_lifecycle_v03(
         from app.modules.ai.models import RunMemory as _RunMemoryModel
 
         async with session_factory() as session:
-            mem = await session.scalar(
-                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
-            )
+            mem = await session.scalar(_select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id))
         memory_data: dict[str, Any] = (mem.data if mem is not None else {}) or {}
         memory = read_lifecycle_memory(memory_data)
         task = find_current_task(memory)
-        plans_top: Mapping[str, Any] = cast(
-            Mapping[str, Any], memory_data.get("plans") or {}
-        )
+        plans_top: Mapping[str, Any] = cast(Mapping[str, Any], memory_data.get("plans") or {})
         plan_for_task: Mapping[str, Any] = cast(
             Mapping[str, Any],
             plans_top.get(task.id if task is not None else "", {}) or {},
@@ -768,9 +746,7 @@ def register_lifecycle_v03(
         # Operator's signal payload, if any.  Lives in the runtime's
         # bookkeeping namespace under ``last_dispatch_result.payload``.
         bookkeeping = cast(Mapping[str, Any], memory_data.get("__feat009") or {})
-        last_result = cast(
-            Mapping[str, Any], bookkeeping.get("last_dispatch_result") or {}
-        )
+        last_result = cast(Mapping[str, Any], bookkeeping.get("last_dispatch_result") or {})
         evidence_payload = last_result.get("payload") or {}
         if isinstance(evidence_payload, Mapping):
             evidence_lines: list[str] = []
@@ -799,10 +775,17 @@ def register_lifecycle_v03(
             "implementationEvidence": evidence,
         }
 
-    registry.register(
-        agent_ref,
-        "review_implementation",
-        LLMContentExecutor(
+    # IMP-003: select the reviewer binding from settings.  Default
+    # ``llm-content`` preserves today's behaviour; ``stub-pass`` is the
+    # smoke / CI binding that auto-approves so runs reach
+    # ``close_work_item`` without real PR evidence.  A future ``remote``
+    # value slots in here when the external reviewer service ships.
+    from app.config import get_settings as _get_settings
+
+    reviewer_choice = _get_settings().lifecycle_reviewer
+    reviewer_executor: Any
+    if reviewer_choice == "llm-content":
+        reviewer_executor = LLMContentExecutor(
             ref="llm:review_implementation",
             system_prompt=_load_prompt("review_implementation"),
             user_prompt_template=(
@@ -825,8 +808,28 @@ def register_lifecycle_v03(
             memory_patch_builder=_patch_review,
             prompt_context_loader=_load_review_context,
             session_factory=session_factory,
-        ),
+        )
+    elif reviewer_choice == "stub-pass":
+        from app.modules.ai.executors.stub_reviewer import make_stub_pass_reviewer
+
+        logger.warning(
+            "register_lifecycle_v03: LIFECYCLE_REVIEWER=stub-pass — every "
+            "implementation will be auto-approved.  Smoke / CI only."
+        )
+        reviewer_executor = make_stub_pass_reviewer(
+            session_factory=session_factory,
+            patch_review_builder=_patch_review,
+        )
+    else:
+        # Pydantic ``Literal`` validation prevents this branch in
+        # practice; the explicit raise documents the closed enumeration.
+        raise ValueError(f"unknown LIFECYCLE_REVIEWER={reviewer_choice!r}")
+
+    logger.info(
+        "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
+        reviewer_choice,
     )
+    registry.register(agent_ref, "review_implementation", reviewer_executor)
 
     # ------------------------------------------------------------------
     # approve_review — T10: impl_review → done (current task).  Only
@@ -944,10 +947,7 @@ def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
     from app.modules.ai.models import WorkItem as _WorkItem
 
     async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
-        task_external_ref = (
-            str(ctx.intake.get("taskId") or ctx.intake.get("task_id") or "")
-            or "unknown"
-        )
+        task_external_ref = str(ctx.intake.get("taskId") or ctx.intake.get("task_id") or "") or "unknown"
         engine_item_id_raw = ctx.intake.get("engineItemId") or ctx.intake.get("workItemEngineId")
 
         # 1. Bookkeeping — read existing attempts from
@@ -966,9 +966,7 @@ def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
         )
 
         async with session_factory() as session:
-            row = await session.scalar(
-                _select(_RunMemory).where(_RunMemory.run_id == ctx.run_id)
-            )
+            row = await session.scalar(_select(_RunMemory).where(_RunMemory.run_id == ctx.run_id))
             existing: dict[str, Any] = ((row.data if row is not None else {}) or {}).copy()
         memory_model = read_lifecycle_memory(existing)
         current = int(memory_model.correction_attempts.get(task_external_ref, 0))

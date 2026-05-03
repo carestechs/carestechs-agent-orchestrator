@@ -131,9 +131,65 @@ class TestCoverageWiredV03:
         for node_name, expected_type in expected.items():
             binding = registry.resolve(_AGENT_REF, node_name)
             assert isinstance(binding.executor, expected_type), (
-                f"node {node_name!r}: expected {expected_type.__name__}, "
-                f"got {type(binding.executor).__name__}"
+                f"node {node_name!r}: expected {expected_type.__name__}, " f"got {type(binding.executor).__name__}"
             )
+
+
+class TestReviewerBindingSelector:
+    """IMP-003 / T-270 — ``LIFECYCLE_REVIEWER`` selects the binding."""
+
+    def test_default_binds_llm_content_executor(
+        self,
+        stub_lifecycle_client: Any,
+        stub_llm_provider: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """No env override -> production LLMContentExecutor binding."""
+        registry = ExecutorRegistry()
+        register_lifecycle_v03(
+            registry,
+            _AGENT_REF,
+            lifecycle_client=stub_lifecycle_client,
+            llm_provider=stub_llm_provider,
+            session_factory=session_factory,
+            workflow_ids={
+                "work_item_workflow": uuid.uuid4(),
+                "task_workflow": uuid.uuid4(),
+            },
+        )
+        binding = registry.resolve(_AGENT_REF, "review_implementation")
+        assert isinstance(binding.executor, LLMContentExecutor)
+
+    def test_stub_pass_binds_local_executor(
+        self,
+        stub_lifecycle_client: Any,
+        stub_llm_provider: Any,
+        session_factory: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``LIFECYCLE_REVIEWER=stub-pass`` swaps in the stub-pass binding."""
+        from app.config import get_settings
+
+        get_settings.cache_clear()
+        monkeypatch.setenv("LIFECYCLE_REVIEWER", "stub-pass")
+        try:
+            registry = ExecutorRegistry()
+            register_lifecycle_v03(
+                registry,
+                _AGENT_REF,
+                lifecycle_client=stub_lifecycle_client,
+                llm_provider=stub_llm_provider,
+                session_factory=session_factory,
+                workflow_ids={
+                    "work_item_workflow": uuid.uuid4(),
+                    "task_workflow": uuid.uuid4(),
+                },
+            )
+            binding = registry.resolve(_AGENT_REF, "review_implementation")
+            assert isinstance(binding.executor, LocalExecutor)
+            assert binding.executor.name == "local:stub-pass-reviewer"
+        finally:
+            get_settings.cache_clear()
 
 
 class TestCoverageWithoutV03Wiring:

@@ -90,6 +90,16 @@ class Settings(BaseSettings):
     # -- Lifecycle agent (FEAT-005) ---------------------------------------
     lifecycle_max_corrections: int = Field(default=2, ge=1)
 
+    # -- Lifecycle reviewer binding (IMP-003) -----------------------------
+    # Selects which executor binding registers for ``review_implementation``.
+    #   * ``llm-content`` (default) — production binding; in-process LLM
+    #     call via ``LLMContentExecutor`` (FEAT-011 baseline).
+    #   * ``stub-pass`` — smoke / CI binding; ``StubPassReviewerExecutor``
+    #     always returns ``verdict=pass``.  NEVER use in production.
+    # A future ``remote`` value is reserved for the external review service;
+    # intentionally not in the literal yet to avoid premature contract freeze.
+    lifecycle_reviewer: Literal["llm-content", "stub-pass"] = "llm-content"
+
     # -- Deterministic lifecycle flow (FEAT-006) --------------------------
     # When True (v1 default) the impl-review approver collapses to `admin`;
     # when False a `dev` other than the implementer is expected.
