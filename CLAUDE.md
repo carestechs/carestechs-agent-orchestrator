@@ -42,7 +42,7 @@ uv run uvicorn app.main:app --reload
 # or: uv run orchestrator serve --reload
 
 # Invoke the CLI
-uv run orchestrator run lifecycle-agent@0.3.0 --intake featureBriefPath=docs/work-items/FEAT-042.md --follow
+uv run orchestrator run lifecycle-agent@0.3.0 --intake workItemPath=docs/work-items/FEAT-042.md --follow
 uv run orchestrator doctor
 
 # Operational reconcilers (FEAT-008 / FEAT-010)

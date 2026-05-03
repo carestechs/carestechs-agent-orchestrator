@@ -245,7 +245,7 @@ No `data-model.md` change — this is bootstrap-layer behaviour, no entity field
 - `uv run pytest tests/modules/ai/executors/test_stub_reviewer.py tests/integration/test_lifecycle_v03_review_pass_path.py` — new suite green.
 - `uv run pytest` — full suite green; nothing regressed in the LLM-content review path.
 - `uv run pyright` and `uv run ruff check .` clean.
-- Manual: `LIFECYCLE_REVIEWER=stub-pass uv run orchestrator run lifecycle-agent@0.3.0 --intake featureBriefPath=docs/work-items/FEAT-SMOKE-001.md --follow` against a real engine reaches `close_work_item` with `status=completed`. Logs show `register_lifecycle_v03: reviewer binding=stub-pass`.
+- Manual: `LIFECYCLE_REVIEWER=stub-pass uv run orchestrator run lifecycle-agent@0.3.0 --intake workItemPath=docs/work-items/FEAT-SMOKE-001.md --follow` against a real engine reaches `close_work_item` with `status=completed`. Logs show `register_lifecycle_v03: reviewer binding=stub-pass`.
 - `LIFECYCLE_REVIEWER=xyz uv run orchestrator serve` refuses to boot with a pydantic validation error.
 
 ---

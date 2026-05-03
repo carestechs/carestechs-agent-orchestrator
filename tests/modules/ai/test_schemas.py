@@ -104,7 +104,7 @@ class TestCamelCaseDeserialization:
     def test_create_run_request(self) -> None:
         data = {
             "agentRef": "lifecycle-agent@0.3.0",
-            "intake": {"featureBriefPath": "docs/FEAT-042.md"},
+            "intake": {"workItemPath": "docs/FEAT-042.md"},
             "budget": {"maxSteps": 50},
         }
         req = CreateRunRequest.model_validate(data)
