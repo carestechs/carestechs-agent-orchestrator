@@ -81,7 +81,7 @@ orchestrator run <agent-ref> [--intake KEY=VAL ...] [--intake-file PATH]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `<agent-ref>` | positional | required | Stable agent reference, e.g. `lifecycle-agent@0.3.0` |
-| `--intake KEY=VAL` | repeatable | — | Inline intake fields (e.g., `--intake featureBriefPath=docs/work-items/FEAT-042.md`) |
+| `--intake KEY=VAL` | repeatable | — | Inline intake fields (e.g., `--intake workItemPath=docs/work-items/FEAT-042.md`) |
 | `--intake-file` | path | — | YAML/JSON file providing the full intake payload |
 | `--budget-steps` | int | agent default | Maximum steps before `budget_exceeded` |
 | `--budget-tokens` | int | agent default | Maximum total tokens before `budget_exceeded` |
@@ -110,7 +110,7 @@ orchestrator run <agent-ref> [--intake KEY=VAL ...] [--intake-file PATH]
 **Example:**
 ```
 $ orchestrator run lifecycle-agent@0.3.0 \
-    --intake featureBriefPath=docs/work-items/FEAT-042.md \
+    --intake workItemPath=docs/work-items/FEAT-042.md \
     --follow
 started run 01J8ZX... (lifecycle-agent@0.3.0)
 [step 1] policy → generate_tasks({...})

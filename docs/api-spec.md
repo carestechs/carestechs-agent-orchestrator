@@ -94,7 +94,7 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
 {
   "agentRef": "string — stable agent reference, e.g. 'lifecycle-agent@0.3.0'",
   "intake": {
-    "featureBriefPath": "string — optional, e.g. 'docs/work-items/FEAT-042.md'",
+    "workItemPath": "string — required for lifecycle-agent, e.g. 'docs/work-items/FEAT-042.md'",
     "…": "other agent-specific intake fields (validated by the loaded agent definition)"
   },
   "budget": {
