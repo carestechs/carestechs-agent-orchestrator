@@ -74,6 +74,7 @@ class TestSettingsFields:
             "trace_dir",
             "repo_root",
             "lifecycle_max_corrections",
+            "lifecycle_reviewer",
             "solo_dev_mode",
             "github_webhook_secret",
             "github_pat",
@@ -203,35 +204,27 @@ class TestAnthropicValidation:
         base.update(overrides)
         return base
 
-    def test_anthropic_provider_missing_key_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_missing_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError) as exc_info:
             Settings(**self._kw(llm_provider="anthropic"))  # type: ignore[arg-type]
         assert "anthropic_api_key" in str(exc_info.value)
 
-    def test_anthropic_provider_empty_key_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_empty_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError):
             Settings(  # type: ignore[arg-type]
                 **self._kw(llm_provider="anthropic", anthropic_api_key="")
             )
 
-    def test_anthropic_provider_whitespace_key_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_whitespace_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError):
             Settings(  # type: ignore[arg-type]
                 **self._kw(llm_provider="anthropic", anthropic_api_key="   ")
             )
 
-    def test_anthropic_provider_valid_key_succeeds(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_valid_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         s = Settings(  # type: ignore[arg-type]
             **self._kw(
@@ -241,17 +234,13 @@ class TestAnthropicValidation:
         )
         assert s.llm_provider == "anthropic"
 
-    def test_stub_provider_without_key_succeeds(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_stub_provider_without_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         s = Settings(**self._kw(llm_provider="stub"))  # type: ignore[arg-type]
         assert s.llm_provider == "stub"
         assert s.anthropic_api_key is None
 
-    def test_anthropic_provider_defaults_model(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_defaults_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("LLM_MODEL", raising=False)
         s = Settings(  # type: ignore[arg-type]
@@ -262,9 +251,7 @@ class TestAnthropicValidation:
         )
         assert s.llm_model == "claude-opus-4-7"
 
-    def test_anthropic_provider_respects_explicit_model(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_provider_respects_explicit_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("LLM_MODEL", raising=False)
         s = Settings(  # type: ignore[arg-type]
@@ -276,9 +263,7 @@ class TestAnthropicValidation:
         )
         assert s.llm_model == "claude-sonnet-4-6"
 
-    def test_anthropic_max_tokens_zero_rejected(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_max_tokens_zero_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError):
             Settings(  # type: ignore[arg-type]
@@ -289,9 +274,7 @@ class TestAnthropicValidation:
                 )
             )
 
-    def test_anthropic_timeout_seconds_negative_rejected(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_anthropic_timeout_seconds_negative_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError):
             Settings(  # type: ignore[arg-type]
@@ -312,7 +295,9 @@ class TestGitHubCredentialValidation:
 
     def test_no_credentials_is_valid(self) -> None:
         s = _make_settings(
-            github_pat=None, github_app_id=None, github_private_key=None,
+            github_pat=None,
+            github_app_id=None,
+            github_private_key=None,
         )
         assert s.github_pat is None
         assert s.github_app_id is None
@@ -320,7 +305,9 @@ class TestGitHubCredentialValidation:
 
     def test_pat_only_is_valid(self) -> None:
         s = _make_settings(
-            github_pat="ghp_token", github_app_id=None, github_private_key=None,
+            github_pat="ghp_token",
+            github_app_id=None,
+            github_private_key=None,
         )
         assert s.github_pat is not None
         assert s.github_pat.get_secret_value() == "ghp_token"
@@ -337,7 +324,9 @@ class TestGitHubCredentialValidation:
     def test_app_id_without_private_key_raises(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
             _make_settings(
-                github_pat=None, github_app_id="12345", github_private_key=None,
+                github_pat=None,
+                github_app_id="12345",
+                github_private_key=None,
             )
         assert "github_app_id" in str(exc_info.value).lower()
 
@@ -378,3 +367,23 @@ class TestDependencyOverride:
             assert result.log_level == "ERROR"
         finally:
             _ = original  # no-op restore; just proving the pattern
+
+
+class TestLifecycleReviewerSetting:
+    """IMP-003 / T-270 — ``LIFECYCLE_REVIEWER`` is a closed enumeration."""
+
+    def test_default_is_llm_content(self) -> None:
+        settings = _make_settings()
+        assert settings.lifecycle_reviewer == "llm-content"
+
+    def test_stub_pass_accepted(self) -> None:
+        settings = _make_settings(lifecycle_reviewer="stub-pass")
+        assert settings.lifecycle_reviewer == "stub-pass"
+
+    def test_unknown_value_refuses_construction(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_settings(lifecycle_reviewer="remote")  # reserved but not yet wired
+
+    def test_arbitrary_string_refuses_construction(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_settings(lifecycle_reviewer="xyz")
