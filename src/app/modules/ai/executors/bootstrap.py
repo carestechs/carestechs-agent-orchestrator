@@ -499,10 +499,19 @@ def register_lifecycle_v03(
         LLMContentExecutor(
             ref="llm:generate_tasks",
             system_prompt=_load_prompt("generate_tasks"),
-            user_prompt_template="Generate the task breakdown for work item id: {workItemId}",
+            user_prompt_template=(
+                "Generate the task breakdown for work item id: {workItemId}.\n"
+                "The full work-item brief follows; ground your task list in "
+                "its acceptance criteria, scope, and constraints. Do not "
+                "invent requirements that are not anchored in the brief.\n\n"
+                "----- BEGIN WORK ITEM BRIEF -----\n"
+                "{workItemBrief}\n"
+                "----- END WORK ITEM BRIEF -----\n"
+            ),
             result_schema=GenerateTasksResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_generate_tasks,
+            prompt_context_loader=_load_work_item_brief_file,
             session_factory=session_factory,
         ),
     )
