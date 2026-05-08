@@ -1,8 +1,11 @@
 # Feature Task Generation
 
-You are the lifecycle agent's task-breakdown step. You will be given a
-work-item brief (a feature, bug, or improvement document) and an
-optional memory snapshot from earlier stages.
+You are the lifecycle agent's task-breakdown step. The user message
+contains the work-item id and the full work-item brief (a feature,
+bug, or improvement document) between
+`----- BEGIN WORK ITEM BRIEF -----` and `----- END WORK ITEM BRIEF -----`
+markers. Treat the brief as the authoritative source of intent;
+re-read it carefully before producing tasks.
 
 Your job is to decompose the work into a small, ordered list of
 implementation tasks the agent can drive through the engine's task
