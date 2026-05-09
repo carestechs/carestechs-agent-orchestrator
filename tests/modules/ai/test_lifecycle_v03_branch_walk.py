@@ -108,18 +108,41 @@ def _lifecycle_memory_with_corrections(
     }
 
 
+def _lifecycle_memory_with_completed(
+    *,
+    task_ids: tuple[str, ...],
+    completed: tuple[str, ...],
+) -> dict[str, Any]:
+    """Build memory whose ``completed_task_ids`` drives ``tasks_remaining`` (BUG-013)."""
+    from app.modules.ai.tools.lifecycle.memory import (
+        LIFECYCLE_MEMORY_NS,
+        LifecycleMemory,
+        LifecycleTask,
+        to_run_memory,
+    )
+
+    memory_model = LifecycleMemory(
+        tasks=[LifecycleTask(id=tid, title=f"Task {tid}") for tid in task_ids],
+        completed_task_ids=list(completed),
+    )
+    return {LIFECYCLE_MEMORY_NS: to_run_memory(memory_model)}
+
+
 _BRANCH_SCENARIOS: dict[str, list[tuple[str, dict[str, Any], dict[str, Any] | None]]] = {
-    "generate_plan": [
+    # BUG-013: ``generate_plan`` no longer branches — the planning self-loop
+    # was removed in favour of a sequential per-task pipeline.  The
+    # multi-target branching now lives at ``mark_task_done`` (loop or close).
+    "mark_task_done": [
         (
             "true",
-            # one task without a plan -> still unplanned
-            _lifecycle_memory(task_ids=("T-1",), planned=()),
+            # one task complete, one to go -> loop back to assign_task
+            _lifecycle_memory_with_completed(task_ids=("T-1", "T-2"), completed=("T-1",)),
             None,
         ),
         (
             "false",
-            # every task has a plan -> done planning
-            _lifecycle_memory(task_ids=("T-1",), planned=("T-1",)),
+            # every task complete -> close_work_item
+            _lifecycle_memory_with_completed(task_ids=("T-1",), completed=("T-1",)),
             None,
         ),
     ],

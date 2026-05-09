@@ -164,6 +164,53 @@ class TestUnplannedTasksRemaining:
         assert predicate(memory, None) is True
 
 
+class TestTasksRemainingPredicate:
+    """BUG-013: True iff at least one task is not yet in ``completed_task_ids``.
+
+    Powers the loop-back from ``approve_review`` so multi-task work items
+    walk every task through the per-task pipeline before ``close_work_item``.
+    """
+
+    @staticmethod
+    def _memory_with(*, task_ids: tuple[str, ...], completed: tuple[str, ...]) -> dict[str, Any]:
+        from app.modules.ai.tools.lifecycle.memory import (
+            LIFECYCLE_MEMORY_NS,
+            LifecycleMemory,
+            LifecycleTask,
+            to_run_memory,
+        )
+
+        memory_model = LifecycleMemory(
+            tasks=[LifecycleTask(id=tid, title=f"Task {tid}") for tid in task_ids],
+            completed_task_ids=list(completed),
+        )
+        return {LIFECYCLE_MEMORY_NS: to_run_memory(memory_model)}
+
+    def test_registered(self) -> None:
+        assert "tasks_remaining" in flow_predicates.known()
+
+    def test_no_tasks_returns_false(self) -> None:
+        predicate = flow_predicates.get("tasks_remaining")
+        memory = self._memory_with(task_ids=(), completed=())
+        assert predicate(memory, None) is False
+
+    def test_all_completed_returns_false(self) -> None:
+        predicate = flow_predicates.get("tasks_remaining")
+        memory = self._memory_with(task_ids=("T-1", "T-2"), completed=("T-1", "T-2"))
+        assert predicate(memory, None) is False
+
+    def test_some_remaining_returns_true(self) -> None:
+        """The loop case — one approved, one still to do."""
+        predicate = flow_predicates.get("tasks_remaining")
+        memory = self._memory_with(task_ids=("T-1", "T-2"), completed=("T-1",))
+        assert predicate(memory, None) is True
+
+    def test_none_completed_returns_true(self) -> None:
+        predicate = flow_predicates.get("tasks_remaining")
+        memory = self._memory_with(task_ids=("T-1",), completed=())
+        assert predicate(memory, None) is True
+
+
 # ---------------------------------------------------------------------------
 # Resolver integration — confirm both predicates are reachable through the
 # resolver's ``branch.rule`` lookup path. (Does not modify ``flow_resolver``;

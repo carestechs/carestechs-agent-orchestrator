@@ -99,6 +99,13 @@ class LifecycleMemory(BaseModel):
     review_history: list[LifecycleReview] = Field(default_factory=list[LifecycleReview])
     files_touched_per_task: dict[str, list[str]] = Field(default_factory=dict)
     correction_attempts: dict[str, int] = Field(default_factory=dict)
+    # BUG-013: task ids that have completed approve_review (T10) and are
+    # therefore done from the engine's standpoint.  ``mark_task_done``
+    # appends the just-approved id; ``tasks_remaining`` predicate checks
+    # cardinality against ``tasks``; loop-back from ``approve_review``
+    # walks ``tasks`` in declaration order to pick the next un-completed
+    # task as ``current_task_id``.
+    completed_task_ids: list[str] = Field(default_factory=list[str])
 
     @classmethod
     def empty(cls) -> LifecycleMemory:

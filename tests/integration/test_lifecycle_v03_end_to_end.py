@@ -240,7 +240,10 @@ async def _drive_engine_with_webhooks(
         intake={
             "workItemPath": "docs/work-items/FEAT-099.md",
             "workItemId": "FEAT-099",
-            "taskId": "T-1",
+            # taskId intentionally omitted: the deterministic runtime
+            # back-fills it from ``LifecycleMemory.current_task_id`` each
+            # iteration so multi-task work items see the right id as the
+            # loop advances (BUG-013).
         },
     )
 
@@ -560,6 +563,122 @@ async def test_ac2_correction_budget_exhausted_run_fails(
             inject_signal=True,
             expected_status=RunStatus.FAILED,
         )
+    finally:
+        if run is not None and session_factory is not None:
+            await _cleanup(session_factory, run.id, work_item_id=work_item_id)
+
+
+async def test_ac3_multi_task_run_processes_every_task_then_closes(
+    test_database_url: str,
+    migrated: None,
+    fresh_pool: None,
+    webhook_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BUG-013: a 3-task work item runs every task through the per-task
+    pipeline (assign → plan → implement → review → approve_review) before
+    the work item closes.
+
+    Asserts:
+        * every task ends up with its own engine task row in `tasks`,
+        * each task has a plan markdown entry in memory,
+        * each task receives its own pass verdict,
+        * the work item only closes after the third task's approve_review
+          (one ``close_work_item`` step exists; it fires last),
+        * `LifecycleMemory.completed_task_ids` lists all three task ids
+          in declaration order.
+    """
+    llm_script: dict[str, list[dict[str, Any]]] = {
+        "load_work_item": [
+            {
+                "work_item_id": "FEAT-MULTI",
+                "title": "v03 multi-task",
+                "summary": "exercise multi-task per-task loop",
+            }
+        ],
+        "generate_tasks": [
+            {
+                "tasks": [
+                    {"id": "T-1", "title": "first task", "executor": "claude-code"},
+                    {"id": "T-2", "title": "second task", "executor": "claude-code"},
+                    {"id": "T-3", "title": "third task", "executor": "claude-code"},
+                ]
+            }
+        ],
+        # One plan entry per task, in execution order.
+        "generate_plan": [
+            {"task_id": "T-1", "plan_markdown": "# plan T-1"},
+            {"task_id": "T-2", "plan_markdown": "# plan T-2"},
+            {"task_id": "T-3", "plan_markdown": "# plan T-3"},
+        ],
+        # One pass review per task — no rejections.
+        "review_implementation": [
+            {"task_id": "T-1", "verdict": "pass", "feedback": "ok"},
+            {"task_id": "T-2", "verdict": "pass", "feedback": "ok"},
+            {"task_id": "T-3", "verdict": "pass", "feedback": "ok"},
+        ],
+    }
+    run = None
+    session_factory = None
+    work_item_id = None
+    try:
+        run, session_factory, work_item_id = await _drive_engine_with_webhooks(
+            test_database_url=test_database_url,
+            webhook_secret=webhook_secret,
+            monkeypatch=monkeypatch,
+            llm_script=llm_script,
+            inject_signal=True,
+            expected_status=RunStatus.COMPLETED,
+        )
+
+        # Memory contract: every task is in completed_task_ids in order.
+        from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+        async with session_factory() as session:
+            mem_row = await session.scalar(
+                select(RunMemory).where(RunMemory.run_id == run.id)
+            )
+        assert mem_row is not None
+        memory = read_lifecycle_memory(dict(mem_row.data or {}))
+        assert memory.completed_task_ids == ["T-1", "T-2", "T-3"], (
+            f"expected all three tasks completed in order; got {memory.completed_task_ids}"
+        )
+        assert memory.current_task_id is None, (
+            f"after the last task, current_task_id should clear; got {memory.current_task_id!r}"
+        )
+
+        # Plan markdown was written for every task.
+        plans = (mem_row.data or {}).get("plans", {})
+        assert set(plans.keys()) == {"T-1", "T-2", "T-3"}, f"plans keys={set(plans.keys())}"
+
+        # Steps: every per-task node fired exactly N times; close_work_item
+        # fired exactly once.
+        async with session_factory() as session:
+            steps = (
+                await session.scalars(
+                    select(Step).where(Step.run_id == run.id).order_by(Step.step_number)
+                )
+            ).all()
+        node_counts: dict[str, int] = {}
+        for s in steps:
+            node_counts[s.node_name] = node_counts.get(s.node_name, 0) + 1
+        for per_task_node in (
+            "assign_task",
+            "generate_plan",
+            "approve_plan",
+            "request_implementation",
+            "submit_implementation",
+            "review_implementation",
+            "approve_review",
+            "mark_task_done",
+        ):
+            assert node_counts.get(per_task_node) == 3, (
+                f"node {per_task_node!r} expected 3 steps; got {node_counts.get(per_task_node)}; "
+                f"all counts={node_counts}"
+            )
+        assert node_counts.get("close_work_item") == 1
+        # close_work_item is the last step (terminal).
+        assert steps[-1].node_name == "close_work_item"
     finally:
         if run is not None and session_factory is not None:
             await _cleanup(session_factory, run.id, work_item_id=work_item_id)

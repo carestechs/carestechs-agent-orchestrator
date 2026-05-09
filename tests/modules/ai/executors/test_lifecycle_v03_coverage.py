@@ -125,6 +125,7 @@ class TestCoverageWiredV03:
             "submit_implementation": SubmitImplementationExecutor,
             "review_implementation": LLMContentExecutor,
             "approve_review": EngineExecutor,
+            "mark_task_done": LocalExecutor,
             "correct_implementation": LocalExecutor,
             "close_work_item": SequenceEngineExecutor,
         }
@@ -213,6 +214,7 @@ class TestCoverageWithoutV03Wiring:
             "submit_implementation",
             "review_implementation",
             "approve_review",
+            "mark_task_done",
             "correct_implementation",
             "close_work_item",
             "terminate_correction_budget",

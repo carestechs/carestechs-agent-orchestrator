@@ -571,11 +571,15 @@ def register_lifecycle_v03(
     # branch on completion.
     # ------------------------------------------------------------------
 
-    def _patch_generate_plan(result: Mapping[str, Any], _current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    def _patch_generate_plan(result: Mapping[str, Any], current_memory: Mapping[str, Any]) -> dict[str, Any]:
         task_id = str(result.get("task_id", ""))
-        return {
-            "plans": {task_id: {"plan_markdown": result.get("plan_markdown")}},
-        }
+        # BUG-013: ``plans`` is a top-level sidecar; the runtime's memory
+        # applier replaces top-level keys outright, so we must merge in
+        # the existing entries before writing or every per-task iteration
+        # of ``generate_plan`` overwrites prior task plans.
+        merged_plans = dict(cast(Mapping[str, Any], current_memory.get("plans") or {}))
+        merged_plans[task_id] = {"plan_markdown": result.get("plan_markdown")}
+        return {"plans": merged_plans}
 
     async def _load_current_task_body(ctx: DispatchContext) -> Mapping[str, Any]:
         """Read the current task's structured body from memory for the planner.
@@ -846,6 +850,48 @@ def register_lifecycle_v03(
         session_factory=session_factory,
         actor=actor,
         target_id_resolver=_resolve_current_task_engine_id,
+    )
+
+    # ------------------------------------------------------------------
+    # mark_task_done — append current_task_id to completed_task_ids and
+    # advance current_task_id to the next un-completed task (or None when
+    # every task is done).  Pure memory write; no engine call.  BUG-013.
+    # ------------------------------------------------------------------
+
+    async def _mark_task_done_handler(ctx: DispatchContext) -> Mapping[str, Any]:
+        from sqlalchemy import select as _select
+
+        from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+        async with session_factory() as session:
+            row = await session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+            )
+        memory = read_lifecycle_memory((row.data if row is not None else {}) or {})
+        completed_id = memory.current_task_id
+        if completed_id is not None and completed_id not in memory.completed_task_ids:
+            memory.completed_task_ids.append(completed_id)
+        # Pick the next task in declaration order whose id is not yet in
+        # the completed list.  None when every task is done — the
+        # tasks_remaining predicate then routes to close_work_item.
+        next_id: str | None = next(
+            (t.id for t in memory.tasks if t.id not in memory.completed_task_ids),
+            None,
+        )
+        memory.current_task_id = next_id
+        return {
+            "completedTaskId": completed_id,
+            "nextTaskId": next_id,
+            "__memory_patch": write_lifecycle_memory(memory),
+        }
+
+    registry.register(
+        agent_ref,
+        "mark_task_done",
+        LocalExecutor(
+            ref="local:mark_task_done",
+            handler=_mark_task_done_handler,
+        ),
     )
 
     # ------------------------------------------------------------------
