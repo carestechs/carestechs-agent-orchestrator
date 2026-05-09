@@ -11,7 +11,7 @@
 | **ID** | BUG-013 |
 | **Summary** | The deterministic per-task loop in `lifecycle-agent@0.3.0` reads `LifecycleMemory.current_task_id` to address the engine task on every per-task node (`assign_task`, `generate_plan`, `approve_plan`, `request_implementation`, `submit_implementation`, `review_implementation`, `approve_review`). The id is written exactly once by `_patch_generate_tasks` and is never updated. The `unplanned_tasks_remaining` self-loop on `generate_plan` therefore re-plans the same task indefinitely (or, depending on whether the LLM elects to plan a different id than the one it was asked about, writes plan rows for tasks that the rest of the loop will never address). After plans complete, `approve_plan → request_implementation → … → approve_review → close_work_item` runs against `current_task_id` (the first task only); other tasks orphan in `plan_review` (engine-side) and the work item closes prematurely on `approve_review`'s unconditional transition to `close_work_item`. |
 | **Severity** | High. v0.3.0 is the production lifecycle agent; any FEAT or BUG work item that decomposes into more than one task is currently un-shippable through the orchestrator. The system prompt for `generate_tasks` even says "A typical FEAT decomposes into 3–8 tasks" — precisely the case that doesn't work. |
-| **Status** | Open |
+| **Status** | Resolved |
 | **Reported By** | Operator-led walk-through of the lifecycle (2026-05-09) |
 | **Date Reported** | 2026-05-09 |
 | **Date First Observed** | 2026-05-09 (gap exists since FEAT-011 / lifecycle-agent@0.3.0 shipped; never surfaced because the e2e tests are single-task) |

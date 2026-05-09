@@ -93,8 +93,13 @@ nodes:
   - name: generate_plan
     description: >
       Author an implementation plan for the current task (LLM-content) and
-      fire T6 (planning → plan_review). Self-loops while
-      `unplanned_tasks_remaining` is true.
+      fire T6 (planning → plan_review). One task at a time — the per-task
+      loop runs assign → plan → implement → review → approve sequentially
+      and the loop-back from `mark_task_done` resumes at `assign_task` for
+      the next un-completed task. (BUG-013 — the v0.1.0-style "plan all
+      then implement all" self-loop was structurally broken because no
+      v0.3.0 writer advanced ``current_task_id``; sequential per-task is
+      simpler and provably correct.)
     inputSchema:
       type: object
       properties:
@@ -150,6 +155,17 @@ nodes:
         taskId: {type: string}
       required: [taskId]
 
+  - name: mark_task_done
+    description: >
+      Append the just-approved task id to ``LifecycleMemory.completed_task_ids``
+      and advance ``current_task_id`` to the next un-completed task in
+      declaration order (or ``None`` when every task is done).  Pure memory
+      write; no engine call.  The ``tasks_remaining`` predicate then routes
+      back to ``assign_task`` (loop) or onward to ``close_work_item``
+      (terminal).  BUG-013.
+    inputSchema:
+      type: object
+
   - name: correct_implementation
     description: >
       Record a rejection for the current task implementation (writes the
@@ -194,11 +210,7 @@ flow:
     generate_tasks: [propose_tasks]
     propose_tasks: [assign_task]
     assign_task: [generate_plan]
-    generate_plan:
-      branch:
-        rule: unplanned_tasks_remaining
-        "true": generate_plan
-        "false": approve_plan
+    generate_plan: [approve_plan]
     approve_plan: [request_implementation]
     request_implementation: [submit_implementation]
     submit_implementation: [review_implementation]
@@ -207,7 +219,12 @@ flow:
         rule: review_passed
         "true": approve_review
         "false": correct_implementation
-    approve_review: [close_work_item]
+    approve_review: [mark_task_done]
+    mark_task_done:
+      branch:
+        rule: tasks_remaining
+        "true": assign_task
+        "false": close_work_item
     correct_implementation:
       branch:
         rule: correction_attempts_under_bound

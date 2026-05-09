@@ -110,6 +110,26 @@ def _correction_attempts_under_bound(  # pyright: ignore[reportUnusedFunction] -
 # ---------------------------------------------------------------------------
 
 
+@register("tasks_remaining")
+def _tasks_remaining(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    memory: Mapping[str, Any], _last: Mapping[str, Any] | None
+) -> bool:
+    """True iff at least one task is not yet in ``completed_task_ids``.
+
+    BUG-013: powers the loop-back from ``approve_review`` so multi-task
+    work items run every task through assign → plan → implement → review
+    → approve before the work item closes.  ``mark_task_done`` is the
+    sole writer of ``completed_task_ids``.
+    """
+    # Lazy import — flow_predicates is reachable from the resolver
+    # before any lifecycle module has been imported.
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(memory)
+    completed = set(lifecycle_memory.completed_task_ids)
+    return any(task.id not in completed for task in lifecycle_memory.tasks)
+
+
 @register("review_passed")
 def _review_passed(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     memory: Mapping[str, Any], last: Mapping[str, Any] | None
