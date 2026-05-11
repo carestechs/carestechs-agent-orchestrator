@@ -554,7 +554,7 @@ async def list_agents(*, settings: Settings) -> list[AgentDto]:
         assert agent.agent_definition_hash is not None
         items.append(
             AgentDto(
-                ref=f"{agent.ref}@{agent.version}",
+                ref=agent.ref if "@" in agent.ref else f"{agent.ref}@{agent.version}",
                 definition_hash=agent.agent_definition_hash,
                 path=str(rec.path),
                 intake_schema=agent.intake_schema,
