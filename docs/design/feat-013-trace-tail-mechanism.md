@@ -93,47 +93,40 @@ The CLAUDE.md anti-pattern *"Don't add a parallel persistence surface for engine
 
 ## Decision 3 — `open_run_stream` query shape
 
-The canonical query for a one-shot drain of run `R`'s trace, after filter pushdown, is:
+The canonical query for a one-shot drain of run `R`'s trace, after filter pushdown, is a `UNION ALL` over **four** sources — `steps`, `policy_calls`, `webhook_events`, `run_signals`. These are the four kinds the existing protocol surfaces through `open_run_stream` / `tail_run_stream` (the return type is `AsyncIterator[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDto]`).
+
+**Effector calls and executor calls are not in the run-stream union.** They have their own protocol methods (`read_effector_calls(entity_id)`, no run-keyed reader for executor calls — JSONL writes them under `executors/<run_id>.jsonl` but reads happen through a separate path). FEAT-013 preserves that surface; folding them into the per-run stream would change the FEAT-004 endpoint contract, which is explicitly out of scope.
 
 ```sql
--- Generated dynamically: each <branch_n> is included only if `?kinds=` admits it.
+-- Generated dynamically: each branch is included only if `?kinds=` admits it.
 -- Each branch carries a literal `kind` column so the union row is self-describing.
 
-SELECT 'step'           AS kind, s.id          AS source_id, s.created_at, <step_payload_columns…>
+SELECT 'step'            AS kind, s.id  AS source_id, s.created_at, <step_payload_columns…>
   FROM steps s
  WHERE s.run_id = :run_id
-   AND s.created_at > :since           -- ALWAYS pushed down; :since defaults to '-infinity'::timestamptz
+   AND s.created_at > :since      -- ALWAYS pushed down; :since defaults to '-infinity'::timestamptz
 UNION ALL
-SELECT 'policy_call'    AS kind, pc.id,        pc.created_at, <pc_payload_columns…>
+SELECT 'policy_call'     AS kind, pc.id,        pc.created_at, <pc_payload_columns…>
   FROM policy_calls pc
  WHERE pc.run_id = :run_id
    AND pc.created_at > :since
 UNION ALL
-SELECT 'webhook_event'  AS kind, we.id,        we.created_at, <we_payload_columns…>
+SELECT 'webhook_event'   AS kind, we.id,        we.created_at, <we_payload_columns…>
   FROM webhook_events we
  WHERE we.run_id = :run_id
    AND we.created_at > :since
 UNION ALL
-SELECT 'operator_signal' AS kind, rs.id,       rs.created_at, <rs_payload_columns…>
+SELECT 'operator_signal' AS kind, rs.id,        rs.received_at AS created_at, <rs_payload_columns…>
   FROM run_signals rs
  WHERE rs.run_id = :run_id
-   AND rs.created_at > :since
-UNION ALL
-SELECT 'executor_call'   AS kind, ec.id,       ec.created_at, <ec_payload_columns…>
-  FROM executor_calls ec
- WHERE ec.run_id = :run_id
-   AND ec.created_at > :since
-UNION ALL
-SELECT 'effector_call'   AS kind, efc.id,      efc.created_at, <efc_payload_columns…>
-  FROM effector_calls efc
-  JOIN <entity-link>    ON efc.entity_id = <entity-link>.id
- WHERE <entity-link>.run_id = :run_id        -- see "effector_calls join" below
-   AND efc.created_at > :since
+   AND rs.received_at > :since
 ORDER BY created_at ASC, source_id ASC        -- tie-break on source_id for determinism
 LIMIT 1000;                                   -- pagination chunk
 ```
 
-The DTO projection happens in Python; the SQL returns enough columns per branch to construct each DTO without a follow-up query.
+The DTO projection happens in Python — the SQL returns enough columns per branch (or whole-row SELECTs, since these are stable existing tables and the SQLAlchemy mappers are already wired) to construct each DTO without a follow-up query.
+
+Per-table "creation" timestamp column may differ from `created_at` — `run_signals` uses `received_at`, which is what the JSONL backend's `_record_timestamp` helper reads for that DTO. The reader's filter pushdown uses each table's authoritative timestamp; the union projects it as `created_at` for consistent ordering.
 
 ### Filter pushdown rules
 
@@ -149,18 +142,14 @@ The DTO projection happens in Python; the SQL returns enough columns per branch 
 
 1000 rows per fetch. Used for both `open_run_stream` (one-shot drain) and `tail_run_stream`'s backlog drain before entering the polling loop. The number is empirical (matches the chunk size we use in the engine-corr reconciler) and adjustable without changing the contract.
 
-### The `effector_calls` join
+### Why no `effector_calls` / `executor_calls` join into the run stream
 
-Effector traces key on `entity_id` (work-item UUID or task UUID), not `run_id`. The straight `WHERE efc.run_id = :run_id` does not exist as a column. The query joins through the lifecycle entity that links the effector's `entity_id` back to a run.
+These two kinds are *not* part of the per-run stream union. The reasons:
 
-The link is:
-
-- **Work-item effectors:** `effector_calls.entity_id` → `work_items.id` → `work_items.run_id`. (`work_items` carries the originating `run_id` for every item the orchestrator created via W1.)
-- **Task effectors:** `effector_calls.entity_id` → `tasks.id` → `tasks.work_item_id` → `work_items.run_id`.
-
-The implementation in T-273 expresses this as a `LEFT JOIN` over `work_items` `UNION ALL` `LEFT JOIN` over `tasks → work_items`, deduplicated by `effector_calls.id`. Or, equivalently, a `JOIN` against a `VIEW`/CTE `effector_run_link(entity_id, run_id)` that unions the two link paths. T-273 picks one; both produce the same rows. The doc fixes the join semantics but not the SQL spelling.
-
-If an effector's `entity_id` does not resolve to a work item or a task — e.g. a future entity kind we haven't added a link path for — the row is **not** included in the run's stream. It remains readable via `read_effector_calls(entity_id)`. This is the same behavior `JsonlTraceStore` exhibits today: effector trace files live under `<trace_dir>/effectors/<entity_id>.jsonl` and are not folded into per-run trace by default; FEAT-004's endpoint also reads them via the same `entity_id` keyed path. Parity is preserved.
+- The `TraceStore` protocol's stream return type does not include `EffectorCallDto` or `ExecutorCallDto` — only the four kinds above. `JsonlTraceStore` enforces this by writing them to separate files (`effectors/<entity_id>.jsonl`, `executors/<run_id>.jsonl`) that the `_tail` reader does not touch. FEAT-013 preserves the protocol contract verbatim.
+- The FEAT-004 streaming endpoint's external behavior is therefore "step / policy_call / webhook_event / operator_signal only." Folding new kinds in would be a contract change, out of scope.
+- Effector calls remain readable via `read_effector_calls(entity_id)` — Postgres backend implementation: `SELECT * FROM effector_calls WHERE entity_id = :entity_id ORDER BY created_at, id`.
+- Executor calls have no run-keyed reader on the protocol today. If a future feature needs one, that's an additive protocol extension and its own FEAT.
 
 ---
 
