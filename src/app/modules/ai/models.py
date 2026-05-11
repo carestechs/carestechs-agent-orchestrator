@@ -13,6 +13,7 @@ from typing import Any
 
 import uuid6
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -675,3 +676,75 @@ class Dispatch(Base):
         self.outcome = DispatchOutcome.CANCELLED
         self.detail = detail
         self.finished_at = at
+
+
+# ---------------------------------------------------------------------------
+# Trace rows persisted by PostgresTraceStore (FEAT-013)
+#
+# The other four trace kinds — step / policy_call / webhook_event /
+# operator_signal — already live in the existing Step / PolicyCall /
+# WebhookEvent / RunSignal tables.  PostgresTraceStore reads from those
+# tables instead of writing them a second time (see
+# docs/design/feat-013-trace-tail-mechanism.md, Decision 2).
+#
+# effector_calls and executor_calls are the only kinds without an
+# existing home; this is where they land.  Both tables are append-only
+# and immutable — no updated_at, no mutating helpers.
+# ---------------------------------------------------------------------------
+
+
+class EffectorCall(Base):
+    """One row per effector dispatch (FEAT-008 effector registry).
+
+    Append-only and immutable.  Keyed on ``entity_id`` (work-item or task
+    UUID), not ``run_id`` — the FEAT-008 effector seam is run-agnostic.
+    ``open_run_stream`` joins through ``work_items`` /
+    ``tasks → work_items`` to fold this back into the per-run trace; see
+    ``docs/design/feat-013-trace-tail-mechanism.md`` Decision 3.
+    """
+
+    __tablename__ = "effector_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    entity_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    transition_key: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_effector_calls_entity_created", "entity_id", "created_at"),
+        Index("ix_effector_calls_transition_key", "transition_key"),
+    )
+
+
+class ExecutorCall(Base):
+    """One row per executor dispatch terminal-state record (FEAT-009).
+
+    Append-only and immutable.  Keyed on ``run_id`` directly because the
+    executor seam is run-scoped — the dispatch row in ``dispatches``
+    already carries ``run_id`` and ``dispatch_id``.  The cascade is
+    intentional: when a run is purged, its executor-call trace is purged
+    with it (the same retention boundary as ``dispatches``).
+    """
+
+    __tablename__ = "executor_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+    )
+    node_name: Mapped[str] = mapped_column(Text, nullable=False)
+    dispatch_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_executor_calls_run_created", "run_id", "created_at"),
+        Index("ix_executor_calls_node_name", "node_name"),
+    )
