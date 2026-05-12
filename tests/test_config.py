@@ -113,6 +113,25 @@ class TestEnvVarHappyPath:
         assert s.engine_api_key is None
         assert s.agents_dir == Path("agents")
         assert s.log_level == "INFO"
+        # FEAT-013 — Postgres is the production default.
+        assert s.trace_backend == "postgres"
+
+    @pytest.mark.usefixtures("_env_with_required")
+    def test_trace_backend_accepts_postgres_jsonl_and_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for value in ("postgres", "jsonl", "noop"):
+            monkeypatch.setenv("TRACE_BACKEND", value)
+            s = Settings()
+            assert s.trace_backend == value
+
+    @pytest.mark.usefixtures("_env_with_required")
+    def test_trace_backend_rejects_unknown_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRACE_BACKEND", "redis")
+        with pytest.raises(ValidationError):
+            Settings()
 
 
 class TestMissingRequiredField:

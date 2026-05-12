@@ -179,7 +179,11 @@ def get_trace_store() -> TraceStore:
 
     * ``"noop"`` — :class:`NoopTraceStore` (default for most tests).
     * ``"jsonl"`` — :class:`~app.modules.ai.trace_jsonl.JsonlTraceStore`
-      writing to :attr:`~app.config.Settings.trace_dir` (AD-5 v1).
+      writing to :attr:`~app.config.Settings.trace_dir` (AD-5 v1;
+      now opt-in local-dev).
+    * ``"postgres"`` — :class:`~app.modules.ai.trace_postgres.PostgresTraceStore`
+      backed by the app's ``async_sessionmaker`` (FEAT-013, AD-5 v2 —
+      production default).
 
     Override in tests via ``app.dependency_overrides[get_trace_store]``.
     """
@@ -194,6 +198,11 @@ def get_trace_store() -> TraceStore:
         from app.modules.ai.trace_jsonl import JsonlTraceStore
 
         _trace_store = JsonlTraceStore(settings.trace_dir)
+    elif settings.trace_backend == "postgres":
+        from app.core.dependencies import get_session_factory
+        from app.modules.ai.trace_postgres import PostgresTraceStore
+
+        _trace_store = PostgresTraceStore(get_session_factory())
     else:
         _trace_store = NoopTraceStore()
     return _trace_store

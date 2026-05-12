@@ -141,7 +141,11 @@ class Settings(BaseSettings):
 
     # -- Observability -----------------------------------------------------
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    trace_backend: Literal["noop", "jsonl"] = "jsonl"
+    # ``postgres`` (FEAT-013) is the production default — trace rows
+    # land in the Postgres tables alongside the rest of run state.
+    # ``jsonl`` remains as an opt-in local-dev backend.  ``noop`` is the
+    # test default and discards all writes.
+    trace_backend: Literal["noop", "jsonl", "postgres"] = "postgres"
 
     @model_validator(mode="after")
     def _validate_llm_provider(self) -> Settings:
