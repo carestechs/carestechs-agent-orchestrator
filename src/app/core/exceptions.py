@@ -41,10 +41,17 @@ class AppError(Exception):
     http_status: ClassVar[int]
     title: ClassVar[str]
 
-    def __init__(self, detail: str, *, errors: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        errors: dict[str, list[str]] | None = None,
+        meta: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.errors: dict[str, list[str]] = errors or {}
+        self.meta: dict[str, str] = meta or {}
 
 
 class ValidationError(AppError):
@@ -124,6 +131,52 @@ class NotImplementedYet(AppError):
 
 
 # ---------------------------------------------------------------------------
+# FEAT-014 — work-item upload errors
+# ---------------------------------------------------------------------------
+
+
+class WorkItemNotRegisteredError(AppError):
+    code = "work-item-not-registered"
+    http_status = 400
+    title = "Work item not registered"
+
+
+class WorkItemContentConflictError(AppError):
+    code = "work-item-content-conflict"
+    http_status = 409
+    title = "Work item content conflict"
+
+    def __init__(self, *, stored_sha256: str, uploaded_sha256: str) -> None:
+        super().__init__(
+            f"work-item body sha256 mismatch: stored={stored_sha256[:12]} "
+            f"uploaded={uploaded_sha256[:12]}",
+            meta={"storedSha256": stored_sha256, "uploadedSha256": uploaded_sha256},
+        )
+        self.stored_sha256 = stored_sha256
+        self.uploaded_sha256 = uploaded_sha256
+
+
+class WorkItemKindConflictError(AppError):
+    code = "work-item-kind-conflict"
+    http_status = 409
+    title = "Work item kind conflict"
+
+    def __init__(self, *, stored_kind: str, uploaded_kind: str) -> None:
+        super().__init__(
+            f"work-item kind mismatch: stored={stored_kind} uploaded={uploaded_kind}",
+            meta={"storedKind": stored_kind, "uploadedKind": uploaded_kind},
+        )
+        self.stored_kind = stored_kind
+        self.uploaded_kind = uploaded_kind
+
+
+class PayloadTooLargeError(AppError):
+    code = "payload-too-large"
+    http_status = 413
+    title = "Payload too large"
+
+
+# ---------------------------------------------------------------------------
 # Problem Details Pydantic schema
 # ---------------------------------------------------------------------------
 
@@ -136,6 +189,7 @@ class ProblemDetails(BaseModel):
     status: int
     detail: str
     errors: dict[str, list[str]] | None = None
+    meta: dict[str, str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +206,7 @@ async def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
         status=exc.http_status,
         detail=exc.detail,
         errors=exc.errors or None,
+        meta=exc.meta or None,
     )
     return JSONResponse(
         status_code=exc.http_status,
@@ -242,4 +297,8 @@ ALL_APP_ERRORS: list[type[AppError]] = [
     EngineError,
     ProviderError,
     NotImplementedYet,
+    WorkItemNotRegisteredError,
+    WorkItemContentConflictError,
+    WorkItemKindConflictError,
+    PayloadTooLargeError,
 ]

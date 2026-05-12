@@ -86,7 +86,8 @@ class TestAppErrorSubclasses:
         assert cls.title == title
 
     def test_all_app_errors_list_complete(self) -> None:
-        assert len(ALL_APP_ERRORS) == 8
+        # 8 core + 4 FEAT-014 work-item errors
+        assert len(ALL_APP_ERRORS) == 12
 
     def test_detail_and_errors(self) -> None:
         exc = ValidationError("bad input", errors={"name": ["required"]})
