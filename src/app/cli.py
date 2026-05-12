@@ -447,6 +447,78 @@ async def _run_reconcile_dispatches(*, since: Optional[str], dry_run: bool) -> N
         raise SystemExit(2)
 
 
+@main.command("migrate-traces")
+def migrate_traces_cmd(
+    from_backend: Annotated[
+        str,
+        typer.Option(
+            "--from",
+            help="Source backend.  Only ``jsonl`` is supported.",
+        ),
+    ] = "jsonl",
+    since: Annotated[
+        Optional[str],
+        typer.Option(
+            "--since",
+            help="ISO-8601 timestamp (with timezone). Only JSONL lines whose "
+            "event timestamp is at or after this are considered.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report what would be inserted without writing.",
+        ),
+    ] = False,
+) -> None:
+    """One-shot JSONL → Postgres trace migration (FEAT-013 / T-276).
+
+    Imports ``effector_call`` and ``executor_call`` JSONL lines into
+    the matching Postgres tables.  For the other four trace kinds the
+    JSONL line is checked against the existing SQL row and a divergence
+    count is reported (never re-inserted).  Idempotent.
+
+    Used at cutover from ``TRACE_BACKEND=jsonl`` to
+    ``TRACE_BACKEND=postgres``; not a continuous-import tool.
+    """
+    import asyncio
+
+    if from_backend != "jsonl":
+        typer.echo(f"error: only --from=jsonl is supported, got {from_backend!r}", err=True)
+        raise SystemExit(2)
+
+    asyncio.run(_run_migrate_traces(since=since, dry_run=dry_run))
+
+
+async def _run_migrate_traces(*, since: Optional[str], dry_run: bool) -> None:
+    from app.config import get_settings
+    from app.core.database import get_engine, make_sessionmaker
+    from app.modules.ai.trace_migrate import (
+        format_report,
+        migrate,
+        parse_iso_since,
+    )
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = parse_iso_since(since)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise SystemExit(2) from exc
+
+    settings = get_settings()
+    sessionmaker = make_sessionmaker(get_engine())
+    report = await migrate(
+        trace_dir=settings.trace_dir,
+        session_factory=sessionmaker,
+        since=since_dt,
+        dry_run=dry_run,
+    )
+    typer.echo(format_report(report))
+
+
 @main.command("trace-retention-sweep")
 def trace_retention_sweep_cmd(
     dry_run: Annotated[
