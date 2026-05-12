@@ -17,7 +17,7 @@
 | **ID** | FEAT-013 |
 | **Name** | Postgres trace store (AD-5 v2 migration) |
 | **Target Version** | v0.8.0 |
-| **Status** | Not Started |
+| **Status** | Completed (T-271..T-281 all landed) |
 | **Priority** | High |
 | **Requested By** | Project owner (post-v1 cleanup; AD-5 deferred work) |
 | **Date Created** | 2026-05-11 |

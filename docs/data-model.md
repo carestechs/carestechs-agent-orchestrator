@@ -370,6 +370,54 @@ v0.1.0's top-level shape is preserved as a read-fallback so a run started under 
 
 ---
 
+### EffectorCall
+
+> *Module: `ai` — One effector dispatch trace row, keyed on entity. Introduced by FEAT-013 / T-272 as the Postgres home for the `effector_call` trace kind (previously only in JSONL at `<trace_dir>/effectors/<entity_id>.jsonl`).*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | bigint | PK, BIGSERIAL | Monotonic insertion key; ties `created_at` for deterministic ordering. |
+| entity_id | uuid | Required | Work-item or task UUID the effector fired against. Not foreign-keyed — effector traces survive a parent purge. |
+| transition_key | text | Required, Indexed | Canonical transition key (`work_item.W2`, `task.T6`, …). |
+| payload | jsonb | Required | Full `EffectorCallDto` body — re-validated on read so the wire shape is stable. |
+| outcome | text | Required | Mirrors `EffectorCallDto.status`: `ok` / `error` / `skipped`. |
+| created_at | timestamptz | Required, Auto | Insertion-time wall-clock from `now()`; primary ordering column. |
+
+**Indexes:**
+- BTREE on `(entity_id, created_at)` — supports `read_effector_calls(entity_id)` and the FEAT-008 / T-172 invariant audit.
+- BTREE on `transition_key` — supports cross-run "every transition X" queries.
+
+**Business Rules:**
+- Append-only. No `updated_at`, no mutating helpers.
+- Keyed on entity, not run — effectors fire on lifecycle transitions whose owning run may have terminated.
+- Not folded into `open_run_stream` / `tail_run_stream`. Read via `TraceStore.read_effector_calls(entity_id)`.
+
+---
+
+### ExecutorCall
+
+> *Module: `ai` — One executor dispatch terminal-state trace row, keyed on run. Introduced by FEAT-013 / T-272 as the Postgres home for the `executor_call` trace kind (previously only in JSONL at `<trace_dir>/executors/<run_id>.jsonl`).*
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | bigint | PK, BIGSERIAL | Monotonic insertion key. |
+| run_id | uuid | FK→runs.id ON DELETE CASCADE, Required | Owning run. Cascade matches the `Dispatch` retention boundary. |
+| node_name | text | Required, Indexed | Executor / node name dispatched against. |
+| dispatch_id | uuid | Nullable | Correlation id of the originating `Dispatch` row when known. |
+| payload | jsonb | Required | Full `ExecutorCallDto` body, including FEAT-010 engine-mode metadata (`correlation_id`, `transition_key`, `engine_run_id`) when present. |
+| outcome | text | Required | Mirrors `ExecutorCallDto.outcome` (or the literal `"pending"` when no terminal outcome was set on the DTO). |
+| created_at | timestamptz | Required, Auto | Insertion-time wall-clock. |
+
+**Indexes:**
+- BTREE on `(run_id, created_at)` — supports the per-run executor trace listing.
+- BTREE on `node_name` — supports "which runs touched node X" queries.
+
+**Business Rules:**
+- Append-only.
+- The protocol does not currently expose a run-keyed reader; the row is the audit trail, not part of the per-run stream. A future protocol extension can add `read_executor_calls(run_id)` symmetrically with effectors.
+
+---
+
 ## Relationships
 
 ### One-to-Many
@@ -562,11 +610,12 @@ None — single-module project in v1.
 - **Append-only where stated**: `Step`, `PolicyCall`, and `WebhookEvent` rows MUST NOT be updated after their terminal fields are set. No "edit last policy call" operations.
 - **Field completeness**: Generated Pydantic/SQLAlchemy classes must include all fields defined here. Do NOT add fields that aren't documented — propose them in a doc update first.
 - **Idempotency**: The `WebhookEvent.dedupe_key` constraint is load-bearing; any ingestion task MUST insert through a path that honors it.
-- **JSONL ↔ Postgres parity**: Any change to an entity's shape MUST update both the v1 JSONL writer and the v2 SQLAlchemy model in the same PR. They are two representations of the same model.
+- **JSONL ↔ Postgres parity**: As of FEAT-013, Postgres is the primary backend and `JsonlTraceStore` is opt-in for local dev. The two backends must still emit byte-identical NDJSON for the same logical run (the FEAT-004 endpoint contract). Any change to an entity's shape MUST update the SQLAlchemy model and verify the JSONL backend continues to round-trip the same field set.
 - **No cross-module relationships**: Do not introduce foreign keys to modules that don't exist yet.
 
 ## Changelog
 
+- 2026-05-11 — FEAT-013 (Postgres trace store, AD-5 v2) — Added `EffectorCall` and `ExecutorCall` entities (tables `effector_calls`, `executor_calls`); BIGSERIAL `id`, JSONB `payload`, `created_at TIMESTAMPTZ DEFAULT now()`. Forward-only migration `7a3f1d2c9e4b`. The other four trace kinds (`step`, `policy_call`, `webhook_event`, `operator_signal`) remain in their existing tables — `PostgresTraceStore` reads them rather than re-writing. `Settings.trace_backend` Literal widened to `"noop" | "jsonl" | "postgres"` with `"postgres"` as the production default; `JsonlTraceStore` stays as opt-in local dev. Design doc: `docs/design/feat-013-trace-tail-mechanism.md`.
 - 2026-05-01 — Task body expansion (post-BUG-008) — No SQL schema changes. `LifecycleTask` (Pydantic model under `RunMemory.data['lifecycle.v1']`) gained five additive fields: `description: str = ""`, `acceptance_criteria: list[str] = []`, `complexity: Literal["small","medium","large"] = "medium"`, `depends_on: list[str] = []`, `files_hint: list[str] = []`. `GenerateTasksTask` (the LLM-content schema for the `generate_tasks` node) mirrors the same fields. Old runs validate via field defaults — no migration. The local `tasks` table is unchanged; per-task body lives in memory + (for the planner) in `task_plans.plan_markdown`.
 - 2026-04-30 — FEAT-011 (deterministic lifecycle port — `lifecycle-agent@0.3.0`) — No schema changes. v0.3.0 reuses every existing entity (`Run`, `Step`, `Dispatch`, `RunMemory`, `RunSignal`, `WorkItem`, `Task`, `Approval`, `PendingAuxWrite`). `RunMemory.data` is now namespaced under `lifecycle.v1` for v0.3.0 runs (helpers in `tools/lifecycle/memory.py`); v0.1.0's top-level shape is preserved as a read-fallback. `correct_implementation` (rejection branch) writes `Approval(stage='impl', decision='reject', decided_by='lifecycle-agent', decided_by_role='admin')` inline — FEAT-008 contract preserved bit-for-bit (no engine call on rejection). `Dispatch.intake` JSONB on engine-mode rows already carries `correlation_id` + `transition_key`; v0.3.0 composite executors mirror that shape. v0.1.0 entities and write paths remain unchanged for the migration window.
 - 2026-04-26 — FEAT-010 (engine executor adapter) — No schema changes. The `dispatches.mode` CHECK constraint extension to include `'engine'` shipped in PR 2's migration; this PR is note-only. `Dispatch.intake` (JSONB) carries `correlation_id` + `transition_key` for engine-mode rows so the dispatch reconciler (`reconcile_orphan_dispatches_engine_aware`) can look up the matching outbox row without a new column. The `pending_aux_writes` row remains the durable source of truth for the correlation; the dispatch row only mirrors it for in-process wake / restart-time lookup. The `executor_call` trace shape is extended (additive only) with optional `transition_key`, `correlation_id`, and `engine_run_id` fields, populated only when `mode=engine`. New CLI `orchestrator reconcile-dispatches` reads `dispatches` + `pending_aux_writes` only — no new tables, no new indices.
