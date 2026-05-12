@@ -87,14 +87,14 @@ async def register_work_item(
             opened_by=opened_by,
             status=WorkItemStatus.OPEN.value,
         )
-        session.add(wi)
+        # SAVEPOINT-scoped INSERT so a concurrent-race ``IntegrityError``
+        # rolls back only the inner attempt without killing the caller's
+        # outer transaction (the route's run-creation tx).
         try:
-            await session.flush()
+            async with session.begin_nested():
+                session.add(wi)
+                await session.flush()
         except IntegrityError:
-            # Concurrent INSERT — another coroutine inserted the same
-            # external_ref between our SELECT and our flush.  Roll back
-            # the failed INSERT, re-read, and reconcile.
-            await session.rollback()
             existing = await session.scalar(
                 select(WorkItem).where(WorkItem.external_ref == dto.id)
             )

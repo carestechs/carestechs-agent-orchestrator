@@ -80,22 +80,26 @@ Acceptable matches after this task:
 
 Nothing else.
 
-## Investigation Findings
+## Investigation Findings (completed 2026-05-12)
 
-<!--
-Fill in during Step I-3. Format:
+Grep results across `src/app/modules/ai/executors/` and `src/app/modules/ai/lifecycle/`:
 
-### Site 1: `bootstrap.py:408` — `generate_tasks` adapter
-- Category: (A) reads body content
-- Action: swap to ctx.memory["work_item_body"]; update prompt template
-- Verified by: existing test `test_generate_tasks_*.py` passes without modification
+| Site | Category | Decision |
+|------|----------|----------|
+| `bootstrap.py::_load_work_item_brief_file` (was line 398–427) | (A) reads body content | **Remediated** — replaced with `_load_work_item_brief_db` that fetches `WorkItem.body_md` via `_load_work_item_body` from T-286. |
+| `bootstrap.py` `load_work_item` `LLMContentExecutor` prompt template (line 521–527) | (B) reads path string for prompt only | **Remediated** — template changed from `The path is {workItemPath}; the full content follows.` to `Synthesize a brief for the work item with id`{workItemId}`. The full body follows.`. The `{workItemBrief}` variable continues to carry the body. |
+| `bootstrap.py` `generate_tasks` `LLMContentExecutor` `prompt_context_loader` | (A) reads body content | **Remediated** — was wired to the same `_load_work_item_brief_file`; now wired to `_load_work_item_brief_db`. The existing prompt template already references `{workItemId}` + `{workItemBrief}` (BUG-005 / BUG-012), no template change needed. |
+| `bootstrap.py::_load_prompt` (line 446–450) | (C) Reads the executor's own system-prompt file from the package's `prompts/lifecycle/` directory | **No change** — not a work-item brief; package-resource read. |
+| `tools/lifecycle/work_items.py:33` (`.read_text()`) | Out of scope | **No change** — v0.1.0 LLM-policy path. The brief's exclusion clause and CLAUDE.md's "legacy `lifecycle-agent@0.1.0` LLM-policy path is the lone exception" both apply. |
+| `tools/lifecycle/close_work_item.py:57` (`.read_text()`) | Out of scope | **No change** — same as above. |
+| `runtime_deterministic.py:218` | (C) comment only | **No change.** |
+| `schemas.py` (FEAT-014 docstring) | (C) docstring only | **No change.** |
 
-### Site 2: `bootstrap.py:437` — prompt template variable
-- Category: (B) reads path string for prompt only
-- Action: change `{workItemPath}` → `{workItemId}` + add `{workItemBody}` block
+`grep -rn "workItemPath" src/app/ | grep -v test_` after remediation: only comments, the FEAT-014 docstring, and the executor's memory-patch legacy-compat key (kept for one minor, removed in the follow-up cut).
 
-(etc.)
--->
+`grep -rn ".read_text\|.read_bytes" src/app/modules/ai/executors/ src/app/modules/ai/lifecycle/` after remediation: only the package-resource `_load_prompt` (system-prompt loader). No work-item brief reads remain.
+
+Agent YAML updates: `lifecycle-agent@0.3.0.yaml` and `lifecycle-agent@0.2.0.yaml` `intakeSchema` now uses `anyOf: [required: [workItem], required: [workItemPath]]` so both the new and legacy intake shapes pass jsonschema validation.
 
 ## Files Affected
 | File | Action | Summary |

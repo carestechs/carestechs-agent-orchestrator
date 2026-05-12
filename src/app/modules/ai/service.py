@@ -11,9 +11,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import jsonschema
@@ -30,7 +32,7 @@ from app.core.exceptions import (
 )
 from app.modules.ai import repository
 from app.modules.ai.agents import list_agent_records, load_agent
-from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType
+from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType, WorkItemType
 from app.modules.ai.lifecycle.work_item_registry import register_work_item
 from app.modules.ai.models import Run, RunMemory, Step, WebhookEvent, generate_uuid7
 from app.modules.ai.reconciliation import next_step_state
@@ -72,6 +74,48 @@ _KIND_BY_TYPE: dict[type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDt
     WebhookEventDto: "webhook_event",
     RunSignalDto: "operator_signal",
 }
+
+
+# FEAT-014 / T-288 — legacy ``intake.workItemPath`` filename parser.
+# Removed in the FEAT after the next minor cut.
+_LEGACY_WORK_ITEM_FILENAME_RE = re.compile(r"^(FEAT|BUG|IMP)-(\d+)(?:-[a-z0-9-]+)?$")
+
+
+def _legacy_work_item_path_to_dto(
+    legacy_path: str,
+    *,
+    settings: Settings,
+) -> RunIntakeWorkItem:
+    """DEPRECATED FEAT-014; remove after one minor.
+
+    Read the brief at *legacy_path* (resolved relative to
+    ``Settings.repo_root`` for relative paths) and build a
+    ``RunIntakeWorkItem`` so the legacy run-start path continues to
+    work through the deprecation window.  Filename must match
+    ``(FEAT|BUG|IMP)-<digits>[-slug].md``.
+    """
+    from app.core.exceptions import WorkItemNotRegisteredError
+
+    path = Path(legacy_path)
+    if not path.is_absolute():
+        path = Path(settings.repo_root) / path
+    if not path.is_file():
+        raise WorkItemNotRegisteredError(
+            f"legacy workItemPath not found: {legacy_path}"
+        )
+    body = path.read_text(encoding="utf-8")
+    m = _LEGACY_WORK_ITEM_FILENAME_RE.match(path.stem)
+    if m is None:
+        raise WorkItemNotRegisteredError(
+            f"legacy workItemPath has unrecognized filename: {legacy_path} "
+            "(expected FEAT-XXX[-slug].md / BUG-XXX[-slug].md / IMP-XXX[-slug].md)"
+        )
+    kind_str, num = m.groups()
+    return RunIntakeWorkItem(
+        id=f"{kind_str}-{num}",
+        kind=WorkItemType(kind_str),
+        content=body,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +183,24 @@ async def start_run(
     work_item_dto: RunIntakeWorkItem | None = None
     if work_item_raw is not None:
         work_item_dto = RunIntakeWorkItem.model_validate(work_item_raw)
+    elif (legacy_path := request.intake.get("workItemPath")) is not None and isinstance(
+        legacy_path, str
+    ):
+        # FEAT-014 / T-288: legacy ``intake.workItemPath`` shape.  The
+        # body is read from the orchestrator's filesystem (single
+        # remaining disk-read site, tagged ``DEPRECATED FEAT-014``),
+        # registered via ``register_work_item``, and a WARNING is
+        # emitted with the stable code ``intake-work-item-path-deprecated``
+        # so operators can grep it.  The new shape wins when both keys
+        # are present (the ``if`` branch above).
+        logger.warning(
+            "intake-work-item-path-deprecated",
+            extra={
+                "code": "intake-work-item-path-deprecated",
+                "path": legacy_path,
+            },
+        )
+        work_item_dto = _legacy_work_item_path_to_dto(legacy_path, settings=settings)
 
     # 5. Persist Run + RunMemory + (optionally) the work-item row in one commit.
     run_id = generate_uuid7()

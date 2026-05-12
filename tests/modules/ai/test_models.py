@@ -285,6 +285,9 @@ class TestWorkItem:
             "type",
             "title",
             "source_path",
+            # FEAT-014: uploaded body + content hash.
+            "body_md",
+            "body_sha256",
             "status",
             "engine_item_id",
             "opened_by",

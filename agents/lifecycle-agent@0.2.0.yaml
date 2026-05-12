@@ -48,8 +48,19 @@ flow:
 intakeSchema:
   type: object
   properties:
+    # FEAT-014: ``workItem`` is the canonical upload shape.
+    # ``workItemPath`` is accepted for one minor as legacy compat.
+    workItem:
+      type: object
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [FEAT, BUG, IMP]}
+        content: {type: string}
+      required: [id, kind]
     workItemPath: {type: string}
-  required: [workItemPath]
+  anyOf:
+    - required: [workItem]
+    - required: [workItemPath]
 
 terminalNodes: [request_closure]
 
