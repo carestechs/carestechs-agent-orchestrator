@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # test default and discards all writes.
     trace_backend: Literal["noop", "jsonl", "postgres"] = "postgres"
 
+    # FEAT-013 — retention sweep target.  ``None`` (default) disables
+    # retention; otherwise ``orchestrator trace-retention-sweep`` deletes
+    # ``effector_calls`` / ``executor_calls`` rows older than this many
+    # days.  Operators wire the CLI to their scheduler (cron / systemd /
+    # CronJob); the orchestrator runs no in-process retention thread.
+    trace_retention_days: int | None = None
+
     @model_validator(mode="after")
     def _validate_llm_provider(self) -> Settings:
         """Enforce provider-specific invariants at ``Settings()`` construction.

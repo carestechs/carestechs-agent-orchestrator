@@ -85,6 +85,7 @@ class TestSettingsFields:
             "flow_engine_tenant_id",
             "log_level",
             "trace_backend",
+            "trace_retention_days",
             "engine_dispatch_timeout_seconds",
             "public_base_url",
             "executor_dispatch_secret",
