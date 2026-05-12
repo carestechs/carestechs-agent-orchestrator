@@ -280,6 +280,11 @@ class WorkItem(Base):
     type: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # FEAT-014: uploaded markdown body + content-addressed sha256.  Briefs
+    # are immutable once ``body_sha256`` is populated; re-uploads with a
+    # different body are rejected with 409 (``work-item-content-conflict``).
+    body_md: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, default=WorkItemStatus.OPEN)
     # FEAT-006 rc2 (T-131a): nullable for transition.  When the engine
     # client is configured, ``engine_item_id`` is populated at open-time
@@ -298,6 +303,10 @@ class WorkItem(Base):
         _enum_check("type", WorkItemType),
         UniqueConstraint("external_ref", name="uq_work_items_external_ref"),
         Index("ix_work_items_status_updated_at", "status", updated_at.desc()),
+        CheckConstraint(
+            "body_sha256 IS NULL OR body_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_work_items_body_sha256_format",
+        ),
     )
 
 
