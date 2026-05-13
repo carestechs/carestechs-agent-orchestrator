@@ -11,10 +11,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import jsonschema
 from jsonschema import ValidationError as JsonSchemaValidationError
@@ -22,10 +24,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    PayloadTooLargeError,
+    ValidationError,
+)
 from app.modules.ai import repository
 from app.modules.ai.agents import list_agent_records, load_agent
-from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType
+from app.modules.ai.enums import RunStatus, StepStatus, StopReason, WebhookEventType, WorkItemType
+from app.modules.ai.lifecycle.work_item_registry import register_work_item
 from app.modules.ai.models import Run, RunMemory, Step, WebhookEvent, generate_uuid7
 from app.modules.ai.reconciliation import next_step_state
 from app.modules.ai.runtime import run_loop
@@ -36,6 +44,7 @@ from app.modules.ai.schemas import (
     LastStepSummary,
     PolicyCallDto,
     RunDetailDto,
+    RunIntakeWorkItem,
     RunSignalDto,
     RunSummaryDto,
     StepDto,
@@ -67,6 +76,48 @@ _KIND_BY_TYPE: dict[type[StepDto | PolicyCallDto | WebhookEventDto | RunSignalDt
 }
 
 
+# FEAT-014 / T-288 — legacy ``intake.workItemPath`` filename parser.
+# Removed in the FEAT after the next minor cut.
+_LEGACY_WORK_ITEM_FILENAME_RE = re.compile(r"^(FEAT|BUG|IMP)-(\d+)(?:-[a-z0-9-]+)?$")
+
+
+def _legacy_work_item_path_to_dto(
+    legacy_path: str,
+    *,
+    settings: Settings,
+) -> RunIntakeWorkItem:
+    """DEPRECATED FEAT-014; remove after one minor.
+
+    Read the brief at *legacy_path* (resolved relative to
+    ``Settings.repo_root`` for relative paths) and build a
+    ``RunIntakeWorkItem`` so the legacy run-start path continues to
+    work through the deprecation window.  Filename must match
+    ``(FEAT|BUG|IMP)-<digits>[-slug].md``.
+    """
+    from app.core.exceptions import WorkItemNotRegisteredError
+
+    path = Path(legacy_path)
+    if not path.is_absolute():
+        path = Path(settings.repo_root) / path
+    if not path.is_file():
+        raise WorkItemNotRegisteredError(
+            f"legacy workItemPath not found: {legacy_path}"
+        )
+    body = path.read_text(encoding="utf-8")
+    m = _LEGACY_WORK_ITEM_FILENAME_RE.match(path.stem)
+    if m is None:
+        raise WorkItemNotRegisteredError(
+            f"legacy workItemPath has unrecognized filename: {legacy_path} "
+            "(expected FEAT-XXX[-slug].md / BUG-XXX[-slug].md / IMP-XXX[-slug].md)"
+        )
+    kind_str, num = m.groups()
+    return RunIntakeWorkItem(
+        id=f"{kind_str}-{num}",
+        kind=WorkItemType(kind_str),
+        content=body,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runs
 # ---------------------------------------------------------------------------
@@ -93,7 +144,29 @@ async def start_run(
     agent = load_agent(request.agent_ref, settings.agents_dir)
     assert agent.agent_definition_hash is not None  # loader always sets it
 
-    # 2. Validate intake against the agent's declared schema.
+    # 2. FEAT-014 size cap: reject oversized work-item content *before*
+    #    sha256-hashing so a malicious upload can't burn CPU on hashing
+    #    a large string.  Reads only the dict shape; the typed parse
+    #    happens at step 4.
+    work_item_raw_any: Any = request.intake.get("workItem")
+    work_item_raw: dict[str, Any] | None = (
+        cast("dict[str, Any]", work_item_raw_any)
+        if isinstance(work_item_raw_any, dict)
+        else None
+    )
+    if work_item_raw is not None:
+        content_any: Any = work_item_raw.get("content")
+        if isinstance(content_any, str):
+            byte_len = len(content_any.encode("utf-8"))
+            if byte_len > settings.intake_work_item_max_bytes:
+                raise PayloadTooLargeError(
+                    detail=(
+                        f"intake.workItem.content exceeds INTAKE_WORK_ITEM_MAX_BYTES "
+                        f"({byte_len} > {settings.intake_work_item_max_bytes})"
+                    ),
+                )
+
+    # 3. Validate intake against the agent's declared schema.
     if agent.intake_schema and agent.intake_schema.get("properties"):
         try:
             jsonschema.validate(instance=request.intake, schema=agent.intake_schema)
@@ -103,21 +176,58 @@ async def start_run(
                 errors={"intake": [exc.message]},
             ) from exc
 
-    # 3. Persist Run + RunMemory in one commit.
+    # 4. FEAT-014 work-item upload: typed-parse and register inside the
+    #    same transaction as the Run insert.  Errors propagate to the
+    #    global handler — 400 ``work-item-not-registered`` or 409
+    #    ``work-item-content-conflict`` / ``work-item-kind-conflict``.
+    work_item_dto: RunIntakeWorkItem | None = None
+    if work_item_raw is not None:
+        work_item_dto = RunIntakeWorkItem.model_validate(work_item_raw)
+    elif isinstance((legacy_path := request.intake.get("workItemPath")), str):
+        # FEAT-014 / T-288: legacy ``intake.workItemPath`` shape.  The
+        # body is read from the orchestrator's filesystem (single
+        # remaining disk-read site, tagged ``DEPRECATED FEAT-014``),
+        # registered via ``register_work_item``, and a WARNING is
+        # emitted with the stable code ``intake-work-item-path-deprecated``
+        # so operators can grep it.  The new shape wins when both keys
+        # are present (the ``if`` branch above).
+        logger.warning(
+            "intake-work-item-path-deprecated",
+            extra={
+                "code": "intake-work-item-path-deprecated",
+                "path": legacy_path,
+            },
+        )
+        work_item_dto = _legacy_work_item_path_to_dto(legacy_path, settings=settings)
+
+    # 5. Persist Run + RunMemory + (optionally) the work-item row in one commit.
     run_id = generate_uuid7()
     trace_uri = f"file://{settings.trace_dir}/{run_id}.jsonl"
-    run = Run(
-        id=run_id,
-        agent_ref=request.agent_ref,
-        agent_definition_hash=agent.agent_definition_hash,
-        intake=request.intake,
-        status=RunStatus.PENDING,
-        started_at=datetime.now(UTC),
-        trace_uri=trace_uri,
-    )
-    memory = RunMemory(run_id=run_id, data={})
 
     async with session_factory() as session:
+        if work_item_dto is not None:
+            wi = await register_work_item(session, work_item_dto)
+            # Seed engineItemId into the run's intake so the engine
+            # executor's existing read path keeps working.  Also normalize
+            # workItemId for downstream consumers.
+            intake_copy = dict(request.intake)
+            intake_copy.setdefault("workItemId", str(wi.id))
+            if wi.engine_item_id is not None:
+                intake_copy.setdefault("engineItemId", str(wi.engine_item_id))
+            run_intake = intake_copy
+        else:
+            run_intake = request.intake
+
+        run = Run(
+            id=run_id,
+            agent_ref=request.agent_ref,
+            agent_definition_hash=agent.agent_definition_hash,
+            intake=run_intake,
+            status=RunStatus.PENDING,
+            started_at=datetime.now(UTC),
+            trace_uri=trace_uri,
+        )
+        memory = RunMemory(run_id=run_id, data={})
         session.add_all([run, memory])
         await session.commit()
         await session.refresh(run)

@@ -154,6 +154,11 @@ class Settings(BaseSettings):
     # CronJob); the orchestrator runs no in-process retention thread.
     trace_retention_days: int | None = None
 
+    # FEAT-014 — server-side cap on ``intake.workItem.content`` size at the
+    # POST /api/v1/runs and POST /api/v1/work-items boundaries.  Bytes,
+    # measured as ``len(content.encode("utf-8"))``.  Default 1 MB.
+    intake_work_item_max_bytes: int = Field(default=1_048_576, ge=1)
+
     @model_validator(mode="after")
     def _validate_llm_provider(self) -> Settings:
         """Enforce provider-specific invariants at ``Settings()`` construction.

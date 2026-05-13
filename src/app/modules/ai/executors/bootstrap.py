@@ -75,6 +75,7 @@ def register_all_executors(
     agents_dir: Path,
     *,
     v03_collaborators: LifecycleV03Collaborators | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     """Register an executor for every node of every loaded agent.
 
@@ -95,7 +96,14 @@ def register_all_executors(
         if agent.ref.startswith("lifecycle-agent@0.1"):
             _register_lifecycle_v01(registry, agent.ref, [n.name for n in agent.nodes])
         elif agent.ref.startswith("lifecycle-agent@0.2"):
-            _register_lifecycle_v02(registry, agent.ref)
+            # FEAT-014 / T-286: v0.2's ``request_work_item_load`` reads
+            # the body from DB.  Prefer the explicit kwarg; fall back to
+            # the v0.3 collaborators' session_factory if available; else
+            # the handler will surface ``loaded=False`` at dispatch time.
+            v02_session_factory = session_factory or (
+                v03_collaborators.session_factory if v03_collaborators else None
+            )
+            _register_lifecycle_v02(registry, agent.ref, session_factory=v02_session_factory)
         elif agent.ref.startswith("lifecycle-agent@0.3"):
             if v03_collaborators is None:
                 _exempt_lifecycle_v03(agent.ref, [n.name for n in agent.nodes])
@@ -172,7 +180,12 @@ def _make_v01_placeholder(agent_ref: str, node_name: str):  # type: ignore[no-un
 # ---------------------------------------------------------------------------
 
 
-def _register_lifecycle_v02(registry: ExecutorRegistry, agent_ref: str) -> None:
+def _register_lifecycle_v02(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
     """Register the v0.2.0 demo agent's local executors.
 
     v0.2.0 is a minimal demo proving the new shape end-to-end (dispatch
@@ -180,13 +193,19 @@ def _register_lifecycle_v02(registry: ExecutorRegistry, agent_ref: str) -> None:
     drop-in replacement for v0.1.0 — migrating the full lifecycle (with
     its eight original tools, LifecycleMemory semantics, and the
     wait_for_implementation pause) is tracked as a separate future FEAT.
+
+    FEAT-014 / T-286: ``request_work_item_load`` reads the brief body
+    from the ``work_items`` row instead of opening a file under
+    ``docs/work-items/``.  When *session_factory* is absent (tests that
+    don't load the v0.3 collaborators), the handler returns ``loaded=False``
+    rather than touching disk.
     """
     registry.register(
         agent_ref,
         "request_work_item_load",
         LocalExecutor(
             ref="local:request_work_item_load",
-            handler=_handle_request_work_item_load,
+            handler=_make_work_item_load_handler(session_factory),
         ),
     )
     registry.register(
@@ -196,19 +215,88 @@ def _register_lifecycle_v02(registry: ExecutorRegistry, agent_ref: str) -> None:
     )
 
 
-async def _handle_request_work_item_load(ctx: DispatchContext) -> Mapping[str, Any]:
-    """Load a work-item brief path into the run's memory.
+async def _load_work_item_body(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    external_ref: str,
+) -> tuple[str | None, str | None]:
+    """Return ``(body_md, source_path)`` for the work item identified by
+    *external_ref*.  Either component may be ``None``.
 
-    Pure code; no LLM. The path comes from the run's ``intake.workItemPath``
-    forwarded by the runtime via memory bookkeeping (or a future
-    enhancement that threads intake into ``DispatchContext.intake``).
+    Short-lived session per call — matches the runtime loop's
+    one-session-per-iteration discipline and never holds a session across
+    yields.  Imports SQLAlchemy + the model lazily to keep import-time
+    surface small.
     """
-    path = ctx.intake.get("workItemPath") or ctx.intake.get("path")
-    return {
-        "loaded": True,
-        "path": str(path) if path is not None else None,
-        "__memory_patch": {"work_item_path": str(path) if path is not None else None},
-    }
+    from sqlalchemy import select as _select
+
+    from app.modules.ai.models import WorkItem as _WorkItem
+
+    async with session_factory() as session:
+        row = await session.scalar(
+            _select(_WorkItem).where(_WorkItem.external_ref == external_ref)
+        )
+        if row is None:
+            return None, None
+        return row.body_md, row.source_path
+
+
+def _make_work_item_load_handler(
+    session_factory: async_sessionmaker[AsyncSession] | None,
+):  # type: ignore[no-untyped-def]
+    """Build the ``request_work_item_load`` handler bound to *session_factory*.
+
+    FEAT-014 / T-286: returns a coroutine that reads ``intake.workItem.id``
+    (or legacy ``intake.workItemId``), looks up the row, and emits a
+    memory patch carrying the body.  The legacy ``intake.workItemPath``
+    is preserved on the memory patch for downstream consumers that still
+    expect it during the deprecation window (T-288).
+    """
+
+    async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
+        work_item_raw: Any = ctx.intake.get("workItem")
+        external_ref_raw: Any
+        if isinstance(work_item_raw, Mapping):
+            external_ref_raw = cast("Mapping[str, Any]", work_item_raw).get("id")
+        else:
+            external_ref_raw = ctx.intake.get("workItemId")
+        external_ref: str | None = (
+            str(external_ref_raw)  # external_ref_raw: Any
+            if external_ref_raw is not None
+            else None
+        )
+
+        if external_ref is None or session_factory is None:
+            # Either no work-item is wired (non-lifecycle agent) or
+            # session_factory wasn't provided (test wiring); return a
+            # safe ``loaded=False`` rather than touching disk.
+            return {
+                "loaded": False,
+                "externalRef": external_ref,
+                "__memory_patch": {
+                    "work_item_body": None,
+                    "work_item_id": external_ref,
+                    "work_item_path": ctx.intake.get("workItemPath"),
+                },
+            }
+
+        body_md, source_path = await _load_work_item_body(
+            session_factory, external_ref=external_ref
+        )
+        return {
+            "loaded": body_md is not None,
+            "externalRef": external_ref,
+            "__memory_patch": {
+                "work_item_body": body_md,
+                "work_item_id": external_ref,
+                # Legacy compat: some prompts / downstream consumers still
+                # read ``work_item_path`` during the FEAT-014 deprecation
+                # window.  Removed in the follow-up cut.
+                "work_item_path": source_path or ctx.intake.get("workItemPath"),
+            },
+        }
+
+    return _handler
 
 
 async def _handle_request_closure(_ctx: DispatchContext) -> Mapping[str, Any]:
@@ -395,36 +483,51 @@ def register_lifecycle_v03(
         )
         return write_lifecycle_memory(memory)
 
-    async def _load_work_item_brief_file(ctx: DispatchContext) -> Mapping[str, Any]:
-        # BUG-005: the user prompt previously only carried the path
-        # string; the LLM had no way to read the file and would invent
-        # a title from the external ref.  Read the file from disk
-        # (resolved relative to ``Settings.repo_root``) and expose it
-        # as ``{workItemBrief}`` for the prompt template.
-        from pathlib import Path as _Path
+    async def _load_work_item_brief_db(ctx: DispatchContext) -> Mapping[str, Any]:
+        # FEAT-014 / T-287: read the brief body from ``WorkItem.body_md``
+        # keyed on the run's ``intake.workItem.id`` (or legacy
+        # ``workItemId``).  Replaces BUG-005's disk read of
+        # ``intake.workItemPath`` — the orchestrator no longer needs
+        # filesystem access to the caller's brief.  Falls back to a
+        # placeholder when the row is missing or body is NULL so the
+        # LLM still has *something* to synthesise from.
+        external_ref_raw: Any = ctx.intake.get("workItemId")
+        work_item_raw: Any = ctx.intake.get("workItem")
+        if isinstance(work_item_raw, Mapping):
+            external_ref_raw = (
+                cast("Mapping[str, Any]", work_item_raw).get("id") or external_ref_raw
+            )
+        external_ref = (
+            str(external_ref_raw)  # external_ref_raw: Any
+            if external_ref_raw is not None
+            else None
+        )
 
-        from app.config import get_settings as _get_settings
+        # ``workItemId`` is also looked up in the prompt template; expose
+        # the resolved external ref so the template binding works either
+        # way (new shape via ``intake.workItem.id`` OR legacy intake).
+        bindings: dict[str, Any] = {
+            "workItemId": external_ref or "",
+            "workItemBrief": "",
+        }
 
-        raw_path = ctx.intake.get("workItemPath")
-        if not raw_path:
-            return {"workItemBrief": ""}
-        path = _Path(str(raw_path))
-        if not path.is_absolute():
-            path = _Path(_get_settings().repo_root) / path
-        try:
-            return {"workItemBrief": path.read_text(encoding="utf-8")}
-        except FileNotFoundError:
-            return {
-                "workItemBrief": (
-                    f"<!-- file not found at {path!s}; " "synthesize from the path's external ref alone -->"
-                )
-            }
-        except OSError as exc:
-            return {
-                "workItemBrief": (
-                    f"<!-- could not read {path!s}: {exc}; " "synthesize from the path's external ref alone -->"
-                )
-            }
+        if external_ref is None:
+            bindings["workItemBrief"] = (
+                "<!-- no work_item in intake; synthesize from the run's intake alone -->"
+            )
+            return bindings
+
+        body_md, _ = await _load_work_item_body(
+            session_factory, external_ref=external_ref
+        )
+        if body_md is None:
+            bindings["workItemBrief"] = (
+                f"<!-- work_item {external_ref} has no body stored; "
+                "synthesize from the external ref alone -->"
+            )
+        else:
+            bindings["workItemBrief"] = body_md
+        return bindings
 
     registry.register(
         agent_ref,
@@ -433,8 +536,8 @@ def register_lifecycle_v03(
             ref="llm:load_work_item",
             system_prompt=_load_prompt("load_work_item"),
             user_prompt_template=(
-                "Synthesize a brief for the work item described in the file below. "
-                "The path is {workItemPath}; the full content follows.\n\n"
+                "Synthesize a brief for the work item with id `{workItemId}`. "
+                "The full body follows.\n\n"
                 "----- BEGIN WORK ITEM BRIEF -----\n"
                 "{workItemBrief}\n"
                 "----- END WORK ITEM BRIEF -----\n"
@@ -442,7 +545,7 @@ def register_lifecycle_v03(
             result_schema=LoadWorkItemResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_load_work_item,
-            prompt_context_loader=_load_work_item_brief_file,
+            prompt_context_loader=_load_work_item_brief_db,
             session_factory=session_factory,
         ),
     )
@@ -511,7 +614,7 @@ def register_lifecycle_v03(
             result_schema=GenerateTasksResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_generate_tasks,
-            prompt_context_loader=_load_work_item_brief_file,
+            prompt_context_loader=_load_work_item_brief_db,
             session_factory=session_factory,
         ),
     )

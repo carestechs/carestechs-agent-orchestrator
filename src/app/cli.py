@@ -8,6 +8,7 @@ service — never the database directly (CLAUDE.md anti-pattern).  Only
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Annotated, Any, Optional, cast
@@ -177,6 +178,26 @@ def _emit(envelope: dict[str, Any], human_renderer: Any = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+_WORK_ITEM_FILENAME_RE = re.compile(r"^(FEAT|BUG|IMP)-(\d+)(?:-[a-z0-9-]+)?\.md$")
+
+
+def _parse_work_item_filename(name: str) -> tuple[str, str]:
+    """FEAT-014 / T-289 — derive ``(external_ref, kind)`` from a brief filename.
+
+    Pattern: ``(FEAT|BUG|IMP)-<digits>[-slug].md``.  Lowercase slug only;
+    uppercase / underscores / missing digits all reject.
+    """
+    m = _WORK_ITEM_FILENAME_RE.match(name)
+    if not m:
+        raise typer.BadParameter(
+            f"--work-item filename must match FEAT-XXX[-slug].md / "
+            f"BUG-XXX[-slug].md / IMP-XXX[-slug].md; got: {name}. "
+            "Use --intake workItem.id=... for non-standard names."
+        )
+    kind, num = m.groups()
+    return f"{kind}-{num}", kind
+
+
 @main.command()
 def run(
     agent_ref: Annotated[str, typer.Argument(help="Agent reference, e.g. lifecycle-agent@0.3.0")],
@@ -187,6 +208,16 @@ def run(
     intake_file: Annotated[
         Optional[str],
         typer.Option("--intake-file", help="YAML/JSON file providing the intake payload."),
+    ] = None,
+    work_item: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--work-item",
+            help=(
+                "Path to a FEAT-/BUG-/IMP-*.md brief. Read client-side and "
+                "uploaded as intake.workItem (FEAT-014)."
+            ),
+        ),
     ] = None,
     budget_steps: Annotated[
         Optional[int],
@@ -212,6 +243,25 @@ def run(
     """Start an agent run; optionally block until it terminates."""
     _require_api_key()
     intake_payload = _parse_intake(intake, intake_file)
+
+    # FEAT-014 / T-289 — --work-item reads the file client-side and
+    # embeds the body in intake.workItem; mutually exclusive with the
+    # legacy --intake workItemPath=... shape.
+    if work_item is not None:
+        if "workItemPath" in intake_payload:
+            typer.echo(
+                "error: --work-item and --intake workItemPath=... are mutually "
+                "exclusive; pick one",
+                err=True,
+            )
+            raise SystemExit(2)
+        if not work_item.is_file():
+            typer.echo(f"error: --work-item file not found: {work_item}", err=True)
+            raise SystemExit(2)
+        body_md = work_item.read_text(encoding="utf-8")
+        ext_ref, kind = _parse_work_item_filename(work_item.name)
+        intake_payload["workItem"] = {"id": ext_ref, "kind": kind, "content": body_md}
+
     body: dict[str, Any] = {"agentRef": agent_ref, "intake": intake_payload}
     if budget_steps is not None or budget_tokens is not None:
         body["budget"] = {"maxSteps": budget_steps, "maxTokens": budget_tokens}
@@ -562,6 +612,85 @@ async def _run_trace_retention_sweep(*, dry_run: bool) -> None:
             dry_run=dry_run,
         )
     typer.echo(format_report(report))
+
+
+@main.command("import-work-items")
+def import_work_items(
+    directory: Annotated[
+        Path,
+        typer.Argument(help="Directory containing FEAT-/BUG-/IMP-*.md briefs."),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List intended actions without POSTing."),
+    ] = False,
+) -> None:
+    """FEAT-014 / T-290 — backfill ``work_items`` from a directory of briefs.
+
+    POSTs each matching file to ``POST /api/v1/work-items/upload``.
+    Idempotent: re-runs report rows as ``reused``.  Exits 1 if any
+    upload returned 409 (content / kind conflict).
+    """
+    _require_api_key()
+    if not directory.is_dir():
+        typer.echo(f"error: not a directory: {directory}", err=True)
+        raise SystemExit(1)
+
+    inserted: list[str] = []
+    reused: list[str] = []
+    conflicted: list[tuple[str, str]] = []
+    malformed: list[str] = []
+
+    files = sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".md")
+    with _client() as client:
+        for f in files:
+            try:
+                ext_ref, kind = _parse_work_item_filename(f.name)
+            except typer.BadParameter:
+                malformed.append(f.name)
+                continue
+            payload = {"id": ext_ref, "kind": kind, "content": f.read_text(encoding="utf-8")}
+            if dry_run:
+                inserted.append(f.name)
+                continue
+            resp = client.post("/api/v1/work-items/upload", json=payload)
+            if resp.status_code == 201:
+                inserted.append(f.name)
+            elif resp.status_code == 200:
+                reused.append(f.name)
+            elif resp.status_code == 409:
+                detail = ""
+                try:
+                    detail = resp.json().get("detail", "")
+                except Exception:
+                    detail = resp.text
+                conflicted.append((f.name, detail))
+            else:
+                typer.echo(
+                    f"error: unexpected status {resp.status_code} for {f.name}: {resp.text}",
+                    err=True,
+                )
+                raise SystemExit(3)
+
+    lines: list[str] = []
+    if dry_run:
+        lines.append("[DRY RUN — no POSTs made]")
+    lines.append(f"Inserted: {len(inserted)}")
+    lines.append(f"Reused:   {len(reused)}")
+    lines.append(f"Conflicted: {len(conflicted)}")
+    lines.append(f"Malformed (skipped): {len(malformed)}")
+    if conflicted:
+        lines.append("\nConflicts:")
+        for name, reason in conflicted:
+            lines.append(f"  - {name}: {reason}")
+    if malformed:
+        lines.append("\nSkipped (unrecognized filename):")
+        for name in malformed:
+            lines.append(f"  - {name}")
+    typer.echo("\n".join(lines))
+
+    if conflicted:
+        raise SystemExit(1)
 
 
 @main.command()

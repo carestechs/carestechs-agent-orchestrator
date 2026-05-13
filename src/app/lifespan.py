@@ -209,7 +209,12 @@ def _bootstrap_executor_registry(
             workflow_ids=workflow_ids,
         )
 
-    register_all_executors(registry, agents_dir, v03_collaborators=v03_collaborators)
+    register_all_executors(
+        registry,
+        agents_dir,
+        v03_collaborators=v03_collaborators,
+        session_factory=session_factory,
+    )
     try:
         run_coverage_validation(registry, agents_dir)
     except ExecutorCoverageError as exc:

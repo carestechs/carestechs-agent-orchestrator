@@ -236,8 +236,22 @@ flow:
 intakeSchema:
   type: object
   properties:
+    # FEAT-014: ``workItem`` is the canonical upload shape — the body is
+    # carried inline on first sight and the orchestrator dedupes by id
+    # for every sight after.  ``workItemPath`` is the legacy intake;
+    # accepted for one minor (with a server-side deprecation log) and
+    # then removed.
+    workItem:
+      type: object
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [FEAT, BUG, IMP]}
+        content: {type: string}
+      required: [id, kind]
     workItemPath: {type: string}
-  required: [workItemPath]
+  anyOf:
+    - required: [workItem]
+    - required: [workItemPath]
 
 terminalNodes: [close_work_item, terminate_correction_budget]
 

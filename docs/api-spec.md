@@ -94,7 +94,12 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
 {
   "agentRef": "string — stable agent reference, e.g. 'lifecycle-agent@0.3.0'",
   "intake": {
-    "workItemPath": "string — required for lifecycle-agent, e.g. 'docs/work-items/FEAT-042.md'",
+    "workItem": {
+      "id": "string — external ref like 'FEAT-042' (^[A-Z]+-\\d+(-[a-z0-9-]+)?$)",
+      "kind": "FEAT | BUG | IMP",
+      "content": "string — markdown body; required on first sight, optional on every sight after (FEAT-014)"
+    },
+    "workItemPath": "string — DEPRECATED (FEAT-014); legacy intake path on the orchestrator's filesystem. Emits a WARNING log entry with code 'intake-work-item-path-deprecated'. Removed in the next minor.",
     "…": "other agent-specific intake fields (validated by the loaded agent definition)"
   },
   "budget": {
@@ -123,9 +128,13 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
 | Code | Condition |
 |------|-----------|
 | 202 | Run accepted and queued |
-| 400 | Validation error (unknown `agentRef`, invalid intake against agent schema) |
+| 400 | Validation error (unknown `agentRef`, invalid intake against agent schema, or FEAT-014 `work-item-not-registered`) |
 | 401 | Unauthorized |
+| 409 | FEAT-014: `work-item-content-conflict` (body sha256 mismatch) or `work-item-kind-conflict` (re-upload with different kind) |
+| 413 | FEAT-014: `payload-too-large` — `intake.workItem.content` exceeds `INTAKE_WORK_ITEM_MAX_BYTES` (default 1 MB) |
 | 429 | Rate-limited (concurrent run cap) |
+
+**FEAT-014 work-item upload contract:** the body of `intake.workItem.content` is sha256-hashed (no normalization) and stored in `work_items.body_md` + `work_items.body_sha256`. Re-uploads with matching sha256 are idempotent (no UPDATE, run starts against the existing row). Re-uploads with a different sha256 return 409 with `meta.storedSha256` and `meta.uploadedSha256` so the client can diff. Briefs are immutable by design — to replace a brief, register a new `external_ref` (e.g., `FEAT-100-v2`).
 
 ---
 
@@ -449,6 +458,56 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 ```
 
 **Response Data:** `{ id, externalRef, status: "open", openedAt }`.
+
+---
+
+#### POST /api/v1/work-items/upload (FEAT-014)
+
+> *Register a work-item brief without starting a run.  Backs `orchestrator import-work-items`.  Idempotent: re-uploads with matching sha256 return 200; mismatched bodies return 409.*
+
+**Auth:** API key (same as the control plane).  No role gating in v1.
+
+**Request Body:** A `RunIntakeWorkItem`:
+
+```json
+{
+  "id": "FEAT-100",
+  "kind": "FEAT",
+  "content": "# FEAT-100 — title\n\nmarkdown body..."
+}
+```
+
+**Response (201 Created or 200 OK):**
+
+```json
+{
+  "data": {
+    "id": "uuid",
+    "externalRef": "FEAT-100",
+    "type": "FEAT",
+    "title": "FEAT-100 — title",
+    "status": "open",
+    "openedBy": "import",
+    "createdAt": "timestamptz",
+    "updatedAt": "timestamptz"
+  },
+  "meta": {
+    "alreadyReceived": true
+  }
+}
+```
+
+**Status Codes:**
+
+| Code | Condition |
+|------|-----------|
+| 201 | New row inserted |
+| 200 | Existing row reused (matching sha256); `meta.alreadyReceived = true` |
+| 400 | `work-item-not-registered` — `content` is missing and no row exists yet |
+| 409 | `work-item-content-conflict` or `work-item-kind-conflict` |
+| 413 | `payload-too-large` — body exceeds `INTAKE_WORK_ITEM_MAX_BYTES` |
+
+`GET /api/v1/work-items` (listing endpoint) is explicitly **out of scope** in v1 (FEAT-014 brief §4.2).  Callers identify briefs by their `externalRef` (== `RunIntakeWorkItem.id`).
 
 ---
 
@@ -855,6 +914,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 | GET | `/api/v1/runs/{id}/trace` | ai | Required | Stream run trace as NDJSON |
 | GET | `/api/v1/agents` | ai | Required | List on-disk agent definitions |
 | POST | `/api/v1/work-items` | ai | Required (admin) | Open a work item (S1, FEAT-006) |
+| POST | `/api/v1/work-items/upload` | ai | Required | Register a brief (FEAT-014); 201 insert / 200 reuse / 409 conflict |
 | POST | `/api/v1/work-items/{id}/lock` | ai | Required (admin) | Pause a work item (S2, FEAT-006) |
 | POST | `/api/v1/work-items/{id}/unlock` | ai | Required (admin) | Resume a locked work item (S3, FEAT-006) |
 | POST | `/api/v1/work-items/{id}/close` | ai | Required (admin) | Close from `ready` (S4, FEAT-006) |
@@ -884,6 +944,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-05-12 — FEAT-014 (work-item upload) — `POST /api/v1/runs` now accepts `intake.workItem = {id, kind, content?}`.  Content is sha256-hashed and stored on `work_items.body_md` / `body_sha256`; matching re-uploads are idempotent and mismatched bodies return 409.  New endpoint `POST /api/v1/work-items/upload` registers a brief without starting a run (201 insert / 200 reuse / 409 conflict).  Server-side cap `INTAKE_WORK_ITEM_MAX_BYTES` (default 1 MB) returns 413 before any DB I/O.  New Problem Details codes: `work-item-not-registered`, `work-item-content-conflict` (carries `meta.storedSha256` + `meta.uploadedSha256`), `work-item-kind-conflict` (carries `meta.storedKind` + `meta.uploadedKind`), `payload-too-large`.  Legacy `intake.workItemPath` continues to work for one minor; emits a `WARNING` log with code `intake-work-item-path-deprecated`.  `GET /api/v1/work-items` listing endpoint is explicitly out of scope.
 - 2026-04-30 — FEAT-011 (deterministic lifecycle port — `lifecycle-agent@0.3.0`) — No new HTTP endpoints, no DTO changes, no auth surface change. The control-plane accepts `agent_ref=lifecycle-agent@0.3.0` on `POST /api/v1/runs` (and via the CLI `orchestrator run lifecycle-agent@0.3.0 ...`). Run intake, signal payloads, and webhook signatures are unchanged from v0.1.0. The trace stream's `executor_call` entries gain familiar values for `mode` (`local` / `engine` / `human`) — v0.3.0's composite executors emit `mode=engine` because the engine leg drives the wake. Operationally externally indistinguishable from v0.1.0; the pivot is internal (deterministic policy, executor seam). See `docs/migration/lifecycle-v01-to-v03.md`.
 - 2026-04-26 — FEAT-010 (engine executor adapter) — No new HTTP endpoints; the engine-bound dispatch path settles via the existing `POST /hooks/engine/lifecycle/item-transitioned` webhook. Reactor pipeline gained a wake-dispatch step at the canonical position (`materialize aux → consume correlation → fire effectors → wake dispatch → fire derivations`); payload shape on `/hooks/engine/lifecycle/item-transitioned` is unchanged. The `executor_call` trace entry was extended (additive only) for `mode=engine` rows: optional `transitionKey`, `correlationId`, and `engineRunId` fields are populated when the dispatch is engine-bound. New operator command `uv run orchestrator reconcile-dispatches [--since=24h] [--dry-run]` (companion to `reconcile-aux`) settles orphan `Dispatch` rows after a process restart by querying `FlowEngineLifecycleClient.get_item_state`. No DTO changes; no auth surface change; no engine-side endpoint added (per FEAT-010 brief constraint).
 - 2026-04-26 — FEAT-009 (orchestrator as a pure orchestrator) — New `POST /hooks/executors/{executorId}` route receives terminal-state callbacks from remote executors. HMAC-signed via `X-Executor-Signature` keyed by the new `EXECUTOR_DISPATCH_SECRET`. Persist-first: every inbound delivery (including bad signatures) writes a `WebhookEvent(eventType='executor_dispatch_result')` row. Idempotent on `(executorId, dispatchId, outcome)` — same outcome → 200 + `meta.alreadyReceived=true`; conflicting outcome → 409; unknown dispatchId → 404. The existing `POST /api/v1/runs/{id}/signals` route is reframed (no wire-format change) as the human-executor return path: when a signal lands while a `mode='human'` Dispatch is in flight for the run, both the legacy `RunSignal` row and the dispatch terminal state are written. Dispatch entity and the per-agent `flow.policy: deterministic | llm` are described in `docs/data-model.md` + `agents/lifecycle-agent@0.2.0.yaml`.

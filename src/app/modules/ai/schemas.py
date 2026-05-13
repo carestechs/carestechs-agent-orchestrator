@@ -11,7 +11,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+import re
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
 from app.modules.ai.enums import (
@@ -237,6 +239,35 @@ class BudgetConfig(BaseModel):
 
     max_steps: int | None = None
     max_tokens: int | None = None
+
+
+_WORK_ITEM_ID_RE = re.compile(r"^[A-Z]+-\d+(-[a-z0-9-]+)?$")
+
+
+class RunIntakeWorkItem(BaseModel):
+    """FEAT-014: typed sub-object inside ``CreateRunRequest.intake.workItem``.
+
+    Replaces the legacy ``intake.workItemPath`` shape — the body travels in
+    ``content`` on first sight, then the orchestrator dedupes by
+    ``external_ref`` (== ``id``) for every sight after.  Briefs are
+    content-addressed via sha256 and immutable; re-uploads with a
+    different body return 409.
+    """
+
+    model_config = _CAMEL_CONFIG
+
+    id: str = Field(..., min_length=3, max_length=64)
+    kind: WorkItemType
+    content: str | None = Field(default=None)
+
+    @field_validator("id")
+    @classmethod
+    def _id_format(cls, v: str) -> str:
+        if not _WORK_ITEM_ID_RE.match(v):
+            raise ValueError(
+                "id must match ^[A-Z]+-\\d+(-[a-z0-9-]+)?$ (e.g. FEAT-100, BUG-5-slug)"
+            )
+        return v
 
 
 class CreateRunRequest(BaseModel):

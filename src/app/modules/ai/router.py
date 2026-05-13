@@ -6,8 +6,9 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.responses import JSONResponse
 
@@ -57,6 +58,7 @@ from app.modules.ai.schemas import (
     ReviewApproveRequest,
     ReviewRejectRequest,
     RunDetailDto,
+    RunIntakeWorkItem,
     RunSummaryDto,
     SignalCreateRequest,
     SignalCreateResponse,
@@ -272,6 +274,48 @@ def _work_item_envelope(
     dto = WorkItemDto.model_validate(wi, from_attributes=True)
     meta = LifecycleSignalMeta(already_received=True) if already_received else None
     return WorkItemSignalResponse(data=dto, meta=meta)
+
+
+@api_router.post(
+    "/work-items/upload",
+    status_code=201,
+    response_model=WorkItemSignalResponse,
+    responses={200: {"model": WorkItemSignalResponse}},
+)
+async def upload_work_item(
+    body: RunIntakeWorkItem,
+    response: Response,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+) -> WorkItemSignalResponse:
+    """FEAT-014 / T-290 — register a work-item brief without starting a run.
+
+    Backs ``orchestrator import-work-items``: an operator helper that
+    walks a directory of FEAT-/BUG-/IMP-*.md files and POSTs each one.
+    Returns **201** on insert, **200** on idempotent reuse (matching
+    sha256), **409** on content / kind conflict.  Same size cap as
+    ``POST /runs`` (``INTAKE_WORK_ITEM_MAX_BYTES``).
+    """
+    from app.core.exceptions import PayloadTooLargeError
+    from app.modules.ai.lifecycle.work_item_registry import register_work_item
+
+    if body.content is not None:
+        byte_len = len(body.content.encode("utf-8"))
+        if byte_len > settings.intake_work_item_max_bytes:
+            raise PayloadTooLargeError(
+                detail=(
+                    f"workItem.content exceeds INTAKE_WORK_ITEM_MAX_BYTES "
+                    f"({byte_len} > {settings.intake_work_item_max_bytes})"
+                ),
+            )
+
+    existed_before = await db.scalar(
+        select(WorkItem.id).where(WorkItem.external_ref == body.id)
+    )
+    wi = await register_work_item(db, body, opened_by="import")
+    if existed_before is not None:
+        response.status_code = 200
+    return _work_item_envelope(wi, already_received=existed_before is not None)
 
 
 @api_router.post(
