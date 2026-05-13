@@ -373,8 +373,16 @@ def register_lifecycle_v03(
     workflow_ids: Mapping[str, uuid.UUID],
     max_corrections: int = 2,
     actor: str | None = "lifecycle-agent",
+    skip_review_implementation: bool = False,
 ) -> None:
     """Register the eight production bindings for ``lifecycle-agent@0.3.0``.
+
+    When ``skip_review_implementation=True``, the LLM ``review_implementation``
+    binding is omitted so a sibling variant (e.g. FEAT-015's
+    ``lifecycle-agent@0.4.0-manual``) can register a human reviewer in
+    that slot.  The companion ``approve_review`` engine binding is
+    unaffected and registers as usual — both reviewer variants route
+    through it on a ``pass`` verdict.
 
     The mapping table lives in ``docs/design/feat-011-lifecycle-deterministic-port.md``
     (section "Node-to-executor mapping table (v0.3.0)").  Composite nodes
@@ -891,61 +899,76 @@ def register_lifecycle_v03(
             "implementationEvidence": evidence,
         }
 
-    # IMP-003: select the reviewer binding from settings.  Default
-    # ``llm-content`` preserves today's behaviour; ``stub-pass`` is the
-    # smoke / CI binding that auto-approves so runs reach
-    # ``close_work_item`` without real PR evidence.  A future ``remote``
-    # value slots in here when the external reviewer service ships.
-    from app.config import get_settings as _get_settings
+    # FEAT-015: sibling variants register their own reviewer (e.g.
+    # ``human_review_implementation`` for the manual flow).  When
+    # ``skip_review_implementation`` is set, omit the LLM reviewer
+    # binding entirely so the variant's bootstrap can register a
+    # replacement under the same ``agent_ref``.  Every other binding
+    # (approve_review / T10, mark_task_done, correct_implementation,
+    # close_work_item, terminate_correction_budget) registers
+    # unconditionally — those are shared infrastructure.
+    if not skip_review_implementation:
+        # IMP-003: select the reviewer binding from settings.  Default
+        # ``llm-content`` preserves today's behaviour; ``stub-pass`` is the
+        # smoke / CI binding that auto-approves so runs reach
+        # ``close_work_item`` without real PR evidence.  A future ``remote``
+        # value slots in here when the external reviewer service ships.
+        from app.config import get_settings as _get_settings
 
-    reviewer_choice = _get_settings().lifecycle_reviewer
-    reviewer_executor: Any
-    if reviewer_choice == "llm-content":
-        reviewer_executor = LLMContentExecutor(
-            ref="llm:review_implementation",
-            system_prompt=_load_prompt("review_implementation"),
-            user_prompt_template=(
-                "Review the implementation for the task below against the "
-                "approved plan and the operator-supplied evidence.\n\n"
-                "Task id: {taskId}\n"
-                "Title: {taskTitle}\n"
-                "Complexity: {complexity}\n\n"
-                "Description:\n{taskDescription}\n\n"
-                "Acceptance criteria:\n{acceptanceCriteria}\n\n"
-                "----- BEGIN APPROVED PLAN -----\n"
-                "{planMarkdown}\n"
-                "----- END APPROVED PLAN -----\n\n"
-                "----- BEGIN IMPLEMENTATION EVIDENCE -----\n"
-                "{implementationEvidence}\n"
-                "----- END IMPLEMENTATION EVIDENCE -----\n"
-            ),
-            result_schema=ReviewImplementationResult,
-            llm_provider=llm_provider,
-            memory_patch_builder=_patch_review,
-            prompt_context_loader=_load_review_context,
-            session_factory=session_factory,
-        )
-    elif reviewer_choice == "stub-pass":
-        from app.modules.ai.executors.stub_reviewer import make_stub_pass_reviewer
+        reviewer_choice = _get_settings().lifecycle_reviewer
+        reviewer_executor: Any
+        if reviewer_choice == "llm-content":
+            reviewer_executor = LLMContentExecutor(
+                ref="llm:review_implementation",
+                system_prompt=_load_prompt("review_implementation"),
+                user_prompt_template=(
+                    "Review the implementation for the task below against the "
+                    "approved plan and the operator-supplied evidence.\n\n"
+                    "Task id: {taskId}\n"
+                    "Title: {taskTitle}\n"
+                    "Complexity: {complexity}\n\n"
+                    "Description:\n{taskDescription}\n\n"
+                    "Acceptance criteria:\n{acceptanceCriteria}\n\n"
+                    "----- BEGIN APPROVED PLAN -----\n"
+                    "{planMarkdown}\n"
+                    "----- END APPROVED PLAN -----\n\n"
+                    "----- BEGIN IMPLEMENTATION EVIDENCE -----\n"
+                    "{implementationEvidence}\n"
+                    "----- END IMPLEMENTATION EVIDENCE -----\n"
+                ),
+                result_schema=ReviewImplementationResult,
+                llm_provider=llm_provider,
+                memory_patch_builder=_patch_review,
+                prompt_context_loader=_load_review_context,
+                session_factory=session_factory,
+            )
+        elif reviewer_choice == "stub-pass":
+            from app.modules.ai.executors.stub_reviewer import make_stub_pass_reviewer
 
-        logger.warning(
-            "register_lifecycle_v03: LIFECYCLE_REVIEWER=stub-pass — every "
-            "implementation will be auto-approved.  Smoke / CI only."
+            logger.warning(
+                "register_lifecycle_v03: LIFECYCLE_REVIEWER=stub-pass — every "
+                "implementation will be auto-approved.  Smoke / CI only."
+            )
+            reviewer_executor = make_stub_pass_reviewer(
+                session_factory=session_factory,
+                patch_review_builder=_patch_review,
+            )
+        else:
+            # Pydantic ``Literal`` validation prevents this branch in
+            # practice; the explicit raise documents the closed enumeration.
+            raise ValueError(f"unknown LIFECYCLE_REVIEWER={reviewer_choice!r}")
+
+        logger.info(
+            "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
+            reviewer_choice,
         )
-        reviewer_executor = make_stub_pass_reviewer(
-            session_factory=session_factory,
-            patch_review_builder=_patch_review,
-        )
+        registry.register(agent_ref, "review_implementation", reviewer_executor)
     else:
-        # Pydantic ``Literal`` validation prevents this branch in
-        # practice; the explicit raise documents the closed enumeration.
-        raise ValueError(f"unknown LIFECYCLE_REVIEWER={reviewer_choice!r}")
-
-    logger.info(
-        "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
-        reviewer_choice,
-    )
-    registry.register(agent_ref, "review_implementation", reviewer_executor)
+        logger.info(
+            "register_lifecycle_v03: agent_ref=%s skipping review_implementation "
+            "(sibling variant will register its own reviewer)",
+            agent_ref,
+        )
 
     # ------------------------------------------------------------------
     # approve_review — T10: impl_review → done (current task).  Only
