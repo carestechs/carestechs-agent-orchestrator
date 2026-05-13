@@ -335,13 +335,24 @@ async def _execute_node(
                     dispatch_row.intake = new_intake
                     await session.commit()
         # Non-terminal: webhook will deliver the terminal envelope.
-        timeout = binding.timeout_seconds if binding.timeout_seconds is not None else float(dispatch_timeout_seconds)
         # IMP-002 / T-269: flip Run.status → PAUSED while parked on a
         # ``mode=human`` dispatch.  Engine and remote waits keep
         # ``running`` — those are not human-handoff waits.  Use the
         # binding's mode (a ClassVar source-of-truth), not envelope.mode
         # which can lie if the executor synthesised a failure.
         is_human_pause = binding.executor.mode == DispatchMode.HUMAN
+        # Human waits are unbounded by default: operator response time has
+        # no natural ceiling and a timeout-failure terminates the run with
+        # an error stop_reason, which is the wrong shape for "waiting on
+        # a person".  An explicit ``timeout_seconds`` on a HumanExecutor
+        # binding is still respected for callers who want a deadline
+        # (e.g. SLA-bounded review queues).
+        if binding.timeout_seconds is not None:
+            timeout = binding.timeout_seconds
+        elif is_human_pause:
+            timeout = None  # asyncio.wait_for treats None as "no timeout"
+        else:
+            timeout = float(dispatch_timeout_seconds)
         if is_human_pause:
             await _mark_paused(run_id, session_factory)
         try:
