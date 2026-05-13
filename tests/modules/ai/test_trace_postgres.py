@@ -397,6 +397,84 @@ class TestOpenRunStream:
         items = await _drain(stream)
         assert items == []
 
+    async def test_step_row_resurfaces_after_status_update(
+        self,
+        store: PostgresTraceStore,
+        session_factory: async_sessionmaker[AsyncSession],
+        seeded_run: uuid.UUID,
+    ) -> None:
+        """A step row re-emits when its status changes — the watermark is
+        ``COALESCE(completed_at, dispatched_at, created_at)`` so each
+        runtime mutation advances the effective timestamp and the row
+        reappears in the next poll with its new state.
+
+        Pre-fix the watermark was ``created_at`` alone — the first sight
+        of the row (often as ``pending``) advanced it past every later
+        update, leaving clients stuck on a stale state.
+
+        Drives the follow=true stream concurrently with row mutations
+        and asserts the same id surfaces three times in order, one per
+        state transition.
+        """
+        step_id = uuid.uuid4()
+        # Pre-insert as pending so the very first poll has something to see.
+        async with session_factory() as session, session.begin():
+            session.add(
+                Step(
+                    id=step_id,
+                    run_id=seeded_run,
+                    step_number=20,
+                    node_name="evolving_node",
+                    node_inputs={},
+                    status=StepStatus.PENDING.value,
+                )
+            )
+
+        collected: list[StepDto] = []
+
+        async def _consume() -> None:
+            async for item in store.tail_run_stream(seeded_run, follow=True):
+                if isinstance(item, StepDto) and item.id == step_id:
+                    collected.append(item)
+                    if len(collected) == 3:
+                        return
+
+        consumer = asyncio.create_task(_consume())
+
+        # Give the tail one poll-cycle (200 ms) + a margin to catch the
+        # initial pending state.
+        await asyncio.sleep(0.4)
+
+        # Transition 1: pending → in_progress.
+        async with session_factory() as session, session.begin():
+            row = await session.scalar(select(Step).where(Step.id == step_id))
+            assert row is not None
+            row.status = StepStatus.IN_PROGRESS.value
+            row.dispatched_at = datetime.now(UTC)
+
+        await asyncio.sleep(0.4)
+
+        # Transition 2: in_progress → completed.
+        async with session_factory() as session, session.begin():
+            row = await session.scalar(select(Step).where(Step.id == step_id))
+            assert row is not None
+            row.status = StepStatus.COMPLETED.value
+            row.completed_at = datetime.now(UTC)
+
+        try:
+            await asyncio.wait_for(consumer, timeout=3.0)
+        except TimeoutError:
+            consumer.cancel()
+            raise AssertionError(
+                f"expected 3 emissions for step {step_id}, got {[s.status for s in collected]}"
+            ) from None
+
+        assert [e.status for e in collected] == [
+            StepStatus.PENDING,
+            StepStatus.IN_PROGRESS,
+            StepStatus.COMPLETED,
+        ]
+
 
 # ---------------------------------------------------------------------------
 # tail_run_stream — filters + follow mode
