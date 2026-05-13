@@ -213,6 +213,69 @@ class TestIdempotency:
                 await session.commit()
 
 
+    async def test_feat014_preseeded_row_is_backfilled(
+        self,
+        lifecycle_client: FlowEngineLifecycleClient,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """FEAT-014 seam: ``service.start_run`` inserts the ``WorkItem`` row
+        with ``engine_item_id=NULL`` at run-start time.  The executor must
+        find it by ``external_ref`` and backfill the engine id rather
+        than INSERT-ing a second row (which would trip
+        ``uq_work_items_external_ref``).
+        """
+        run_id = await _seed_run_with_brief(session_factory)
+        workflow_id = uuid.uuid4()
+        engine_item_id = uuid.uuid4()
+
+        try:
+            # FEAT-014 pre-seed: row exists with NULL engine_item_id.
+            async with session_factory() as session:
+                preexisting = WorkItem(
+                    external_ref="FEAT-099",
+                    type="FEAT",
+                    title="seeded by FEAT-014",
+                    status="open",
+                    opened_by="upload",
+                    engine_item_id=None,
+                )
+                session.add(preexisting)
+                await session.commit()
+                await session.refresh(preexisting)
+                preexisting_id = preexisting.id
+
+            with respx.mock(base_url=_BASE, assert_all_mocked=False, assert_all_called=False) as rx:
+                rx.post("/api/auth/token").mock(return_value=Response(200, json=_TOKEN_RESP))
+                rx.post(f"/api/workflows/{workflow_id}/items").mock(
+                    return_value=Response(201, json={"data": {"id": str(engine_item_id)}})
+                )
+                executor = _executor(lifecycle_client, session_factory, workflow_id)
+                env = await executor.dispatch(_ctx(run_id))
+
+            assert env.state.value == "completed"
+            assert env.result is not None
+            assert env.result["engineItemId"] == str(engine_item_id)
+            assert env.result["workItemId"] == str(preexisting_id)
+
+            async with session_factory() as session:
+                rows = (
+                    await session.scalars(
+                        select(WorkItem).where(WorkItem.external_ref == "FEAT-099")
+                    )
+                ).all()
+                assert len(rows) == 1, "must not insert a second row"
+                assert rows[0].engine_item_id == engine_item_id, "engine_item_id backfilled"
+                assert rows[0].id == preexisting_id, "same row reused"
+        finally:
+            async with session_factory() as session:
+                await session.execute(
+                    WorkItem.__table__.delete().where(WorkItem.external_ref == "FEAT-099")
+                )
+                await session.execute(RunMemory.__table__.delete().where(RunMemory.run_id == run_id))
+                await session.execute(Run.__table__.delete().where(Run.id == run_id))
+                await session.commit()
+
+
 class TestFailureSurfaces:
     async def test_missing_brief_in_memory_returns_failed_envelope(
         self,

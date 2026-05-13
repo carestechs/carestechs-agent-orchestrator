@@ -187,8 +187,16 @@ class EngineCreateExecutor:
         source_path: str | None,
     ) -> uuid.UUID:
         async with self._session_factory() as session, session.begin():
+            # FEAT-014 invariant: ``register_work_item`` in ``service.py``
+            # already inserted a row keyed on ``external_ref`` at
+            # ``start_run`` time (with ``engine_item_id=NULL``).  Look up
+            # by the canonical key — ``external_ref`` — and backfill
+            # ``engine_item_id`` on the existing row.  Looking up by
+            # ``engine_item_id`` misses every FEAT-014-seeded row (NULL
+            # column) and the subsequent INSERT trips
+            # ``uq_work_items_external_ref``.
             existing = await session.scalar(
-                select(WorkItem).where(WorkItem.engine_item_id == engine_item_id)
+                select(WorkItem).where(WorkItem.external_ref == external_ref)
             )
             if existing is None:
                 wi = WorkItem(
@@ -204,6 +212,10 @@ class EngineCreateExecutor:
                 await session.flush()
                 local_id = wi.id
             else:
+                if existing.engine_item_id is None:
+                    existing.engine_item_id = engine_item_id
+                if not existing.source_path and source_path:
+                    existing.source_path = source_path
                 local_id = existing.id
 
             run_row = await session.get(Run, run_id)
