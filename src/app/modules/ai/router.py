@@ -163,6 +163,7 @@ async def cancel_run(
     response_model=SignalCreateResponse,
 )
 async def post_signal(
+    request: Request,
     run_id: uuid.UUID,
     body: SignalCreateRequest,
     db: Annotated[AsyncSession, Depends(get_db_session)],
@@ -175,6 +176,7 @@ async def post_signal(
     duplicate calls return ``202`` with ``meta.alreadyReceived=true`` and
     do not re-wake the supervisor.
     """
+    executor_registry = getattr(request.app.state, "executor_registry", None)
     dto, created = await service.send_signal(
         run_id=run_id,
         name=body.name,
@@ -183,6 +185,7 @@ async def post_signal(
         db=db,
         supervisor=supervisor,
         trace=trace,
+        executor_registry=executor_registry,
     )
     meta = None if created else {"alreadyReceived": True}
     return SignalCreateResponse(data=dto, meta=meta)

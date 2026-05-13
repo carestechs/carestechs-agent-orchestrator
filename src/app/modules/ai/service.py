@@ -382,6 +382,7 @@ async def send_signal(
     db: AsyncSession,
     supervisor: RunSupervisor,
     trace: TraceStore,
+    executor_registry: ExecutorRegistry | None = None,
 ) -> tuple[RunSignalDto, bool]:
     """Persist an operator-injected signal, then wake the runtime loop.
 
@@ -413,7 +414,14 @@ async def send_signal(
 
     lifecycle_memory = read_lifecycle_memory(memory_data)
     known_task_ids: set[str] = {task.id for task in lifecycle_memory.tasks}
-    if task_id not in known_task_ids:
+    # FEAT-015 / T-296: work-item-scoped signals (e.g. ``brief-confirmed``,
+    # ``tasks-confirmed``) deliver with an empty ``task_id``.  Skip the
+    # known-task validation in that case — the dispatch lookup in
+    # ``_deliver_to_human_dispatch`` is what pairs the signal to the
+    # right in-flight checkpoint.  Task-scoped signals
+    # (``implementation-complete``, ``plan-confirmed``,
+    # ``review-completed``) keep the existing check.
+    if task_id and task_id not in known_task_ids:
         raise NotFoundError(f"task not found in run: {task_id}")
 
     dedupe_key = repository.compute_signal_dedupe_key(run_id, name, task_id)
@@ -461,6 +469,7 @@ async def send_signal(
         task_id=task_id,
         payload=payload,
         supervisor=supervisor,
+        executor_registry=executor_registry,
     )
 
     return dto, created
@@ -474,6 +483,7 @@ async def _deliver_to_human_dispatch(
     task_id: str,
     payload: dict[str, Any],
     supervisor: RunSupervisor,
+    executor_registry: ExecutorRegistry | None = None,
 ) -> None:
     """Deliver to the matching in-flight human-executor Dispatch (if any).
 
@@ -483,11 +493,21 @@ async def _deliver_to_human_dispatch(
     human dispatches per run is a defensive log + no-op — under v0.1.0
     there is at most one operator-pause active at any time, and PR 5's
     loop swap is what threads precise pairing through.
+
+    FEAT-015 / T-296: when *executor_registry* is provided and the
+    binding for the in-flight dispatch carries a ``memory_patch_builder``,
+    invoke the builder with the operator's signal payload + current
+    ``RunMemory`` and embed the resulting dict at
+    ``result.__memory_patch`` on the envelope.  The runtime then merges
+    the patch into ``RunMemory.data`` via the standard ``_write_state``
+    pipeline.  When the builder raises, mark the dispatch *failed* with
+    the exception in ``detail`` — the run terminates with
+    ``stop_reason=error``.
     """
     from datetime import UTC, datetime
 
     from app.modules.ai.enums import DispatchMode, DispatchState
-    from app.modules.ai.models import Dispatch
+    from app.modules.ai.models import Dispatch, Run, RunMemory
     from app.modules.ai.schemas import DispatchEnvelope
 
     rows = (
@@ -511,10 +531,54 @@ async def _deliver_to_human_dispatch(
         return
     dispatch = rows[0]
     now = datetime.now(UTC)
-    dispatch.mark_completed(
-        at=now,
-        result={"signal_name": signal_name, "task_id": task_id, "payload": payload},
-    )
+
+    result: dict[str, Any] = {
+        "signal_name": signal_name,
+        "task_id": task_id,
+        "payload": payload,
+    }
+
+    # FEAT-015 / T-296: resolve the binding and invoke the memory-patch
+    # builder if present.  No registry = legacy path (no builder).
+    if executor_registry is not None:
+        node_name = (dispatch.intake or {}).get("nodeName")
+        agent_ref_row = await db.scalar(select(Run.agent_ref).where(Run.id == run_id))
+        if node_name and agent_ref_row:
+            try:
+                binding = executor_registry.resolve(agent_ref_row, node_name)
+                builder = getattr(binding.executor, "memory_patch_builder", None)
+                if builder is not None:
+                    mem_row = await db.scalar(
+                        select(RunMemory).where(RunMemory.run_id == run_id)
+                    )
+                    current_memory: dict[str, Any] = (
+                        mem_row.data if mem_row is not None else {}
+                    ) or {}
+                    patch = builder(payload, current_memory)
+                    result["__memory_patch"] = patch
+            except Exception as exc:
+                # Builder raised — fail the dispatch.  The runtime's
+                # _ExecutorFailure handler then terminates the run with
+                # stop_reason=error.  Strictness is intentional: bad
+                # payloads must not silently corrupt memory.
+                logger.warning(
+                    "memory_patch_builder failed for dispatch %s: %s",
+                    dispatch.dispatch_id,
+                    exc,
+                    exc_info=True,
+                )
+                dispatch.mark_failed(
+                    at=now,
+                    detail=f"memory_patch_builder_failed: {type(exc).__name__}: {exc}",
+                )
+                await db.commit()
+                envelope = DispatchEnvelope.model_validate(
+                    dispatch, from_attributes=True
+                )
+                supervisor.deliver_dispatch(dispatch.dispatch_id, envelope)
+                return
+
+    dispatch.mark_completed(at=now, result=result)
     await db.commit()
     envelope = DispatchEnvelope.model_validate(dispatch, from_attributes=True)
     supervisor.deliver_dispatch(dispatch.dispatch_id, envelope)
