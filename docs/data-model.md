@@ -214,7 +214,9 @@ v0.1.0's top-level shape is preserved as a read-fallback so a run started under 
 | external_ref | text | Required, Unique | Human-facing id (e.g., `FEAT-042`, `BUG-017`). |
 | type | enum `WorkItemType` | Required | `FEAT`, `BUG`, `IMP`. |
 | title | text | Required | Human-readable title. |
-| source_path | text | Nullable | Path to the originating markdown brief, if any. |
+| source_path | text | Nullable | DEPRECATED FEAT-014; legacy intake path (callers' filesystem). New rows leave NULL; the legacy `intake.workItemPath` shim still populates it during the deprecation window. |
+| body_md | text | Nullable | FEAT-014: uploaded markdown body of the brief. NULL for pre-FEAT-014 rows (backed by `source_path`); backfilled on first re-upload or by `orchestrator import-work-items`. |
+| body_sha256 | text | Nullable, CHECK `^[0-9a-f]{64}$` | FEAT-014: hex sha256 of `body_md.encode("utf-8")` (no normalization). Drives content-addressed dedupe and the 409 immutability guard. |
 | status | enum `WorkItemStatus` | Required, default `open` | Reactor-managed cache (FEAT-008): under engine-present mode, written only by the lifecycle reactor on `item.transitioned` arrival, never by signal adapters. See enum. |
 | opened_by | text | Required | Actor id (admin) who opened the work item. |
 | closed_at | timestamptz | Nullable | Set when `status=closed`. |
@@ -232,6 +234,7 @@ v0.1.0's top-level shape is preserved as a read-fallback so a run started under 
 - `closed_at` and `closed_by` are set together or neither.
 - Lock/unlock is an in_progress ⇄ locked round-trip; prior-state tracking is owned by the flow engine's transition history (FEAT-008/T-168 dropped the local `locked_from` cache).
 - Closing from any state other than `ready` returns `409 Conflict`.
+- **Briefs are content-addressed and immutable (FEAT-014).** Once `body_sha256` is populated, the body cannot be changed; re-uploading with a different sha256 returns 409 `work-item-content-conflict`. To replace a brief, register a new `external_ref` (e.g., `FEAT-100-v2`). The `kind` is also immutable — re-uploading with a different kind returns 409 `work-item-kind-conflict`.
 
 ---
 
@@ -615,6 +618,7 @@ None — single-module project in v1.
 
 ## Changelog
 
+- 2026-05-12 — FEAT-014 (work-item upload) — `WorkItem` gained two nullable columns: `body_md TEXT` (uploaded brief body) and `body_sha256 TEXT` with CHECK `body_sha256 ~ '^[0-9a-f]{64}$'` (content hash for idempotent dedupe). Forward-only migration `9c4d2e8a1f7b`. Briefs are now content-addressed and immutable: re-uploads with matching sha256 are idempotent, mismatched bodies return 409. `source_path` is reframed as a legacy field — populated only by the T-288 deprecation shim for runs started under `intake.workItemPath`; new uploads via `intake.workItem = {id, kind, content}` leave it NULL. No data migration: pre-FEAT-014 rows keep `body_md=NULL` until backfilled by `orchestrator import-work-items` or by a re-upload through the run-start path.
 - 2026-05-11 — FEAT-013 (Postgres trace store, AD-5 v2) — Added `EffectorCall` and `ExecutorCall` entities (tables `effector_calls`, `executor_calls`); BIGSERIAL `id`, JSONB `payload`, `created_at TIMESTAMPTZ DEFAULT now()`. Forward-only migration `7a3f1d2c9e4b`. The other four trace kinds (`step`, `policy_call`, `webhook_event`, `operator_signal`) remain in their existing tables — `PostgresTraceStore` reads them rather than re-writing. `Settings.trace_backend` Literal widened to `"noop" | "jsonl" | "postgres"` with `"postgres"` as the production default; `JsonlTraceStore` stays as opt-in local dev. Design doc: `docs/design/feat-013-trace-tail-mechanism.md`.
 - 2026-05-01 — Task body expansion (post-BUG-008) — No SQL schema changes. `LifecycleTask` (Pydantic model under `RunMemory.data['lifecycle.v1']`) gained five additive fields: `description: str = ""`, `acceptance_criteria: list[str] = []`, `complexity: Literal["small","medium","large"] = "medium"`, `depends_on: list[str] = []`, `files_hint: list[str] = []`. `GenerateTasksTask` (the LLM-content schema for the `generate_tasks` node) mirrors the same fields. Old runs validate via field defaults — no migration. The local `tasks` table is unchanged; per-task body lives in memory + (for the planner) in `task_plans.plan_markdown`.
 - 2026-04-30 — FEAT-011 (deterministic lifecycle port — `lifecycle-agent@0.3.0`) — No schema changes. v0.3.0 reuses every existing entity (`Run`, `Step`, `Dispatch`, `RunMemory`, `RunSignal`, `WorkItem`, `Task`, `Approval`, `PendingAuxWrite`). `RunMemory.data` is now namespaced under `lifecycle.v1` for v0.3.0 runs (helpers in `tools/lifecycle/memory.py`); v0.1.0's top-level shape is preserved as a read-fallback. `correct_implementation` (rejection branch) writes `Approval(stage='impl', decision='reject', decided_by='lifecycle-agent', decided_by_role='admin')` inline — FEAT-008 contract preserved bit-for-bit (no engine call on rejection). `Dispatch.intake` JSONB on engine-mode rows already carries `correlation_id` + `transition_key`; v0.3.0 composite executors mirror that shape. v0.1.0 entities and write paths remain unchanged for the migration window.

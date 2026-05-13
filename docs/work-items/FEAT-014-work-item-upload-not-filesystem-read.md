@@ -7,7 +7,7 @@
 | **ID** | FEAT-014 |
 | **Name** | Work-item upload (deprecate `workItemPath` filesystem read) |
 | **Target Version** | Continuous |
-| **Status** | Not Started |
+| **Status** | Completed (T-282..T-294 all landed) |
 | **Priority** | High |
 | **Requested By** | Carlos (self-host / DevTools umbrella deployment) |
 | **Date Created** | 2026-05-12 |

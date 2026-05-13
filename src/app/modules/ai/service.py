@@ -183,9 +183,7 @@ async def start_run(
     work_item_dto: RunIntakeWorkItem | None = None
     if work_item_raw is not None:
         work_item_dto = RunIntakeWorkItem.model_validate(work_item_raw)
-    elif (legacy_path := request.intake.get("workItemPath")) is not None and isinstance(
-        legacy_path, str
-    ):
+    elif isinstance((legacy_path := request.intake.get("workItemPath")), str):
         # FEAT-014 / T-288: legacy ``intake.workItemPath`` shape.  The
         # body is read from the orchestrator's filesystem (single
         # remaining disk-read site, tagged ``DEPRECATED FEAT-014``),
