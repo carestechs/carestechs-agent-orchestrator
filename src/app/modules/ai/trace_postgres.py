@@ -30,7 +30,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.enums import RunStatus
@@ -138,10 +138,13 @@ def _effector_call_to_dto(row: EffectorCall) -> EffectorCallDto:
 
 
 def _step_sort_key(row: Step) -> tuple[datetime, int, str]:
-    # Steps use ``created_at`` as their canonical trace timestamp.  Tie-break
-    # on the row's ``id`` (UUIDv7 — also time-sortable, but lexically
-    # comparable for deterministic ordering).
-    return (row.created_at, 0, str(row.id))
+    # Steps re-surface on update — sort by the latest mutation timestamp
+    # (``completed_at`` > ``dispatched_at`` > ``created_at``) so a row
+    # re-emitted post-update lands at its new event time in the merged
+    # stream, not at the original INSERT time.  Tie-break on the row's
+    # ``id`` (UUIDv7 — also time-sortable, but lexically comparable).
+    effective = row.completed_at or row.dispatched_at or row.created_at
+    return (effective, 0, str(row.id))
 
 
 def _policy_call_sort_key(row: PolicyCall) -> tuple[datetime, int, str]:
@@ -371,19 +374,31 @@ class PostgresTraceStore:
         ] = []
 
         if "step" in active:
+            # Re-emit step rows on update so clients see every state
+            # transition (pending → in_progress → completed/failed).
+            # Watermark on ``COALESCE(completed_at, dispatched_at,
+            # created_at)`` — the column advances each time the runtime
+            # touches the row, so the row resurfaces in the next poll
+            # with its new status.  Without this, the tail's first sight
+            # of a row (often as ``pending``) advanced the watermark past
+            # ``created_at`` and the later terminal update was filtered
+            # out forever.  Clients deduplicate on ``id``.
+            step_effective_ts = func.coalesce(
+                Step.completed_at, Step.dispatched_at, Step.created_at
+            )
             stmt = (
                 select(Step)
                 .where(Step.run_id == run_id)
-                .order_by(Step.created_at.asc(), Step.id.asc())
+                .order_by(step_effective_ts.asc(), Step.id.asc())
                 .limit(_CHUNK_SIZE)
             )
             wm = watermarks.get("step")
             if wm is not None:
-                stmt = stmt.where(Step.created_at > wm)
+                stmt = stmt.where(step_effective_ts > wm)
             result = await session.execute(stmt)
             for row in result.scalars().all():
                 merged.append((_step_sort_key(row), _step_to_dto(row)))
-                new_watermarks["step"] = row.created_at
+                new_watermarks["step"] = row.completed_at or row.dispatched_at or row.created_at
 
         if "policy_call" in active:
             stmt = (
