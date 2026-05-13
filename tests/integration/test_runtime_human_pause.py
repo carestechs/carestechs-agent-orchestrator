@@ -396,6 +396,9 @@ async def test_timeout_in_paused_state_resumes_to_failed(
     """
     agent = _build_human_pause_agent(tmp_path)
     registry = ExecutorRegistry()
+    # Human waits are unbounded by default — to test the timeout path,
+    # the binding must declare an explicit ``timeout_seconds``.  Using 1 s
+    # ensures the loop times out promptly with no signal delivered.
     registry.register(
         agent.ref,
         "human_node",
@@ -403,14 +406,16 @@ async def test_timeout_in_paused_state_resumes_to_failed(
             ref="human:human_node",
             expected_signal_name="implementation-complete",
         ),
+        timeout_seconds=1.0,
     )
     _register_done_terminal(registry, agent)
 
     run_id = await _seed_run(session_factory, agent=agent)
 
     try:
-        # ``dispatch_timeout_seconds`` is an int per the runtime
-        # signature; use 1 s and never deliver the signal.
+        # ``dispatch_timeout_seconds`` would not apply to a human binding
+        # post-fix (humans default to unbounded); the explicit
+        # ``timeout_seconds=1.0`` on the binding above is what fires.
         await run_deterministic_loop(
             run_id=run_id,
             agent=agent,
@@ -434,4 +439,89 @@ async def test_timeout_in_paused_state_resumes_to_failed(
             # ``_terminate`` writes stop_reason=ERROR for timeout failures.
             assert run.stop_reason == StopReason.ERROR
     finally:
+        await _cleanup(session_factory, run_id)
+
+
+async def test_human_wait_is_unbounded_by_default(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Human bindings with no explicit ``timeout_seconds`` wait indefinitely.
+
+    A ``dispatch_timeout_seconds=1`` global default would have terminated
+    the pre-fix runtime within a second.  Post-fix, the human wait is
+    unbounded: we assert the loop is still parked after ~1.5 s and the
+    Run.status is still PAUSED.  Then we deliver the signal and observe
+    a clean completion — proving the wait was genuinely open, not just
+    delayed.
+    """
+    agent = _build_human_pause_agent(tmp_path)
+    registry = ExecutorRegistry()
+    registry.register(
+        agent.ref,
+        "human_node",
+        HumanExecutor(
+            ref="human:human_node",
+            expected_signal_name="implementation-complete",
+        ),
+        # No ``timeout_seconds`` — falls through to unbounded for humans.
+    )
+    _register_done_terminal(registry, agent)
+
+    run_id = await _seed_run(session_factory, agent=agent)
+    supervisor = RunSupervisor()
+    loop_task: asyncio.Task[None] | None = None
+
+    try:
+        loop_task = asyncio.create_task(
+            run_deterministic_loop(
+                run_id=run_id,
+                agent=agent,
+                trace=NoopTraceStore(),
+                supervisor=supervisor,
+                registry=registry,
+                session_factory=session_factory,
+                cancel_event=asyncio.Event(),
+                # Aggressive global default that *would* have fired pre-fix.
+                dispatch_timeout_seconds=1,
+            )
+        )
+
+        await _wait_for_status(session_factory, run_id, RunStatus.PAUSED)
+
+        # Wait longer than ``dispatch_timeout_seconds`` would have allowed
+        # — if the unbounded path were broken the loop would have crashed
+        # with a timeout failure by now.
+        await asyncio.sleep(1.5)
+
+        async with session_factory() as session:
+            run = await session.get(Run, run_id)
+            assert run is not None
+            assert RunStatus(run.status) == RunStatus.PAUSED, (
+                f"unbounded human wait should still be parked; got {run.status!r}"
+            )
+
+        # Deliver the signal — the run should now finish cleanly.
+        dispatch_id = await _find_in_flight_dispatch(session_factory, run_id)
+        envelope = DispatchEnvelope(
+            dispatch_id=dispatch_id,
+            step_id=uuid.uuid4(),
+            run_id=run_id,
+            executor_ref="human:human_node",
+            mode="human",  # type: ignore[arg-type]
+            state="completed",  # type: ignore[arg-type]
+            intake={},
+            outcome="ok",  # type: ignore[arg-type]
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            result={},
+        )
+        supervisor.deliver_dispatch(dispatch_id, envelope)
+
+        await asyncio.wait_for(loop_task, timeout=5.0)
+        final_status = await _read_status(session_factory, run_id)
+        assert final_status == RunStatus.COMPLETED
+    finally:
+        if loop_task is not None and not loop_task.done():
+            loop_task.cancel()
         await _cleanup(session_factory, run_id)
