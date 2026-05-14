@@ -297,6 +297,89 @@ The `meta` object is omitted on first delivery; subsequent calls with the same `
 
 **Ordering invariant:** the endpoint persists the `RunSignal` row before calling `supervisor.deliver_signal(...)`. The trace records one entry of kind `operator_signal` per first delivery (idempotent — no duplicate trace entries).
 
+##### Manual variant signals (FEAT-015)
+
+The endpoint accepts four additional signal `name` values when the run's `agentRef` is `lifecycle-agent@0.4.0-manual`. Each corresponds to a `HumanExecutor` checkpoint in the manual flow. The dispatch / idempotency / wake contract is unchanged; only the payload schemas differ.
+
+Source of truth: `src/app/modules/ai/executors/lifecycle_manual_patches.py` (Pydantic schemas + memory-patch builders).
+
+**`brief-confirmed`** — resume from `confirm_brief` after the operator reviews the LLM-derived work-item brief. `taskId` is omitted or empty.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.workItem.title` | no | string | Replaces the LLM-derived title. |
+| `payload.workItem.type` | no | string | One of `FEAT`, `BUG`, `IMP`. |
+
+```json
+// Approve without edits
+{ "name": "brief-confirmed", "payload": {} }
+
+// Correct title and type
+{ "name": "brief-confirmed",
+  "payload": { "workItem": { "title": "Corrected", "type": "BUG" } } }
+```
+
+**`tasks-confirmed`** — resume from `confirm_tasks` after the operator reviews the LLM-generated task list. `taskId` is omitted or empty. When `payload.tasks` is provided, it replaces `LifecycleMemory.tasks` wholesale; `propose_tasks` then fans out to the engine for the replacement list.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.tasks` | no | array | When present, MUST be non-empty (length 0 returns 422). |
+| `payload.tasks[].id` | yes (within `tasks`) | string | Task identifier (1–64 chars). |
+| `payload.tasks[].title` | yes (within `tasks`) | string | Human-readable title. |
+| `payload.tasks[].summary` | no | string | Optional. Becomes `description` for operator-introduced tasks. |
+| `payload.tasks[].description` | no | string | Optional. Carries over from existing entry by id match. |
+| `payload.tasks[].complexity` | no | string | `small`/`medium`/`large`. Carries over by id match. |
+
+```json
+{ "name": "tasks-confirmed",
+  "payload": {
+    "tasks": [
+      { "id": "T-001", "title": "Set up schema" },
+      { "id": "T-002", "title": "Write the route" }
+    ]
+  } }
+```
+
+**`plan-confirmed`** — resume from `confirm_plan` after the operator reviews the LLM-generated implementation plan. `taskId` is required and must match `LifecycleMemory.current_task_id`.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.plan` | no | string | Markdown plan. When set, replaces `plans[taskId].plan_markdown`. |
+
+```json
+{ "name": "plan-confirmed", "taskId": "T-001",
+  "payload": { "plan": "# Updated plan\n\n1. Step one ...\n" } }
+```
+
+**`review-completed`** — resume from `human_review_implementation` after the operator reviews the submitted implementation. `taskId` is required. `pass` routes to `approve_review` (T10 → done); `fail` routes to `correct_implementation`, which loops back to `request_implementation` if the correction budget allows.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.verdict` | yes | string | One of `"pass"`, `"fail"`. |
+| `payload.feedback` | no | string | Recorded in the `reviewHistory[]` entry. |
+
+```json
+// Approve
+{ "name": "review-completed", "taskId": "T-001",
+  "payload": { "verdict": "pass" } }
+
+// Reject with feedback
+{ "name": "review-completed", "taskId": "T-001",
+  "payload": { "verdict": "fail", "feedback": "Missing edge case." } }
+```
+
+**Status codes (manual-variant signals):**
+
+| Code | Condition |
+|------|-----------|
+| 202 | Signal persisted; matching paused dispatch resumed (or buffered for arrival). |
+| 400 | Payload schema validation failed (missing `verdict`, unknown field, empty `tasks` list, malformed `type`). |
+| 401 | Unauthorized. |
+| 404 | Run not found or `taskId` not in run memory (task-scoped signals only). |
+| 409 | Run already terminal. |
+
+Memory-mutation errors (e.g., `plan-confirmed` delivered before `current_task_id` is set) fail the matched dispatch — the run terminates with `stop_reason=error` rather than the signal endpoint returning an error. Operators see this via the run status flip; the signal itself returns 202.
+
 ---
 
 ##### GET /api/v1/runs/{id}/steps
@@ -944,6 +1027,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-05-13 — FEAT-015 (manual lifecycle variant) — `POST /api/v1/runs/{id}/signals` accepts four new `name` values when the run uses `agentRef=lifecycle-agent@0.4.0-manual`: `brief-confirmed`, `tasks-confirmed`, `plan-confirmed`, `review-completed`. Each maps to a `HumanExecutor` checkpoint in the manual flow and carries an optional payload that the orchestrator translates into a `RunMemory` patch via `lifecycle_manual_patches.py`. Endpoint shape, auth, idempotency, and ordering invariants are unchanged from FEAT-005. Empty payloads mean "approve without edits"; `tasks=[]` (explicit empty list) returns 422. Memory-mutation errors (e.g., signal delivered before memory is ready) fail the matched dispatch; the run terminates with `stop_reason=error` while the signal endpoint itself still returns 202.
 - 2026-05-12 — FEAT-014 (work-item upload) — `POST /api/v1/runs` now accepts `intake.workItem = {id, kind, content?}`.  Content is sha256-hashed and stored on `work_items.body_md` / `body_sha256`; matching re-uploads are idempotent and mismatched bodies return 409.  New endpoint `POST /api/v1/work-items/upload` registers a brief without starting a run (201 insert / 200 reuse / 409 conflict).  Server-side cap `INTAKE_WORK_ITEM_MAX_BYTES` (default 1 MB) returns 413 before any DB I/O.  New Problem Details codes: `work-item-not-registered`, `work-item-content-conflict` (carries `meta.storedSha256` + `meta.uploadedSha256`), `work-item-kind-conflict` (carries `meta.storedKind` + `meta.uploadedKind`), `payload-too-large`.  Legacy `intake.workItemPath` continues to work for one minor; emits a `WARNING` log with code `intake-work-item-path-deprecated`.  `GET /api/v1/work-items` listing endpoint is explicitly out of scope.
 - 2026-04-30 — FEAT-011 (deterministic lifecycle port — `lifecycle-agent@0.3.0`) — No new HTTP endpoints, no DTO changes, no auth surface change. The control-plane accepts `agent_ref=lifecycle-agent@0.3.0` on `POST /api/v1/runs` (and via the CLI `orchestrator run lifecycle-agent@0.3.0 ...`). Run intake, signal payloads, and webhook signatures are unchanged from v0.1.0. The trace stream's `executor_call` entries gain familiar values for `mode` (`local` / `engine` / `human`) — v0.3.0's composite executors emit `mode=engine` because the engine leg drives the wake. Operationally externally indistinguishable from v0.1.0; the pivot is internal (deterministic policy, executor seam). See `docs/migration/lifecycle-v01-to-v03.md`.
 - 2026-04-26 — FEAT-010 (engine executor adapter) — No new HTTP endpoints; the engine-bound dispatch path settles via the existing `POST /hooks/engine/lifecycle/item-transitioned` webhook. Reactor pipeline gained a wake-dispatch step at the canonical position (`materialize aux → consume correlation → fire effectors → wake dispatch → fire derivations`); payload shape on `/hooks/engine/lifecycle/item-transitioned` is unchanged. The `executor_call` trace entry was extended (additive only) for `mode=engine` rows: optional `transitionKey`, `correlationId`, and `engineRunId` fields are populated when the dispatch is engine-bound. New operator command `uv run orchestrator reconcile-dispatches [--since=24h] [--dry-run]` (companion to `reconcile-aux`) settles orphan `Dispatch` rows after a process restart by querying `FlowEngineLifecycleClient.get_item_state`. No DTO changes; no auth surface change; no engine-side endpoint added (per FEAT-010 brief constraint).
