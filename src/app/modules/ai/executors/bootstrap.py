@@ -118,6 +118,24 @@ def register_all_executors(
                     actor=v03_collaborators.actor,
                     max_corrections=v03_collaborators.max_corrections,
                 )
+        elif agent.ref.startswith("lifecycle-agent@0.4"):
+            # FEAT-015: manual variant.  Reuses v0.3.0 collaborators (same
+            # engine workflows, same memory shape, same session).  The
+            # divergence is purely in flow-graph + binding set, both
+            # encoded in the YAML + the dedicated bootstrap helper.
+            if v03_collaborators is None:
+                _exempt_lifecycle_v04_manual(agent.ref, [n.name for n in agent.nodes])
+            else:
+                register_lifecycle_v04_manual(
+                    registry,
+                    agent.ref,
+                    lifecycle_client=v03_collaborators.lifecycle_client,
+                    llm_provider=v03_collaborators.llm_provider,
+                    session_factory=v03_collaborators.session_factory,
+                    workflow_ids=v03_collaborators.workflow_ids,
+                    actor=v03_collaborators.actor,
+                    max_corrections=v03_collaborators.max_corrections,
+                )
 
     logger.info(
         "executor registry: %d binding(s) across %d agent(s)",
@@ -1094,6 +1112,113 @@ class _CorrectionBudgetExceeded(RuntimeError):
     """
 
 
+# ---------------------------------------------------------------------------
+# v0.4.0-manual — manual variant (FEAT-015 / T-299)
+# ---------------------------------------------------------------------------
+
+
+def register_lifecycle_v04_manual(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    llm_provider: LLMProvider,
+    session_factory: async_sessionmaker[AsyncSession],
+    workflow_ids: Mapping[str, uuid.UUID],
+    max_corrections: int = 2,
+    actor: str | None = "lifecycle-agent",
+) -> None:
+    """Register bindings for ``lifecycle-agent@0.4.0-manual`` (FEAT-015).
+
+    Reuses every v0.3.0 binding under *agent_ref* by delegating to
+    :func:`register_lifecycle_v03` with ``skip_review_implementation=True``,
+    then registers the four new ``HumanExecutor`` checkpoint bindings
+    plus the human reviewer in place of the LLM ``review_implementation``.
+
+    The four new checkpoints carry their payload-to-memory builders
+    from :mod:`app.modules.ai.executors.lifecycle_manual_patches`; the
+    runtime applies the patches via ``HumanExecutor.memory_patch_builder``
+    (T-296) at signal-delivery time.
+    """
+    from app.modules.ai.executors.human import HumanExecutor
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_brief_correction,
+        apply_plan_correction,
+        apply_review_verdict,
+        apply_tasks_correction,
+    )
+
+    # 1. Reuse v0.3.0 bindings under the new ref, skipping the LLM reviewer.
+    register_lifecycle_v03(
+        registry,
+        agent_ref,
+        lifecycle_client=lifecycle_client,
+        llm_provider=llm_provider,
+        session_factory=session_factory,
+        workflow_ids=workflow_ids,
+        max_corrections=max_corrections,
+        actor=actor,
+        skip_review_implementation=True,
+    )
+
+    # 2. Four new human checkpoints.
+    registry.register(
+        agent_ref,
+        "confirm_brief",
+        HumanExecutor(
+            ref="human:confirm_brief",
+            expected_signal_name="brief-confirmed",
+            memory_patch_builder=apply_brief_correction,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "confirm_tasks",
+        HumanExecutor(
+            ref="human:confirm_tasks",
+            expected_signal_name="tasks-confirmed",
+            memory_patch_builder=apply_tasks_correction,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "confirm_plan",
+        HumanExecutor(
+            ref="human:confirm_plan",
+            expected_signal_name="plan-confirmed",
+            memory_patch_builder=apply_plan_correction,
+        ),
+    )
+
+    # 3. Human reviewer replaces the LLM ``review_implementation``.
+    registry.register(
+        agent_ref,
+        "human_review_implementation",
+        HumanExecutor(
+            ref="human:review_implementation",
+            expected_signal_name="review-completed",
+            memory_patch_builder=apply_review_verdict,
+        ),
+    )
+
+    logger.info(
+        "register_lifecycle_v04_manual: agent_ref=%s registered (4 human "
+        "checkpoints + human reviewer + v0.3.0 shared bindings)",
+        agent_ref,
+    )
+
+
+def _exempt_lifecycle_v04_manual(agent_ref: str, node_names: list[str]) -> None:
+    """Declare every v0.4.0-manual node as an explicit no_executor exemption.
+
+    Symmetric to :func:`_exempt_lifecycle_v03` — used when
+    ``register_all_executors`` is called without ``v03_collaborators``.
+    """
+    reason = "v0.4.0-manual collaborators not provided to register_all_executors"
+    for node_name in node_names:
+        no_executor(agent_ref, node_name, reason)
+
+
 def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
     session_factory: async_sessionmaker[AsyncSession],
 ):
@@ -1278,5 +1403,6 @@ __all__ = [
     "register_all_executors",
     "register_engine_executor",
     "register_lifecycle_v03",
+    "register_lifecycle_v04_manual",
     "run_coverage_validation",
 ]

@@ -11,13 +11,13 @@ once at signal-delivery time and passes the data dict in.
 
 Shape parity:
 
-- ``_apply_brief_correction``: writes ``lifecycle.v1.work_item`` via
+- ``apply_brief_correction``: writes ``lifecycle.v1.work_item`` via
   the full namespace blob (matches ``_patch_review``'s shape).
-- ``_apply_tasks_correction``: same, writes ``lifecycle.v1.tasks``.
-- ``_apply_plan_correction``: writes the top-level ``plans[task_id]``
+- ``apply_tasks_correction``: same, writes ``lifecycle.v1.tasks``.
+- ``apply_plan_correction``: writes the top-level ``plans[task_id]``
   sidecar (matches ``_patch_generate_plan``'s shape — the engine plan
   store is a sibling of ``lifecycle.v1``, not nested under it).
-- ``_apply_review_verdict``: delegates to the existing
+- ``apply_review_verdict``: delegates to the existing
   :func:`_patch_review` in ``bootstrap.py`` — the LLM reviewer's writer
   is the parity anchor, so the human variant cannot drift the shape.
 
@@ -119,7 +119,7 @@ class ReviewCompletedPayload(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _apply_brief_correction(
+def apply_brief_correction(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -151,7 +151,7 @@ def _apply_brief_correction(
     return {LIFECYCLE_MEMORY_NS: to_run_memory(memory)}
 
 
-def _apply_tasks_correction(
+def apply_tasks_correction(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -200,7 +200,7 @@ def _apply_tasks_correction(
     return {LIFECYCLE_MEMORY_NS: to_run_memory(memory)}
 
 
-def _apply_plan_correction(
+def apply_plan_correction(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -233,7 +233,7 @@ def _apply_plan_correction(
     return {"plans": merged_plans}
 
 
-def _apply_review_verdict(
+def apply_review_verdict(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -274,8 +274,8 @@ __all__ = [
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
-    "_apply_brief_correction",
-    "_apply_plan_correction",
-    "_apply_review_verdict",
-    "_apply_tasks_correction",
+    "apply_brief_correction",
+    "apply_plan_correction",
+    "apply_review_verdict",
+    "apply_tasks_correction",
 ]
