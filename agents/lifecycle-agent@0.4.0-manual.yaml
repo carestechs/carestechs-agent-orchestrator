@@ -1,0 +1,302 @@
+# lifecycle-agent@0.4.0-manual — FEAT-015
+#
+# Manual variant of the lifecycle. Same eight-stage skeleton as v0.3.0
+# with four human checkpoints inserted at the LLM→engine seams (brief,
+# tasks, plan) and a human reviewer replacing the LLM `review_implementation`
+# node. Operator drives every commit to engine state; LLM still
+# synthesises artefacts but cannot advance the flow without explicit
+# operator approval via the `/api/v1/runs/{id}/signals` endpoint.
+#
+# Signal contracts (documented in docs/api-spec.md):
+#   - `brief-confirmed`       — payload optional (workItem corrections)
+#   - `tasks-confirmed`       — payload optional (replacement task list)
+#   - `plan-confirmed`        — payload optional (replacement plan markdown)
+#   - `review-completed`      — payload required (verdict + optional feedback)
+#
+# Bootstrap wiring: `register_lifecycle_v04_manual` in
+# `src/app/modules/ai/executors/bootstrap.py`. Reuses every v0.3.0
+# binding (engine create, propose-tasks fanout, sequence-close, etc.)
+# under this agent_ref + adds four HumanExecutor bindings plus a human
+# reviewer in place of the LLM `review_implementation`.
+#
+# Memory shape, engine workflows, intake schema, terminalNodes, and
+# defaultBudget are byte-identical to v0.3.0.
+
+ref: lifecycle-agent@0.4.0-manual
+version: "0.4.0-manual"
+description: >
+  Manual variant of the lifecycle. Same eight-stage skeleton as v0.3.0,
+  with four human checkpoints inserted at the LLM→engine seams (brief,
+  tasks, plan) and a human reviewer replacing the LLM review step.
+  Operator drives every commit to engine state; LLM still synthesises
+  artefacts but cannot advance the flow without explicit approval.
+
+nodes:
+  - name: start
+    description: >
+      Synthetic entry marker.  The flow resolver treats `entryNode` as
+      the *previous* node before the first dispatch — its outgoing
+      transition selects the first node actually executed.  `start` has
+      no executor binding (registered via `no_executor`) and is never
+      dispatched.
+    inputSchema:
+      type: object
+
+  - name: load_work_item
+    description: >
+      Synthesize the work-item brief (LLM-content). Persists the parsed
+      external ref + title into `LifecycleMemory.work_item` for the
+      following `register_work_item` node to consume. No engine call.
+    inputSchema:
+      type: object
+      properties:
+        workItemPath: {type: string}
+      required: [workItemPath]
+
+  - name: confirm_brief
+    description: >
+      Pause for an operator-injected `brief-confirmed` signal before
+      committing W1. The operator reviews `LifecycleMemory.work_item`
+      (id, kind, title) and either approves or sends corrections in the
+      signal payload — `signal.payload.workItem` (optional) overwrites
+      the corresponding `work_item` fields before `register_work_item`
+      fires.
+    inputSchema:
+      type: object
+
+  - name: register_work_item
+    description: >
+      Create the engine work item (W1) using the brief persisted by
+      `load_work_item`. Calls the engine's `create_item` synchronously,
+      writes the returned `engineItemId` into `Run.intake` so downstream
+      engine-bound nodes can address the item, and inserts the local
+      `work_items` row. Local-mode dispatch — no webhook round-trip.
+    inputSchema:
+      type: object
+
+  - name: generate_tasks
+    description: >
+      Generate the task breakdown (LLM-content). Persists the task list
+      into LifecycleMemory.tasks; engine fanout happens in propose_tasks.
+    inputSchema:
+      type: object
+      properties:
+        workItemId: {type: string}
+      required: [workItemId]
+
+  - name: confirm_tasks
+    description: >
+      Pause for `tasks-confirmed` before fanning out to the engine. The
+      operator reviews `LifecycleMemory.tasks` (list of {id, title,
+      summary}) and may rewrite the list via `signal.payload.tasks`
+      (optional). The replacement is persisted to memory and
+      `propose_tasks` then commits whatever is in memory.
+    inputSchema:
+      type: object
+
+  - name: propose_tasks
+    description: >
+      For every task in memory: T1 create_item against the task workflow,
+      then T2 (proposed → approved) and T4 (approved → assigning).  After
+      all tasks are advanced, fire W2 (open → in_progress) on the work
+      item.  Local-mode synchronous executor (BUG-004).
+    inputSchema:
+      type: object
+
+  - name: assign_task
+    description: >
+      Advance the current task via T5 (assigning → planning).  Resolves the
+      engine target from LifecycleMemory.current_task_id (BUG-004).
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: generate_plan
+    description: >
+      Author an implementation plan for the current task (LLM-content) and
+      fire T6 (planning → plan_review). One task at a time — the per-task
+      loop runs assign → plan → implement → review → approve sequentially
+      and the loop-back from `mark_task_done` resumes at `assign_task` for
+      the next un-completed task. (BUG-013 — the v0.1.0-style "plan all
+      then implement all" self-loop was structurally broken because no
+      v0.3.0 writer advanced ``current_task_id``; sequential per-task is
+      simpler and provably correct.)
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: confirm_plan
+    description: >
+      Pause for `plan-confirmed` after the LLM authored the plan and
+      fired T6 (planning → plan_review). The engine task sits at
+      `plan_review`; the operator reads the plan from
+      `plans[<taskId>].plan_markdown` (top-level sidecar) and either
+      approves or rewrites it via `signal.payload.plan` (optional).
+      On approval, `approve_plan` fires T7.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: approve_plan
+    description: >
+      Fire T7 (plan_review → implementing) on the current task (BUG-004).
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: request_implementation
+    description: >
+      Pause and wait for an operator-injected `implementation-complete`
+      signal.  Engine state advance is handled by submit_implementation.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: submit_implementation
+    description: >
+      Idempotent T9 (implementing → impl_review) on the current task.
+      Skips the engine call if the task has already been submitted (memory
+      flag set), so the rejection-resubmit loop does not re-fire T9.
+    inputSchema:
+      type: object
+
+  - name: human_review_implementation
+    description: >
+      Pause for `review-completed` from a human reviewer.  The signal
+      payload carries `verdict ∈ {"pass", "fail"}` and an optional
+      `feedback` string.  Writes the same `reviewHistory[]` entry the
+      LLM reviewer writes (shared through `_patch_review` in
+      `bootstrap.py`) so downstream `approve_review` / T10 and
+      `correct_implementation` read the same memory contract as v0.3.0.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: approve_review
+    description: >
+      Fire T10 (impl_review → done) on the current task.  Selected only on
+      verdict=pass branch; rejection path bypasses this node so the engine
+      task does not silently advance to done (BUG-004 + FEAT-008 contract).
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: mark_task_done
+    description: >
+      Append the just-approved task id to ``LifecycleMemory.completed_task_ids``
+      and advance ``current_task_id`` to the next un-completed task in
+      declaration order (or ``None`` when every task is done).  Pure memory
+      write; no engine call.  The ``tasks_remaining`` predicate then routes
+      back to ``assign_task`` (loop) or onward to ``close_work_item``
+      (terminal).  BUG-013.
+    inputSchema:
+      type: object
+
+  - name: correct_implementation
+    description: >
+      Record a rejection for the current task implementation (writes the
+      Approval row inline per FEAT-008; does NOT call the engine).
+      Branches on `correction_attempts_under_bound` — true loops back to
+      `request_implementation`, false terminates the run.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: close_work_item
+    description: >
+      Close the work item by chaining W4 (in_progress → ready) and then
+      W6 (ready → closed) via SequenceEngineExecutor.  Terminal node.
+    inputSchema:
+      type: object
+      properties:
+        workItemId: {type: string}
+      required: [workItemId]
+
+  - name: terminate_correction_budget
+    description: >
+      Terminal failure node reached when the correction budget is
+      exhausted (`correction_attempts_under_bound` is false). The runtime
+      maps `final_state.reason=correction_budget_exceeded` to
+      `RunStatus.FAILED` via the existing stop-condition pipeline.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+flow:
+  policy: deterministic
+  entryNode: start
+  transitions:
+    start: [load_work_item]
+    load_work_item: [confirm_brief]
+    confirm_brief: [register_work_item]
+    register_work_item: [generate_tasks]
+    generate_tasks: [confirm_tasks]
+    confirm_tasks: [propose_tasks]
+    propose_tasks: [assign_task]
+    assign_task: [generate_plan]
+    generate_plan: [confirm_plan]
+    confirm_plan: [approve_plan]
+    approve_plan: [request_implementation]
+    request_implementation: [submit_implementation]
+    submit_implementation: [human_review_implementation]
+    human_review_implementation:
+      branch:
+        rule: review_passed
+        "true": approve_review
+        "false": correct_implementation
+    approve_review: [mark_task_done]
+    mark_task_done:
+      branch:
+        rule: tasks_remaining
+        "true": assign_task
+        "false": close_work_item
+    correct_implementation:
+      branch:
+        rule: correction_attempts_under_bound
+        "true": request_implementation
+        "false": terminate_correction_budget
+    close_work_item: []
+    terminate_correction_budget: []
+
+intakeSchema:
+  type: object
+  properties:
+    # FEAT-014: ``workItem`` is the canonical upload shape — the body is
+    # carried inline on first sight and the orchestrator dedupes by id
+    # for every sight after.  ``workItemPath`` is the legacy intake;
+    # accepted for one minor (with a server-side deprecation log) and
+    # then removed.
+    workItem:
+      type: object
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [FEAT, BUG, IMP]}
+        content: {type: string}
+      required: [id, kind]
+    workItemPath: {type: string}
+  anyOf:
+    - required: [workItem]
+    - required: [workItemPath]
+
+terminalNodes: [close_work_item, terminate_correction_budget]
+
+defaultBudget:
+  maxSteps: 600
