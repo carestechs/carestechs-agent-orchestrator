@@ -538,6 +538,15 @@ async def _deliver_to_human_dispatch(
         "payload": payload,
     }
 
+    # FEAT-015: surface payload fields at the envelope result top level
+    # so flow-predicates (e.g. ``review_passed`` reading
+    # ``result.verdict``) work uniformly with LLM-content reviewers and
+    # human reviewers.  Reserved keys (``signal_name`` / ``task_id`` /
+    # ``payload``) are preserved; only payload-only fields are surfaced.
+    for k, v in payload.items():
+        if k not in result:
+            result[k] = v
+
     # FEAT-015 / T-296: resolve the binding and invoke the memory-patch
     # builder if present.  No registry = legacy path (no builder).
     if executor_registry is not None:
