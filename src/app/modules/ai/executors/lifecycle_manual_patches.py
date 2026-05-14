@@ -197,6 +197,19 @@ def apply_tasks_correction(
                 )
             )
     memory.tasks = new_tasks
+    # ``_patch_generate_tasks`` sets ``current_task_id`` to the LLM's
+    # first task on generation.  When the operator rewrites the list,
+    # the previous ``current_task_id`` may no longer exist in
+    # ``memory.tasks`` — downstream nodes (``assign_task``,
+    # ``generate_plan``, target_id_resolver lookups) would then fail
+    # with "no engine target for this dispatch."  Re-anchor the cursor
+    # to the first un-completed task of the replacement list (matches
+    # ``mark_task_done``'s loop-back logic).
+    completed = set(memory.completed_task_ids)
+    memory.current_task_id = next(
+        (t.id for t in new_tasks if t.id not in completed),
+        None,
+    )
     return {LIFECYCLE_MEMORY_NS: to_run_memory(memory)}
 
 
