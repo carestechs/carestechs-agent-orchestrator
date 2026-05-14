@@ -23,15 +23,36 @@ from datetime import UTC, datetime
 from typing import ClassVar
 
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
+from app.modules.ai.executors.llm_content import MemoryPatchBuilder
 from app.modules.ai.schemas import DispatchEnvelope
 
 
 class HumanExecutor:
-    """Operator-fulfilled executor.  Returns ``dispatched`` and waits."""
+    """Operator-fulfilled executor.  Returns ``dispatched`` and waits.
+
+    Optional ``memory_patch_builder`` (FEAT-015 / T-296) lets a binding
+    declare how an operator-delivered signal payload mutates
+    ``RunMemory``.  The builder runs at signal-delivery time in
+    ``service._deliver_to_human_dispatch`` — the executor itself only
+    *carries* the reference; it does not call the builder during its
+    own ``dispatch`` because the payload isn't available there.  The
+    runtime then merges the returned patch into ``RunMemory.data`` via
+    the standard ``__memory_patch`` hook on the dispatch envelope's
+    ``result``.
+
+    Keys starting with ``_`` are filtered by ``_write_state`` and must
+    not appear in the builder's returned patch.
+    """
 
     mode: ClassVar[ExecutorMode] = "human"
 
-    def __init__(self, ref: str, *, expected_signal_name: str) -> None:
+    def __init__(
+        self,
+        ref: str,
+        *,
+        expected_signal_name: str,
+        memory_patch_builder: MemoryPatchBuilder | None = None,
+    ) -> None:
         self.name = ref
         self._ref = ref
         # Documented for the bootstrap site — the runtime is what
@@ -39,6 +60,10 @@ class HumanExecutor:
         # signal arrives.  Carried here as a string so an executor
         # binding can be inspected at runtime.
         self.expected_signal_name = expected_signal_name
+        # Public — ``service._deliver_to_human_dispatch`` resolves the
+        # binding from the registry and reads this attribute to decide
+        # whether to call the builder + embed the patch.
+        self.memory_patch_builder = memory_patch_builder
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)

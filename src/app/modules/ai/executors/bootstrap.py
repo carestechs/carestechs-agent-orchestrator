@@ -118,6 +118,24 @@ def register_all_executors(
                     actor=v03_collaborators.actor,
                     max_corrections=v03_collaborators.max_corrections,
                 )
+        elif agent.ref.startswith("lifecycle-agent@0.4"):
+            # FEAT-015: manual variant.  Reuses v0.3.0 collaborators (same
+            # engine workflows, same memory shape, same session).  The
+            # divergence is purely in flow-graph + binding set, both
+            # encoded in the YAML + the dedicated bootstrap helper.
+            if v03_collaborators is None:
+                _exempt_lifecycle_v04_manual(agent.ref, [n.name for n in agent.nodes])
+            else:
+                register_lifecycle_v04_manual(
+                    registry,
+                    agent.ref,
+                    lifecycle_client=v03_collaborators.lifecycle_client,
+                    llm_provider=v03_collaborators.llm_provider,
+                    session_factory=v03_collaborators.session_factory,
+                    workflow_ids=v03_collaborators.workflow_ids,
+                    actor=v03_collaborators.actor,
+                    max_corrections=v03_collaborators.max_corrections,
+                )
 
     logger.info(
         "executor registry: %d binding(s) across %d agent(s)",
@@ -373,8 +391,16 @@ def register_lifecycle_v03(
     workflow_ids: Mapping[str, uuid.UUID],
     max_corrections: int = 2,
     actor: str | None = "lifecycle-agent",
+    skip_review_implementation: bool = False,
 ) -> None:
     """Register the eight production bindings for ``lifecycle-agent@0.3.0``.
+
+    When ``skip_review_implementation=True``, the LLM ``review_implementation``
+    binding is omitted so a sibling variant (e.g. FEAT-015's
+    ``lifecycle-agent@0.4.0-manual``) can register a human reviewer in
+    that slot.  The companion ``approve_review`` engine binding is
+    unaffected and registers as usual — both reviewer variants route
+    through it on a ``pass`` verdict.
 
     The mapping table lives in ``docs/design/feat-011-lifecycle-deterministic-port.md``
     (section "Node-to-executor mapping table (v0.3.0)").  Composite nodes
@@ -891,61 +917,76 @@ def register_lifecycle_v03(
             "implementationEvidence": evidence,
         }
 
-    # IMP-003: select the reviewer binding from settings.  Default
-    # ``llm-content`` preserves today's behaviour; ``stub-pass`` is the
-    # smoke / CI binding that auto-approves so runs reach
-    # ``close_work_item`` without real PR evidence.  A future ``remote``
-    # value slots in here when the external reviewer service ships.
-    from app.config import get_settings as _get_settings
+    # FEAT-015: sibling variants register their own reviewer (e.g.
+    # ``human_review_implementation`` for the manual flow).  When
+    # ``skip_review_implementation`` is set, omit the LLM reviewer
+    # binding entirely so the variant's bootstrap can register a
+    # replacement under the same ``agent_ref``.  Every other binding
+    # (approve_review / T10, mark_task_done, correct_implementation,
+    # close_work_item, terminate_correction_budget) registers
+    # unconditionally — those are shared infrastructure.
+    if not skip_review_implementation:
+        # IMP-003: select the reviewer binding from settings.  Default
+        # ``llm-content`` preserves today's behaviour; ``stub-pass`` is the
+        # smoke / CI binding that auto-approves so runs reach
+        # ``close_work_item`` without real PR evidence.  A future ``remote``
+        # value slots in here when the external reviewer service ships.
+        from app.config import get_settings as _get_settings
 
-    reviewer_choice = _get_settings().lifecycle_reviewer
-    reviewer_executor: Any
-    if reviewer_choice == "llm-content":
-        reviewer_executor = LLMContentExecutor(
-            ref="llm:review_implementation",
-            system_prompt=_load_prompt("review_implementation"),
-            user_prompt_template=(
-                "Review the implementation for the task below against the "
-                "approved plan and the operator-supplied evidence.\n\n"
-                "Task id: {taskId}\n"
-                "Title: {taskTitle}\n"
-                "Complexity: {complexity}\n\n"
-                "Description:\n{taskDescription}\n\n"
-                "Acceptance criteria:\n{acceptanceCriteria}\n\n"
-                "----- BEGIN APPROVED PLAN -----\n"
-                "{planMarkdown}\n"
-                "----- END APPROVED PLAN -----\n\n"
-                "----- BEGIN IMPLEMENTATION EVIDENCE -----\n"
-                "{implementationEvidence}\n"
-                "----- END IMPLEMENTATION EVIDENCE -----\n"
-            ),
-            result_schema=ReviewImplementationResult,
-            llm_provider=llm_provider,
-            memory_patch_builder=_patch_review,
-            prompt_context_loader=_load_review_context,
-            session_factory=session_factory,
-        )
-    elif reviewer_choice == "stub-pass":
-        from app.modules.ai.executors.stub_reviewer import make_stub_pass_reviewer
+        reviewer_choice = _get_settings().lifecycle_reviewer
+        reviewer_executor: Any
+        if reviewer_choice == "llm-content":
+            reviewer_executor = LLMContentExecutor(
+                ref="llm:review_implementation",
+                system_prompt=_load_prompt("review_implementation"),
+                user_prompt_template=(
+                    "Review the implementation for the task below against the "
+                    "approved plan and the operator-supplied evidence.\n\n"
+                    "Task id: {taskId}\n"
+                    "Title: {taskTitle}\n"
+                    "Complexity: {complexity}\n\n"
+                    "Description:\n{taskDescription}\n\n"
+                    "Acceptance criteria:\n{acceptanceCriteria}\n\n"
+                    "----- BEGIN APPROVED PLAN -----\n"
+                    "{planMarkdown}\n"
+                    "----- END APPROVED PLAN -----\n\n"
+                    "----- BEGIN IMPLEMENTATION EVIDENCE -----\n"
+                    "{implementationEvidence}\n"
+                    "----- END IMPLEMENTATION EVIDENCE -----\n"
+                ),
+                result_schema=ReviewImplementationResult,
+                llm_provider=llm_provider,
+                memory_patch_builder=_patch_review,
+                prompt_context_loader=_load_review_context,
+                session_factory=session_factory,
+            )
+        elif reviewer_choice == "stub-pass":
+            from app.modules.ai.executors.stub_reviewer import make_stub_pass_reviewer
 
-        logger.warning(
-            "register_lifecycle_v03: LIFECYCLE_REVIEWER=stub-pass — every "
-            "implementation will be auto-approved.  Smoke / CI only."
+            logger.warning(
+                "register_lifecycle_v03: LIFECYCLE_REVIEWER=stub-pass — every "
+                "implementation will be auto-approved.  Smoke / CI only."
+            )
+            reviewer_executor = make_stub_pass_reviewer(
+                session_factory=session_factory,
+                patch_review_builder=_patch_review,
+            )
+        else:
+            # Pydantic ``Literal`` validation prevents this branch in
+            # practice; the explicit raise documents the closed enumeration.
+            raise ValueError(f"unknown LIFECYCLE_REVIEWER={reviewer_choice!r}")
+
+        logger.info(
+            "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
+            reviewer_choice,
         )
-        reviewer_executor = make_stub_pass_reviewer(
-            session_factory=session_factory,
-            patch_review_builder=_patch_review,
-        )
+        registry.register(agent_ref, "review_implementation", reviewer_executor)
     else:
-        # Pydantic ``Literal`` validation prevents this branch in
-        # practice; the explicit raise documents the closed enumeration.
-        raise ValueError(f"unknown LIFECYCLE_REVIEWER={reviewer_choice!r}")
-
-    logger.info(
-        "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
-        reviewer_choice,
-    )
-    registry.register(agent_ref, "review_implementation", reviewer_executor)
+        logger.info(
+            "register_lifecycle_v03: agent_ref=%s skipping review_implementation "
+            "(sibling variant will register its own reviewer)",
+            agent_ref,
+        )
 
     # ------------------------------------------------------------------
     # approve_review — T10: impl_review → done (current task).  Only
@@ -1069,6 +1110,113 @@ class _CorrectionBudgetExceeded(RuntimeError):
     Surfaced as a failed local-executor envelope; the runtime maps it to
     ``RunStatus.FAILED`` via the ``_ExecutorFailure`` path.
     """
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0-manual — manual variant (FEAT-015 / T-299)
+# ---------------------------------------------------------------------------
+
+
+def register_lifecycle_v04_manual(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    llm_provider: LLMProvider,
+    session_factory: async_sessionmaker[AsyncSession],
+    workflow_ids: Mapping[str, uuid.UUID],
+    max_corrections: int = 2,
+    actor: str | None = "lifecycle-agent",
+) -> None:
+    """Register bindings for ``lifecycle-agent@0.4.0-manual`` (FEAT-015).
+
+    Reuses every v0.3.0 binding under *agent_ref* by delegating to
+    :func:`register_lifecycle_v03` with ``skip_review_implementation=True``,
+    then registers the four new ``HumanExecutor`` checkpoint bindings
+    plus the human reviewer in place of the LLM ``review_implementation``.
+
+    The four new checkpoints carry their payload-to-memory builders
+    from :mod:`app.modules.ai.executors.lifecycle_manual_patches`; the
+    runtime applies the patches via ``HumanExecutor.memory_patch_builder``
+    (T-296) at signal-delivery time.
+    """
+    from app.modules.ai.executors.human import HumanExecutor
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_brief_correction,
+        apply_plan_correction,
+        apply_review_verdict,
+        apply_tasks_correction,
+    )
+
+    # 1. Reuse v0.3.0 bindings under the new ref, skipping the LLM reviewer.
+    register_lifecycle_v03(
+        registry,
+        agent_ref,
+        lifecycle_client=lifecycle_client,
+        llm_provider=llm_provider,
+        session_factory=session_factory,
+        workflow_ids=workflow_ids,
+        max_corrections=max_corrections,
+        actor=actor,
+        skip_review_implementation=True,
+    )
+
+    # 2. Four new human checkpoints.
+    registry.register(
+        agent_ref,
+        "confirm_brief",
+        HumanExecutor(
+            ref="human:confirm_brief",
+            expected_signal_name="brief-confirmed",
+            memory_patch_builder=apply_brief_correction,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "confirm_tasks",
+        HumanExecutor(
+            ref="human:confirm_tasks",
+            expected_signal_name="tasks-confirmed",
+            memory_patch_builder=apply_tasks_correction,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "confirm_plan",
+        HumanExecutor(
+            ref="human:confirm_plan",
+            expected_signal_name="plan-confirmed",
+            memory_patch_builder=apply_plan_correction,
+        ),
+    )
+
+    # 3. Human reviewer replaces the LLM ``review_implementation``.
+    registry.register(
+        agent_ref,
+        "human_review_implementation",
+        HumanExecutor(
+            ref="human:review_implementation",
+            expected_signal_name="review-completed",
+            memory_patch_builder=apply_review_verdict,
+        ),
+    )
+
+    logger.info(
+        "register_lifecycle_v04_manual: agent_ref=%s registered (4 human "
+        "checkpoints + human reviewer + v0.3.0 shared bindings)",
+        agent_ref,
+    )
+
+
+def _exempt_lifecycle_v04_manual(agent_ref: str, node_names: list[str]) -> None:
+    """Declare every v0.4.0-manual node as an explicit no_executor exemption.
+
+    Symmetric to :func:`_exempt_lifecycle_v03` — used when
+    ``register_all_executors`` is called without ``v03_collaborators``.
+    """
+    reason = "v0.4.0-manual collaborators not provided to register_all_executors"
+    for node_name in node_names:
+        no_executor(agent_ref, node_name, reason)
 
 
 def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
@@ -1255,5 +1403,6 @@ __all__ = [
     "register_all_executors",
     "register_engine_executor",
     "register_lifecycle_v03",
+    "register_lifecycle_v04_manual",
     "run_coverage_validation",
 ]

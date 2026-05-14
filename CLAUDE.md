@@ -43,6 +43,8 @@ uv run uvicorn app.main:app --reload
 
 # Invoke the CLI (FEAT-014: --work-item reads client-side and uploads body)
 uv run orchestrator run lifecycle-agent@0.3.0 --work-item docs/work-items/FEAT-042.md --follow
+# Manual variant — pauses for operator approval at every LLM→engine seam (FEAT-015)
+uv run orchestrator run lifecycle-agent@0.4.0-manual --work-item docs/work-items/FEAT-042.md --follow
 # Legacy (deprecated, removed in next minor): --intake workItemPath=docs/work-items/FEAT-042.md
 # Operator backfill from a directory of briefs (FEAT-014):
 uv run orchestrator import-work-items docs/work-items/
@@ -138,6 +140,7 @@ agents/                         — YAML agent definitions
                                    - lifecycle-agent@0.1.0.yaml (full lifecycle, llm-policy — superseded by 0.3.0; kept for migration window)
                                    - lifecycle-agent@0.2.0.yaml (FEAT-009 demo, deterministic-policy)
                                    - lifecycle-agent@0.3.0.yaml (FEAT-011 production deterministic-policy port; default for new runs)
+                                   - lifecycle-agent@0.4.0-manual.yaml (FEAT-015 manual variant — 4 human checkpoints + human reviewer)
 docs/                           — Framework docs (stakeholder, architecture, data-model, api-spec, ui-specification, personas, work-items)
                                    - migration/lifecycle-v01-to-v03.md — v0.1.0 → v0.3.0 cutover guide (FEAT-011)
 tests/                          — conftest + modules/ai + integration/ + contract/
@@ -177,6 +180,7 @@ tests/                          — conftest + modules/ai + integration/ + contr
 ### Patterns to Follow
 
 - **Two entry points, one core.** Any capability exists once — as a service function — and is exposed by both FastAPI and Typer. New behavior starts in `service.py`, not in the adapter.
+- **Lifecycle agent variants are peers under distinct `agent_ref`s.** Each variant ships its own `agents/lifecycle-agent@X.Y.Z-<variant>.yaml` plus a `register_lifecycle_v0X_<variant>(...)` bootstrap function. The variant is selected at run start via the existing `agent_ref` parameter — no runtime branching. Shared bindings factor through the lowest-version helper (today: `register_lifecycle_v03(agent_ref=..., skip_review_implementation=...)`); variant-specific bindings (human checkpoints, alternative reviewers) layer on top. Current variants: `@0.3.0` (LLM-driven autonomous, FEAT-011), `@0.4.0-manual` (operator-driven, FEAT-015). The `register_all_executors` dispatcher routes by `agent_ref.startswith(...)` to the matching bootstrap helper.
 - **Tool definition doubles as policy action space.** Exposing a capability to the policy means adding a tool in `modules/ai/tools/`. Omit it from the per-call tool list to gate availability — don't use prompt text to hide it.
 - **Pre-persist webhook events.** Inbound engine events MUST be persisted (including ones with bad signatures, with `signature_ok=false`) before any runtime action is taken. Idempotency via `dedupe_key` unique constraint.
 - **RFC 7807 errors.** All 4xx/5xx responses use Problem Details. Helpers in `core/exceptions.py`.
