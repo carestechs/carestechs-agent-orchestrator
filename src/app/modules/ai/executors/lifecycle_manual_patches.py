@@ -44,7 +44,6 @@ from app.modules.ai.tools.lifecycle.memory import (
     to_run_memory,
 )
 
-
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -100,6 +99,19 @@ class TasksConfirmedPayload(BaseModel):
     ) -> list[_TaskInput] | None:
         if v is not None and len(v) == 0:
             raise ValueError("tasks list must be non-empty when provided")
+        return v
+
+
+class AssignmentConfirmedPayload(BaseModel):
+    model_config = _PayloadConfig
+    assignee: str
+    task_id: str | None = None
+
+    @field_validator("assignee")
+    @classmethod
+    def _non_empty_assignee(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("assignee must be non-empty")
         return v
 
 
@@ -246,6 +258,47 @@ def apply_plan_correction(
     return {"plans": merged_plans}
 
 
+def apply_assignment_confirmation(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Record the operator's chosen assignee for the current task.
+
+    Assignees live at top-level ``assignments[task_id]`` — a sibling of
+    ``lifecycle.v1``, NOT nested under it (matches ``apply_plan_correction``'s
+    sidecar pattern).  Keeping ``LifecycleTask`` byte-unchanged from v0.3.0
+    preserves the "Lifecycle agent variants are peers" contract — v0.3.0
+    memory never grows an ``assignments`` key.
+
+    Target task id: ``payload.task_id`` when supplied, else
+    ``memory.current_task_id``.  Missing both → ``ValueError``.  Empty /
+    whitespace ``assignee`` is rejected at the schema layer.
+    """
+    parsed = AssignmentConfirmedPayload.model_validate(payload)
+    target_task_id = parsed.task_id
+    if target_task_id is None:
+        memory = read_lifecycle_memory(current_memory)
+        target_task_id = memory.current_task_id
+    if target_task_id is None:
+        raise ValueError(
+            "assignment-confirmed received with no resolvable task id — "
+            "payload.taskId omitted and lifecycle.v1.current_task_id is None."
+        )
+    # Merge with the existing ``assignments`` sidecar; without this every
+    # per-task loop-back through ``confirm_assignment`` would overwrite prior
+    # assignees (the runtime's memory applier replaces top-level keys verbatim).
+    existing_any: Any = current_memory.get("assignments") or {}
+    if not isinstance(existing_any, dict):
+        raise ValueError(
+            "existing assignments is not a mapping; refusing to overwrite."
+        )
+    merged: dict[str, Any] = {
+        str(k): v for k, v in existing_any.items()  # type: ignore[union-attr]
+    }
+    merged[target_task_id] = parsed.assignee
+    return {"assignments": merged}
+
+
 def apply_review_verdict(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
@@ -283,10 +336,12 @@ def apply_review_verdict(
 
 
 __all__ = [
+    "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
+    "apply_assignment_confirmation",
     "apply_brief_correction",
     "apply_plan_correction",
     "apply_review_verdict",

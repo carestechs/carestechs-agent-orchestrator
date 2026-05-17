@@ -240,6 +240,13 @@ _SIGNAL_FOR_REF: dict[
             ]
         },
     ),
+    "human:confirm_assignment": (
+        # IMP-004 / T-309: operator picks an assignee per task.  Distinct
+        # name per task lets the merge-preserve + multi-task loop-back
+        # assertions discriminate the two cases.
+        "assignment-confirmed",
+        lambda tid: {"assignee": f"operator-{tid}"},
+    ),
     "human:confirm_plan": (
         "plan-confirmed",
         lambda _tid: {},  # approve LLM plan unchanged
@@ -285,6 +292,15 @@ async def _drive_manual_lifecycle(
         intake={
             "workItemPath": "docs/work-items/FEAT-099.md",
             "workItemId": "FEAT-099",
+            # IMP-005: codeSource is the run's anchor to a concrete
+            # repo + branch.  This test seeds the Run row directly so it
+            # bypasses ``start_run`` validation, but supplying the field
+            # keeps the fixture realistic and future-proofs against the
+            # day we exercise the validation path here.
+            "codeSource": {
+                "repo": "carestechs/orchestrator-test-fixture",
+                "baseBranch": "main",
+            },
         },
     )
 
@@ -639,6 +655,22 @@ async def test_manual_lifecycle_drives_full_flow_with_operator_edits(
 
         # Sanity: completed_task_ids matches.
         assert memory.completed_task_ids == ["T-edit-1", "T-edit-2"]
+
+        # IMP-004 / T-309: confirm_assignment fired once per task and
+        # persisted distinct assignees through the per-task loop-back.
+        # The merge-preserve logic in apply_assignment_confirmation must
+        # carry T-edit-1's assignee forward when T-edit-2's gets recorded;
+        # naive overwrite would leave only one key.
+        assignments = ((mem_row.data if mem_row else {}) or {}).get(
+            "assignments"
+        ) or {}
+        assert assignments == {
+            "T-edit-1": "operator-T-edit-1",
+            "T-edit-2": "operator-T-edit-2",
+        }, (
+            "expected per-task assignees preserved through loop-back; got "
+            f"{assignments!r}"
+        )
     finally:
         if run is not None and session_factory is not None:
             await _cleanup(session_factory, run.id, work_item_id=work_item_id)

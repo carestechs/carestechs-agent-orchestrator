@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import jsonschema
 from jsonschema import ValidationError as JsonSchemaValidationError
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -40,6 +41,7 @@ from app.modules.ai.runtime import run_loop
 from app.modules.ai.schemas import (
     AgentDto,
     CancelRunRequest,
+    CodeSourceDto,
     CreateRunRequest,
     LastStepSummary,
     PolicyCallDto,
@@ -175,6 +177,41 @@ async def start_run(
                 detail=f"intake validation failed: {exc.message}",
                 errors={"intake": [exc.message]},
             ) from exc
+
+    # 3b. IMP-005: validate the ``codeSource`` intake block.  Shape errors
+    #     always reject (400).  Presence enforcement is governed by
+    #     ``LIFECYCLE_CODE_SOURCE_REQUIRED`` — strict mode rejects missing,
+    #     soft mode (default during the deprecation window) logs a one-shot
+    #     warning and accepts.
+    code_source_raw: Any = request.intake.get("codeSource")
+    if code_source_raw is not None:
+        try:
+            CodeSourceDto.model_validate(code_source_raw)
+        except PydanticValidationError as exc:
+            raise ValidationError(
+                detail=f"intake.codeSource validation failed: {exc.errors()[0]['msg']}",
+                errors={"intake.codeSource": [e["msg"] for e in exc.errors()]},
+            ) from exc
+    else:
+        if settings.lifecycle_code_source_required:
+            raise ValidationError(
+                detail="intake.codeSource is required",
+                errors={"intake.codeSource": ["field required"]},
+            )
+        wi_id = (
+            work_item_raw.get("id")
+            if isinstance(work_item_raw, dict)
+            else None
+        )
+        logger.warning(
+            "intake.codeSource missing — falling back to deprecation window; "
+            "flip LIFECYCLE_CODE_SOURCE_REQUIRED=true to enforce",
+            extra={
+                "code": "intake-code-source-missing-deprecated",
+                "agent_ref": request.agent_ref,
+                "work_item_id": wi_id,
+            },
+        )
 
     # 4. FEAT-014 work-item upload: typed-parse and register inside the
     #    same transaction as the Run insert.  Errors propagate to the

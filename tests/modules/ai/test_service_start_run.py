@@ -312,3 +312,179 @@ intake_schema:
         finally:
             for rid in ids:
                 await _cleanup_run(session_factory, rid)
+
+
+# ---------------------------------------------------------------------------
+# IMP-005: codeSource intake validation
+# ---------------------------------------------------------------------------
+
+
+class TestStartRunCodeSource:
+    """``LIFECYCLE_CODE_SOURCE_REQUIRED`` enforcement + shape validation."""
+
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_soft_mode_accepts_missing_code_source_and_warns(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        test_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Deprecation window default: missing codeSource → WARN + accept.
+
+        Alembic's ``fileConfig`` (loaded by the ``migrated`` fixture) sets
+        ``disable_existing_loggers=True``, which silences module-level
+        loggers created before migrations run.  Rather than re-enable the
+        production logger from a test, spy on it directly.
+        """
+        from app.modules.ai import service as svc
+
+        warn_calls: list[tuple[str, dict[str, object]]] = []
+        original_warning = svc.logger.warning
+
+        def _spy(msg: object, *args: object, **kwargs: object) -> None:
+            warn_calls.append((str(msg), dict(kwargs.get("extra") or {})))
+            original_warning(msg, *args, **kwargs)
+
+        monkeypatch.setattr(svc.logger, "warning", _spy)
+
+        settings = test_settings.model_copy(
+            update={"lifecycle_code_source_required": False}
+        )
+        supervisor = _FakeSupervisor()
+        request = CreateRunRequest(
+            agent_ref="sample-linear", intake={"brief": "hello"}
+        )
+
+        summary = await start_run(
+            request,
+            settings=settings,
+            supervisor=supervisor,  # type: ignore[arg-type]
+            session_factory=session_factory,
+            policy=StubLLMProvider([]),
+            engine=_FakeEngine(),  # type: ignore[arg-type]
+            trace=NoopTraceStore(),
+        )
+        try:
+            deprecation_warns = [
+                (msg, extra)
+                for msg, extra in warn_calls
+                if extra.get("code") == "intake-code-source-missing-deprecated"
+            ]
+            assert len(deprecation_warns) == 1, (
+                f"expected exactly one deprecation WARN; got {warn_calls!r}"
+            )
+            msg, extra = deprecation_warns[0]
+            assert "codeSource" in msg
+            assert extra.get("agent_ref") == "sample-linear"
+            assert summary.id is not None
+        finally:
+            await _cleanup_run(session_factory, summary.id)
+
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_strict_mode_rejects_missing_code_source(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        test_settings: Settings,
+    ) -> None:
+        settings = test_settings.model_copy(
+            update={"lifecycle_code_source_required": True}
+        )
+        supervisor = _FakeSupervisor()
+        request = CreateRunRequest(
+            agent_ref="sample-linear", intake={"brief": "hello"}
+        )
+
+        with pytest.raises(ValidationError) as exc_info:
+            await start_run(
+                request,
+                settings=settings,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                session_factory=session_factory,
+                policy=StubLLMProvider([]),
+                engine=_FakeEngine(),  # type: ignore[arg-type]
+                trace=NoopTraceStore(),
+            )
+        assert "codeSource" in str(exc_info.value)
+        assert supervisor.spawned == []
+
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_valid_code_source_round_trips_to_run_intake(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        test_settings: Settings,
+    ) -> None:
+        settings = test_settings.model_copy(
+            update={"lifecycle_code_source_required": True}
+        )
+        supervisor = _FakeSupervisor()
+        request = CreateRunRequest(
+            agent_ref="sample-linear",
+            intake={
+                "brief": "hello",
+                "codeSource": {
+                    "repo": "carestechs/orchestrator",
+                    "baseBranch": "main",
+                    "workBranch": "feat/imp-005",
+                },
+            },
+        )
+
+        summary = await start_run(
+            request,
+            settings=settings,
+            supervisor=supervisor,  # type: ignore[arg-type]
+            session_factory=session_factory,
+            policy=StubLLMProvider([]),
+            engine=_FakeEngine(),  # type: ignore[arg-type]
+            trace=NoopTraceStore(),
+        )
+        try:
+            async with session_factory() as session:
+                run = await session.scalar(select(Run).where(Run.id == summary.id))
+            assert run is not None
+            assert run.intake["codeSource"] == {
+                "repo": "carestechs/orchestrator",
+                "baseBranch": "main",
+                "workBranch": "feat/imp-005",
+            }
+        finally:
+            await _cleanup_run(session_factory, summary.id)
+
+    @pytest.mark.asyncio(loop_scope="function")
+    @pytest.mark.parametrize(
+        "lifecycle_code_source_required", [True, False]
+    )
+    async def test_malformed_repo_rejected_regardless_of_setting(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        test_settings: Settings,
+        lifecycle_code_source_required: bool,
+    ) -> None:
+        """Shape validation always fires; the flag only governs presence."""
+        settings = test_settings.model_copy(
+            update={"lifecycle_code_source_required": lifecycle_code_source_required}
+        )
+        supervisor = _FakeSupervisor()
+        request = CreateRunRequest(
+            agent_ref="sample-linear",
+            intake={
+                "brief": "hello",
+                "codeSource": {
+                    "repo": "https://github.com/org/name",
+                    "baseBranch": "main",
+                },
+            },
+        )
+
+        with pytest.raises(ValidationError) as exc_info:
+            await start_run(
+                request,
+                settings=settings,
+                supervisor=supervisor,  # type: ignore[arg-type]
+                session_factory=session_factory,
+                policy=StubLLMProvider([]),
+                engine=_FakeEngine(),  # type: ignore[arg-type]
+                trace=NoopTraceStore(),
+            )
+        assert "codeSource" in str(exc_info.value)
+        assert supervisor.spawned == []

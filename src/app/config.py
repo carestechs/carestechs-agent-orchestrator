@@ -90,6 +90,15 @@ class Settings(BaseSettings):
     # -- Lifecycle agent (FEAT-005) ---------------------------------------
     lifecycle_max_corrections: int = Field(default=2, ge=1)
 
+    # -- Run-intake code source (IMP-005) ---------------------------------
+    # When True, ``POST /api/v1/runs`` rejects intakes missing the
+    # ``codeSource`` block (RFC-7807 ``intake-validation-failed``).
+    # When False (deprecation window default), missing ``codeSource`` logs
+    # a one-shot WARNING and accepts the run.  Flip to True once all
+    # callers supply ``codeSource``; the agent YAML's ``required:`` array
+    # follows in lockstep.
+    lifecycle_code_source_required: bool = False
+
     # -- Lifecycle reviewer binding (IMP-003) -----------------------------
     # Selects which executor binding registers for ``review_implementation``.
     #   * ``llm-content`` (default) — production binding; in-process LLM

@@ -100,6 +100,11 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
       "content": "string — markdown body; required on first sight, optional on every sight after (FEAT-014)"
     },
     "workItemPath": "string — DEPRECATED (FEAT-014); legacy intake path on the orchestrator's filesystem. Emits a WARNING log entry with code 'intake-work-item-path-deprecated'. Removed in the next minor.",
+    "codeSource": {
+      "repo": "string — GitHub 'owner/name' shape; no URL prefix, no '.git' suffix; matches ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$",
+      "baseBranch": "string — non-empty; no leading '/', no '..', no whitespace/control chars",
+      "workBranch": "string — optional; same shape rules as baseBranch. When omitted on intake, a future producer executor may write the branch name into a top-level codeSource memory sidecar; operator-supplied workBranch always wins."
+    },
     "…": "other agent-specific intake fields (validated by the loaded agent definition)"
   },
   "budget": {
@@ -135,6 +140,8 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
 | 429 | Rate-limited (concurrent run cap) |
 
 **FEAT-014 work-item upload contract:** the body of `intake.workItem.content` is sha256-hashed (no normalization) and stored in `work_items.body_md` + `work_items.body_sha256`. Re-uploads with matching sha256 are idempotent (no UPDATE, run starts against the existing row). Re-uploads with a different sha256 return 409 with `meta.storedSha256` and `meta.uploadedSha256` so the client can diff. Briefs are immutable by design — to replace a brief, register a new `external_ref` (e.g., `FEAT-100-v2`).
+
+**IMP-005 code-source contract:** `intake.codeSource` anchors the run to a concrete GitHub repo + branch. Shape errors always reject (400, `intake-validation-failed`). Presence enforcement is governed by `LIFECYCLE_CODE_SOURCE_REQUIRED` — when `true`, missing `codeSource` returns 400; when `false` (deprecation-window default), missing logs a WARNING with code `intake-code-source-missing-deprecated` and accepts. Persists verbatim to `Run.intake.codeSource` (existing JSONB column — no migration). Executors read via `from app.modules.ai.executors.code_source import read_code_source`; direct access to `ctx.intake["codeSource"]` bypasses the memory-sidecar precedence and is a review blocker. Read order is fixed: memory sidecar's `workBranch` → intake's `workBranch` → None. The orchestrator never `git fetch`es at intake time — validation is shape-only.
 
 ---
 
@@ -338,6 +345,18 @@ Source of truth: `src/app/modules/ai/executors/lifecycle_manual_patches.py` (Pyd
       { "id": "T-002", "title": "Write the route" }
     ]
   } }
+```
+
+**`assignment-confirmed`** — resume from `confirm_assignment` after the operator picks the assignee for the current task, before `assign_task` fires T5 (`assigning → planning`). `taskId` is optional; when omitted, falls back to `LifecycleMemory.current_task_id`. On multi-task work items, `mark_task_done`'s loop-back routes through `confirm_assignment` again, so the operator confirms an assignee per task. The chosen assignee is persisted to the top-level `assignments[taskId]` sidecar in `RunMemory.data` (variant-specific — not present in v0.3.0 memory). Idempotency key: `(run_id, "assignment-confirmed", task_id)`; duplicate signals return 202 with `meta.alreadyReceived=true`.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.assignee` | yes | string | Non-empty operator-chosen assignee identifier. |
+| `payload.taskId` | no | string | Overrides `LifecycleMemory.current_task_id`. |
+
+```json
+{ "name": "assignment-confirmed", "taskId": "T-001",
+  "payload": { "assignee": "alice" } }
 ```
 
 **`plan-confirmed`** — resume from `confirm_plan` after the operator reviews the LLM-generated implementation plan. `taskId` is required and must match `LifecycleMemory.current_task_id`.
@@ -1027,6 +1046,8 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-05-17 — IMP-005 (run-intake code source) — `POST /api/v1/runs` accepts a new `intake.codeSource` block: `{repo, baseBranch, workBranch?}`. `repo` matches GitHub `owner/name` (no URL prefix, no `.git`); branch names reject whitespace, control chars, leading `/`, and `..`. New `Settings.lifecycle_code_source_required` (env `LIFECYCLE_CODE_SOURCE_REQUIRED`, default `false`) gates presence enforcement: `false` logs a WARN (`intake-code-source-missing-deprecated`) and accepts; `true` returns 400 (`intake-validation-failed`). Shape errors always reject regardless of the flag. Persists verbatim to `Run.intake.codeSource` (no DB migration — existing JSONB column). Executors read via `read_code_source(ctx, memory=...)`; precedence is memory sidecar → intake → raise. Future producer executors write `workBranch` to `RunMemory.data["codeSource"]` only when intake omitted it (operator-supplied always wins). No new endpoints, no DTO changes outside the intake body, no auth surface change.
+- 2026-05-17 — IMP-004 (human assignment checkpoint, manual variant) — `POST /api/v1/runs/{id}/signals` accepts a new `name` value `assignment-confirmed` when the run uses `agentRef=lifecycle-agent@0.4.0-manual`. Pauses before `assign_task` (T5); payload requires non-empty `assignee` and accepts optional `taskId` (defaults to `current_task_id`). Persists to top-level `assignments[taskId]` sidecar in `RunMemory.data` (variant-only — v0.3.0 memory is unchanged). On multi-task work items the operator confirms an assignee per task — `mark_task_done`'s `tasks_remaining=true` loop-back now routes through `confirm_assignment` (was `assign_task` directly). Idempotency, ordering, and 202-Accepted semantics are unchanged from FEAT-015.
 - 2026-05-13 — FEAT-015 (manual lifecycle variant) — `POST /api/v1/runs/{id}/signals` accepts four new `name` values when the run uses `agentRef=lifecycle-agent@0.4.0-manual`: `brief-confirmed`, `tasks-confirmed`, `plan-confirmed`, `review-completed`. Each maps to a `HumanExecutor` checkpoint in the manual flow and carries an optional payload that the orchestrator translates into a `RunMemory` patch via `lifecycle_manual_patches.py`. Endpoint shape, auth, idempotency, and ordering invariants are unchanged from FEAT-005. Empty payloads mean "approve without edits"; `tasks=[]` (explicit empty list) returns 422. Memory-mutation errors (e.g., signal delivered before memory is ready) fail the matched dispatch; the run terminates with `stop_reason=error` while the signal endpoint itself still returns 202.
 - 2026-05-12 — FEAT-014 (work-item upload) — `POST /api/v1/runs` now accepts `intake.workItem = {id, kind, content?}`.  Content is sha256-hashed and stored on `work_items.body_md` / `body_sha256`; matching re-uploads are idempotent and mismatched bodies return 409.  New endpoint `POST /api/v1/work-items/upload` registers a brief without starting a run (201 insert / 200 reuse / 409 conflict).  Server-side cap `INTAKE_WORK_ITEM_MAX_BYTES` (default 1 MB) returns 413 before any DB I/O.  New Problem Details codes: `work-item-not-registered`, `work-item-content-conflict` (carries `meta.storedSha256` + `meta.uploadedSha256`), `work-item-kind-conflict` (carries `meta.storedKind` + `meta.uploadedKind`), `payload-too-large`.  Legacy `intake.workItemPath` continues to work for one minor; emits a `WARNING` log with code `intake-work-item-path-deprecated`.  `GET /api/v1/work-items` listing endpoint is explicitly out of scope.
 - 2026-04-30 — FEAT-011 (deterministic lifecycle port — `lifecycle-agent@0.3.0`) — No new HTTP endpoints, no DTO changes, no auth surface change. The control-plane accepts `agent_ref=lifecycle-agent@0.3.0` on `POST /api/v1/runs` (and via the CLI `orchestrator run lifecycle-agent@0.3.0 ...`). Run intake, signal payloads, and webhook signatures are unchanged from v0.1.0. The trace stream's `executor_call` entries gain familiar values for `mode` (`local` / `engine` / `human`) — v0.3.0's composite executors emit `mode=engine` because the engine leg drives the wake. Operationally externally indistinguishable from v0.1.0; the pivot is internal (deterministic policy, executor seam). See `docs/migration/lifecycle-v01-to-v03.md`.
