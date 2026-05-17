@@ -9,6 +9,7 @@ preconditions aren't met).
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.modules.ai.executors.lifecycle_manual_patches import (
+    AssignmentConfirmedPayload,
+    apply_assignment_confirmation,
     apply_brief_correction,
     apply_plan_correction,
     apply_review_verdict,
@@ -218,6 +221,88 @@ class TestApplyPlanCorrection:
         no_task = _memory_with_work_item()
         with pytest.raises(ValueError, match="no current_task_id"):
             apply_plan_correction({"plan": "X"}, no_task)
+
+
+# ---------------------------------------------------------------------------
+# AssignmentConfirmedPayload + apply_assignment_confirmation (IMP-004 / T-305)
+# ---------------------------------------------------------------------------
+
+
+class TestAssignmentConfirmedPayload:
+    def test_minimal_payload_validates(self) -> None:
+        payload = AssignmentConfirmedPayload(assignee="alice")
+        assert payload.assignee == "alice"
+        assert payload.task_id is None
+
+    def test_camel_case_alias_roundtrip(self) -> None:
+        payload = AssignmentConfirmedPayload.model_validate(
+            {"assignee": "alice", "taskId": "T-1"}
+        )
+        assert payload.task_id == "T-1"
+
+    def test_empty_assignee_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AssignmentConfirmedPayload(assignee="")
+
+    def test_whitespace_assignee_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AssignmentConfirmedPayload(assignee="   ")
+
+    def test_extra_field_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            AssignmentConfirmedPayload.model_validate(
+                {"assignee": "alice", "bogusField": "x"}
+            )
+
+
+class TestApplyAssignmentConfirmation:
+    def test_explicit_task_id_wins(self) -> None:
+        mem = _memory(current_task_id="T-2")
+        patch = apply_assignment_confirmation(
+            {"assignee": "alice", "taskId": "T-1"}, mem
+        )
+        assert patch == {"assignments": {"T-1": "alice"}}
+
+    def test_fallback_to_current_task_id(self) -> None:
+        mem = _memory(current_task_id="T-2")
+        patch = apply_assignment_confirmation({"assignee": "alice"}, mem)
+        assert patch == {"assignments": {"T-2": "alice"}}
+
+    def test_no_resolvable_task_id_raises(self) -> None:
+        mem = _memory()  # current_task_id=None
+        with pytest.raises(ValueError, match="no resolvable task id"):
+            apply_assignment_confirmation({"assignee": "alice"}, mem)
+
+    def test_writes_top_level_sidecar_not_under_lifecycle_ns(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        patch = apply_assignment_confirmation({"assignee": "alice"}, mem)
+        assert "assignments" in patch
+        assert LIFECYCLE_MEMORY_NS not in patch
+
+    def test_merge_preserves_prior_assignees(self) -> None:
+        """Per-task loop-back must not stomp prior assignees."""
+        mem = _memory(current_task_id="T-2")
+        mem["assignments"] = {"T-1": "alice"}
+        patch = apply_assignment_confirmation({"assignee": "bob"}, mem)
+        assert patch["assignments"] == {"T-1": "alice", "T-2": "bob"}
+
+    def test_builder_does_not_mutate_memory(self) -> None:
+        mem = _memory(current_task_id="T-2")
+        mem["assignments"] = {"T-1": "alice"}
+        snapshot = copy.deepcopy(mem)
+        apply_assignment_confirmation({"assignee": "bob"}, mem)
+        assert mem == snapshot
+
+    def test_existing_assignments_not_mapping_raises(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        mem["assignments"] = "not-a-dict"
+        with pytest.raises(ValueError, match="not a mapping"):
+            apply_assignment_confirmation({"assignee": "alice"}, mem)
+
+    def test_empty_assignee_rejected_via_builder(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        with pytest.raises(ValidationError):
+            apply_assignment_confirmation({"assignee": ""}, mem)
 
 
 # ---------------------------------------------------------------------------

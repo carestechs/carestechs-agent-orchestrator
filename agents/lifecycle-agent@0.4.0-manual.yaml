@@ -1,22 +1,24 @@
 # lifecycle-agent@0.4.0-manual — FEAT-015
 #
 # Manual variant of the lifecycle. Same eight-stage skeleton as v0.3.0
-# with four human checkpoints inserted at the LLM→engine seams (brief,
-# tasks, plan) and a human reviewer replacing the LLM `review_implementation`
-# node. Operator drives every commit to engine state; LLM still
-# synthesises artefacts but cannot advance the flow without explicit
-# operator approval via the `/api/v1/runs/{id}/signals` endpoint.
+# with five human checkpoints inserted at the LLM→engine seams (brief,
+# tasks, assignment, plan) and a human reviewer replacing the LLM
+# `review_implementation` node. Operator drives every commit to engine
+# state; LLM still synthesises artefacts but cannot advance the flow
+# without explicit operator approval via the `/api/v1/runs/{id}/signals`
+# endpoint.
 #
 # Signal contracts (documented in docs/api-spec.md):
-#   - `brief-confirmed`       — payload optional (workItem corrections)
-#   - `tasks-confirmed`       — payload optional (replacement task list)
-#   - `plan-confirmed`        — payload optional (replacement plan markdown)
-#   - `review-completed`      — payload required (verdict + optional feedback)
+#   - `brief-confirmed`        — payload optional (workItem corrections)
+#   - `tasks-confirmed`        — payload optional (replacement task list)
+#   - `assignment-confirmed`   — payload required (assignee for current task)
+#   - `plan-confirmed`         — payload optional (replacement plan markdown)
+#   - `review-completed`       — payload required (verdict + optional feedback)
 #
 # Bootstrap wiring: `register_lifecycle_v04_manual` in
 # `src/app/modules/ai/executors/bootstrap.py`. Reuses every v0.3.0
 # binding (engine create, propose-tasks fanout, sequence-close, etc.)
-# under this agent_ref + adds four HumanExecutor bindings plus a human
+# under this agent_ref + adds five HumanExecutor bindings plus a human
 # reviewer in place of the LLM `review_implementation`.
 #
 # Memory shape, engine workflows, intake schema, terminalNodes, and
@@ -26,10 +28,11 @@ ref: lifecycle-agent@0.4.0-manual
 version: "0.4.0-manual"
 description: >
   Manual variant of the lifecycle. Same eight-stage skeleton as v0.3.0,
-  with four human checkpoints inserted at the LLM→engine seams (brief,
-  tasks, plan) and a human reviewer replacing the LLM review step.
-  Operator drives every commit to engine state; LLM still synthesises
-  artefacts but cannot advance the flow without explicit approval.
+  with five human checkpoints inserted at the LLM→engine seams (brief,
+  tasks, assignment, plan) and a human reviewer replacing the LLM review
+  step. Operator drives every commit to engine state; LLM still
+  synthesises artefacts but cannot advance the flow without explicit
+  approval.
 
 nodes:
   - name: start
@@ -102,6 +105,22 @@ nodes:
       item.  Local-mode synchronous executor (BUG-004).
     inputSchema:
       type: object
+
+  - name: confirm_assignment
+    description: >
+      Pause for `assignment-confirmed` before firing T5 (assigning → planning)
+      on the current task. The operator reads the task list from
+      `LifecycleMemory.tasks` and supplies `signal.payload.assignee` (required,
+      non-empty) plus optional `signal.payload.taskId` (defaults to
+      `current_task_id`). The assignee is persisted to the top-level
+      `assignments[taskId]` sidecar (variant-specific — not present in v0.3.0
+      memory). T5 itself is unchanged; this checkpoint gates it. On a
+      multi-task work item, `mark_task_done`'s loop-back routes through this
+      node again, so the operator confirms an assignee per task.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
 
   - name: assign_task
     description: >
@@ -250,7 +269,8 @@ flow:
     register_work_item: [generate_tasks]
     generate_tasks: [confirm_tasks]
     confirm_tasks: [propose_tasks]
-    propose_tasks: [assign_task]
+    propose_tasks: [confirm_assignment]
+    confirm_assignment: [assign_task]
     assign_task: [generate_plan]
     generate_plan: [confirm_plan]
     confirm_plan: [approve_plan]
@@ -266,7 +286,7 @@ flow:
     mark_task_done:
       branch:
         rule: tasks_remaining
-        "true": assign_task
+        "true": confirm_assignment
         "false": close_work_item
     correct_implementation:
       branch:
@@ -292,6 +312,19 @@ intakeSchema:
         content: {type: string}
       required: [id, kind]
     workItemPath: {type: string}
+    # IMP-005: ``codeSource`` anchors the run to a concrete GitHub repo +
+    # branch.  Defined but NOT in ``required:`` during the deprecation
+    # window (``LIFECYCLE_CODE_SOURCE_REQUIRED=false``).  When the
+    # orchestrator flag flips to True, append ``codeSource`` to the
+    # ``required:`` array in lockstep.
+    codeSource:
+      type: object
+      required: [repo, baseBranch]
+      additionalProperties: false
+      properties:
+        repo:        {type: string, pattern: "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"}
+        baseBranch:  {type: string, minLength: 1}
+        workBranch:  {type: string, minLength: 1}
   anyOf:
     - required: [workItem]
     - required: [workItemPath]

@@ -1132,16 +1132,18 @@ def register_lifecycle_v04_manual(
 
     Reuses every v0.3.0 binding under *agent_ref* by delegating to
     :func:`register_lifecycle_v03` with ``skip_review_implementation=True``,
-    then registers the four new ``HumanExecutor`` checkpoint bindings
-    plus the human reviewer in place of the LLM ``review_implementation``.
+    then registers the four pre-engine-commit ``HumanExecutor`` checkpoint
+    bindings (brief, tasks, assignment, plan) plus the human reviewer in
+    place of the LLM ``review_implementation``.
 
-    The four new checkpoints carry their payload-to-memory builders
+    The five new checkpoints carry their payload-to-memory builders
     from :mod:`app.modules.ai.executors.lifecycle_manual_patches`; the
     runtime applies the patches via ``HumanExecutor.memory_patch_builder``
     (T-296) at signal-delivery time.
     """
     from app.modules.ai.executors.human import HumanExecutor
     from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_assignment_confirmation,
         apply_brief_correction,
         apply_plan_correction,
         apply_review_verdict,
@@ -1161,7 +1163,7 @@ def register_lifecycle_v04_manual(
         skip_review_implementation=True,
     )
 
-    # 2. Four new human checkpoints.
+    # 2. Five human checkpoints (gates at brief / tasks / assignment / plan).
     registry.register(
         agent_ref,
         "confirm_brief",
@@ -1178,6 +1180,15 @@ def register_lifecycle_v04_manual(
             ref="human:confirm_tasks",
             expected_signal_name="tasks-confirmed",
             memory_patch_builder=apply_tasks_correction,
+        ),
+    )
+    registry.register(
+        agent_ref,
+        "confirm_assignment",
+        HumanExecutor(
+            ref="human:confirm_assignment",
+            expected_signal_name="assignment-confirmed",
+            memory_patch_builder=apply_assignment_confirmation,
         ),
     )
     registry.register(
@@ -1202,7 +1213,7 @@ def register_lifecycle_v04_manual(
     )
 
     logger.info(
-        "register_lifecycle_v04_manual: agent_ref=%s registered (4 human "
+        "register_lifecycle_v04_manual: agent_ref=%s registered (5 human "
         "checkpoints + human reviewer + v0.3.0 shared bindings)",
         agent_ref,
     )

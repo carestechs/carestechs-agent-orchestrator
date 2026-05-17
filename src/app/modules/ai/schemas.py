@@ -242,6 +242,67 @@ class BudgetConfig(BaseModel):
 
 
 _WORK_ITEM_ID_RE = re.compile(r"^[A-Z]+-\d+(-[a-z0-9-]+)?$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+class CodeSourceDto(BaseModel):
+    """IMP-005: typed sub-object inside ``CreateRunRequest.intake.codeSource``.
+
+    Anchors every run to a concrete GitHub repo + branch.  Validated at
+    the service layer (presence is governed by
+    ``LIFECYCLE_CODE_SOURCE_REQUIRED``); shape errors always raise 400.
+
+    - ``repo``: ``owner/name`` only (no URL prefix, no ``.git`` suffix).
+    - ``base_branch``: required; rejects whitespace, control chars,
+      leading ``/``, and ``..``.
+    - ``work_branch``: optional input.  When omitted on intake, a future
+      producer executor may write it into a top-level ``codeSource``
+      memory sidecar — the precedence in
+      :func:`app.modules.ai.executors.code_source.read_code_source`
+      is fixed at memory sidecar → intake → None.
+    """
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        alias_generator=to_camel,
+        extra="forbid",
+    )
+
+    repo: str
+    base_branch: str
+    work_branch: str | None = None
+
+    @field_validator("repo")
+    @classmethod
+    def _validate_repo(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("repo must be non-empty")
+        if stripped.endswith(".git"):
+            raise ValueError("repo must not include '.git' suffix")
+        if not _REPO_RE.fullmatch(stripped):
+            raise ValueError(
+                "repo must match GitHub 'owner/name' shape — no URL prefix, "
+                f"no '.git' suffix (got: {value!r})"
+            )
+        return stripped
+
+    @field_validator("base_branch", "work_branch")
+    @classmethod
+    def _validate_branch(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value or not value.strip():
+            raise ValueError("branch name must be non-empty")
+        if value.startswith("/"):
+            raise ValueError("branch name must not start with '/'")
+        if ".." in value:
+            raise ValueError("branch name must not contain '..'")
+        if any(ch.isspace() for ch in value):
+            raise ValueError("branch name must not contain whitespace")
+        if any(ord(ch) < 0x20 for ch in value):
+            raise ValueError("branch name must not contain control characters")
+        return value
 
 
 class RunIntakeWorkItem(BaseModel):

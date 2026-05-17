@@ -249,6 +249,19 @@ intakeSchema:
         content: {type: string}
       required: [id, kind]
     workItemPath: {type: string}
+    # IMP-005: ``codeSource`` anchors the run to a concrete GitHub repo +
+    # branch.  Defined but NOT in ``required:`` during the deprecation
+    # window (``LIFECYCLE_CODE_SOURCE_REQUIRED=false``).  When the
+    # orchestrator flag flips to True, append ``codeSource`` to the
+    # ``required:`` array in lockstep.
+    codeSource:
+      type: object
+      required: [repo, baseBranch]
+      additionalProperties: false
+      properties:
+        repo:        {type: string, pattern: "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"}
+        baseBranch:  {type: string, minLength: 1}
+        workBranch:  {type: string, minLength: 1}
   anyOf:
     - required: [workItem]
     - required: [workItemPath]
