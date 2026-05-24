@@ -289,7 +289,12 @@ async def _execute_node(
     async with session_factory() as session:
         dispatch_row = await session.get(Dispatch, dispatch_id)
         assert dispatch_row is not None
-        dispatch_row.mark_dispatched(at=datetime.now(UTC))
+        now = datetime.now(UTC)
+        dispatch_row.mark_dispatched(at=now)
+        step_row = await session.get(Step, step_id)
+        if step_row is not None:
+            step_row.status = StepStatus.DISPATCHED
+            step_row.dispatched_at = now
         await session.commit()
 
     try:

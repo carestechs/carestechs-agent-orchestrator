@@ -47,7 +47,7 @@ from app.core.llm import ToolCall, ToolDefinition, Usage
 from app.core.webhook_auth import sign_body
 from app.main import create_app
 from app.modules.ai.agents import load_agent
-from app.modules.ai.enums import RunStatus
+from app.modules.ai.enums import RunStatus, StepStatus
 from app.modules.ai.executors.binding import _reset_exemptions_for_tests
 from app.modules.ai.executors.bootstrap import register_lifecycle_v04_manual
 from app.modules.ai.executors.registry import ExecutorRegistry
@@ -424,6 +424,17 @@ async def _drive_manual_lifecycle(
                     for human_row in humans:
                         if human_row.dispatch_id in signaled_dispatches:
                             continue
+                        # BUG-015: while a human dispatch is in-flight the
+                        # Step must be ``dispatched``, not ``pending``.
+                        async with session_factory() as session:
+                            inflight_step = await session.get(Step, human_row.step_id)
+                            assert inflight_step is not None
+                            assert inflight_step.status == StepStatus.DISPATCHED, (
+                                f"BUG-015: step {human_row.step_id} for "
+                                f"{human_row.executor_ref} should be "
+                                f"dispatched, got {inflight_step.status}"
+                            )
+                            assert inflight_step.dispatched_at is not None
                         ref = human_row.executor_ref
                         signal_entry = _SIGNAL_FOR_REF.get(ref)
                         if signal_entry is None:
