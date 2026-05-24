@@ -107,6 +107,32 @@ class TestLifespanZombieReconciliation:
             await _cleanup(session_factory, zombie_id)
 
     @pytest.mark.asyncio(loop_scope="function")
+    async def test_paused_row_transitions_to_failed_on_startup(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """BUG-014: a run parked on a human-executor checkpoint (``paused``)
+        is just as orphaned as a ``running`` row after a process restart."""
+        from app.main import create_app
+
+        zombie_id = await _seed_run(session_factory, status=RunStatus.PAUSED)
+
+        try:
+            application = create_app()
+            async with application.router.lifespan_context(application):
+                pass
+
+            run = await _fetch(session_factory, zombie_id)
+            assert run is not None
+            assert run.status == RunStatus.FAILED
+            assert run.stop_reason == StopReason.ERROR
+            assert run.ended_at is not None
+            assert run.final_state is not None
+            assert run.final_state.get("zombie_reason") == "process restart"
+        finally:
+            await _cleanup(session_factory, zombie_id)
+
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_non_running_rows_are_untouched(
         self,
         session_factory: async_sessionmaker[AsyncSession],

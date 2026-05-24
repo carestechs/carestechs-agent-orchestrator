@@ -1,8 +1,9 @@
-"""App lifespan: supervisor lifecycle + zombie-run reconciliation (T-045).
+"""App lifespan: supervisor lifecycle + zombie-run reconciliation (T-045, BUG-014).
 
-On startup we flip any ``running`` rows left over from a prior process
-into ``failed/error`` so the on-disk state stops lying.  On shutdown we
-drain the in-process :class:`RunSupervisor` within a grace window.
+On startup we flip any ``running`` or ``paused`` rows left over from a
+prior process into ``failed/error`` so the on-disk state stops lying.
+On shutdown we drain the in-process :class:`RunSupervisor` within a
+grace window.
 """
 
 from __future__ import annotations
@@ -32,15 +33,17 @@ logger = logging.getLogger(__name__)
 async def reconcile_zombie_runs(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> int:
-    """Flip every ``running`` row to ``failed/error`` with a zombie marker.
+    """Flip every ``running`` or ``paused`` row to ``failed/error`` with a zombie marker.
 
     Returns the number of rows updated.  Called once from the lifespan
-    startup hook — a restarted process means any row left in ``running`` is
-    orphaned by definition (the supervisor lives in-process).
+    startup hook — a restarted process means any row left in ``running``
+    or ``paused`` (BUG-014: human-executor checkpoint) is orphaned by
+    definition (the supervisor lives in-process).
     """
     now = datetime.now(UTC)
+    orphan_statuses = [RunStatus.RUNNING, RunStatus.PAUSED]
     async with session_factory() as session:
-        zombies = await session.scalars(select(Run).where(Run.status == RunStatus.RUNNING))
+        zombies = await session.scalars(select(Run).where(Run.status.in_(orphan_statuses)))
         count = 0
         for run in zombies:
             existing = dict(run.final_state or {})
@@ -53,7 +56,7 @@ async def reconcile_zombie_runs(
 
         await session.execute(
             update(Run)
-            .where(Run.status == RunStatus.RUNNING)
+            .where(Run.status.in_(orphan_statuses))
             .values(
                 status=RunStatus.FAILED,
                 stop_reason=StopReason.ERROR,
