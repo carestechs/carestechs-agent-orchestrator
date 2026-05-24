@@ -813,12 +813,17 @@ def register_lifecycle_v03(
     # Human: request_implementation — pause for operator signal.
     # ------------------------------------------------------------------
 
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        intake_for_request_implementation,
+    )
+
     registry.register(
         agent_ref,
         "request_implementation",
         HumanExecutor(
             ref="human:request_implementation",
             expected_signal_name="implementation-complete",
+            intake_builder=intake_for_request_implementation,
         ),
     )
 
@@ -1148,6 +1153,11 @@ def register_lifecycle_v04_manual(
         apply_plan_correction,
         apply_review_verdict,
         apply_tasks_correction,
+        intake_for_confirm_assignment,
+        intake_for_confirm_brief,
+        intake_for_confirm_plan,
+        intake_for_confirm_tasks,
+        intake_for_human_review,
     )
 
     # 1. Reuse v0.3.0 bindings under the new ref, skipping the LLM reviewer.
@@ -1171,6 +1181,7 @@ def register_lifecycle_v04_manual(
             ref="human:confirm_brief",
             expected_signal_name="brief-confirmed",
             memory_patch_builder=apply_brief_correction,
+            intake_builder=intake_for_confirm_brief,
         ),
     )
     registry.register(
@@ -1180,6 +1191,7 @@ def register_lifecycle_v04_manual(
             ref="human:confirm_tasks",
             expected_signal_name="tasks-confirmed",
             memory_patch_builder=apply_tasks_correction,
+            intake_builder=intake_for_confirm_tasks,
         ),
     )
     registry.register(
@@ -1189,6 +1201,7 @@ def register_lifecycle_v04_manual(
             ref="human:confirm_assignment",
             expected_signal_name="assignment-confirmed",
             memory_patch_builder=apply_assignment_confirmation,
+            intake_builder=intake_for_confirm_assignment,
         ),
     )
     registry.register(
@@ -1198,6 +1211,7 @@ def register_lifecycle_v04_manual(
             ref="human:confirm_plan",
             expected_signal_name="plan-confirmed",
             memory_patch_builder=apply_plan_correction,
+            intake_builder=intake_for_confirm_plan,
         ),
     )
 
@@ -1209,6 +1223,7 @@ def register_lifecycle_v04_manual(
             ref="human:review_implementation",
             expected_signal_name="review-completed",
             memory_patch_builder=apply_review_verdict,
+            intake_builder=intake_for_human_review,
         ),
     )
 

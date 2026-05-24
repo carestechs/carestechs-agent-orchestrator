@@ -19,12 +19,26 @@ waiting.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from app.modules.ai.executors.base import DispatchContext, ExecutorMode
 from app.modules.ai.executors.llm_content import MemoryPatchBuilder
 from app.modules.ai.schemas import DispatchEnvelope
+
+IntakeBuilder = Callable[[Mapping[str, Any]], dict[str, Any]]
+"""Callable that enriches a human-checkpoint step's intake from memory.
+
+Signature ``(current_memory) -> extra_intake``.  The returned dict is
+merged into the step's ``node_inputs`` before the ``Step`` row is
+persisted, so DevHub (or any trace consumer) can display the artefact
+the operator is gating without needing direct access to ``RunMemory``.
+
+Builders MUST be pure functions (no I/O, no session).  They run inside
+``_execute_node`` before the dispatch is created — not at
+signal-delivery time like ``memory_patch_builder``.
+"""
 
 
 class HumanExecutor:
@@ -40,6 +54,13 @@ class HumanExecutor:
     the standard ``__memory_patch`` hook on the dispatch envelope's
     ``result``.
 
+    Optional ``intake_builder`` enriches the step's ``node_inputs``
+    with artefact data from ``RunMemory`` so the operator (via DevHub
+    or trace) can see the content they are gating — e.g. the original
+    brief body at ``confirm_brief``, the task list at ``confirm_tasks``.
+    The builder runs in ``_execute_node`` before the ``Step`` row is
+    persisted.
+
     Keys starting with ``_`` are filtered by ``_write_state`` and must
     not appear in the builder's returned patch.
     """
@@ -52,18 +73,13 @@ class HumanExecutor:
         *,
         expected_signal_name: str,
         memory_patch_builder: MemoryPatchBuilder | None = None,
+        intake_builder: IntakeBuilder | None = None,
     ) -> None:
         self.name = ref
         self._ref = ref
-        # Documented for the bootstrap site — the runtime is what
-        # actually pairs (run_id, task_id, name) → Dispatch when the
-        # signal arrives.  Carried here as a string so an executor
-        # binding can be inspected at runtime.
         self.expected_signal_name = expected_signal_name
-        # Public — ``service._deliver_to_human_dispatch`` resolves the
-        # binding from the registry and reads this attribute to decide
-        # whether to call the builder + embed the patch.
         self.memory_patch_builder = memory_patch_builder
+        self.intake_builder = intake_builder
 
     async def dispatch(self, ctx: DispatchContext) -> DispatchEnvelope:
         started = datetime.now(UTC)

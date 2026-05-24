@@ -31,7 +31,7 @@ which terminates the run with ``stop_reason=error``.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
@@ -335,6 +335,89 @@ def apply_review_verdict(
     )
 
 
+# ---------------------------------------------------------------------------
+# Intake builders — enrich the step's ``node_inputs`` so DevHub (or any
+# trace consumer) can display the artefact the operator is gating.
+#
+# Signature: ``(current_memory) -> extra_intake``.  Pure functions — no
+# I/O, no session.  Called by the runtime in ``_execute_node`` before
+# the Step row is persisted.
+# ---------------------------------------------------------------------------
+
+
+def intake_for_confirm_brief(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    return {
+        "workItemBody": current_memory.get("work_item_body") or "",
+        "workItem": memory.work_item.model_dump(mode="json") if memory.work_item else None,
+    }
+
+
+def intake_for_confirm_tasks(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    return {
+        "tasks": [t.model_dump(mode="json") for t in memory.tasks],
+    }
+
+
+def intake_for_confirm_assignment(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    current_task = next(
+        (t for t in memory.tasks if t.id == memory.current_task_id), None
+    )
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "assignments": dict(current_memory.get("assignments") or {}),
+    }
+
+
+def _resolve_plan_markdown(current_memory: Mapping[str, Any], task_id: str) -> str:
+    plans_raw = current_memory.get("plans")
+    if not isinstance(plans_raw, dict):
+        return ""
+    entry_raw = cast("dict[str, Any]", plans_raw).get(task_id)
+    if not isinstance(entry_raw, dict):
+        return ""
+    return str(cast("dict[str, Any]", entry_raw).get("plan_markdown") or "")
+
+
+def intake_for_confirm_plan(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
+    }
+
+
+def intake_for_request_implementation(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
+    }
+
+
+def intake_for_human_review(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
+        "reviewHistory": [r.model_dump(mode="json") for r in memory.review_history if r.task_id == task_id],
+    }
+
+
 __all__ = [
     "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
@@ -346,4 +429,10 @@ __all__ = [
     "apply_plan_correction",
     "apply_review_verdict",
     "apply_tasks_correction",
+    "intake_for_confirm_assignment",
+    "intake_for_confirm_brief",
+    "intake_for_confirm_plan",
+    "intake_for_confirm_tasks",
+    "intake_for_human_review",
+    "intake_for_request_implementation",
 ]
