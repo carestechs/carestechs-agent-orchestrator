@@ -348,8 +348,7 @@ def apply_review_verdict(
 def intake_for_confirm_brief(current_memory: Mapping[str, Any]) -> dict[str, Any]:
     memory = read_lifecycle_memory(current_memory)
     return {
-        "workItemBody": current_memory.get("work_item_body") or "",
-        "workItem": memory.work_item.model_dump(mode="json") if memory.work_item else None,
+        "workItemSummary": memory.work_item.model_dump(mode="json") if memory.work_item else None,
     }
 
 
