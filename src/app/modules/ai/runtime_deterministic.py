@@ -246,6 +246,11 @@ async def _execute_node(
     if lifecycle_memory.current_task_id is not None:
         intake.setdefault("taskId", lifecycle_memory.current_task_id)
 
+    intake_builder = getattr(binding.executor, "intake_builder", None)
+    if intake_builder is not None:
+        extra = intake_builder(mem_data)
+        intake.update(extra)
+
     async with session_factory() as session:
         step = Step(
             id=step_id,
