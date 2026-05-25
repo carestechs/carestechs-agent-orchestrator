@@ -68,6 +68,8 @@ class _WorkItemCorrection(BaseModel):
 
 class BriefConfirmedPayload(BaseModel):
     model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
     work_item: _WorkItemCorrection | None = None
 
 
@@ -90,6 +92,8 @@ class _TaskInput(BaseModel):
 
 class TasksConfirmedPayload(BaseModel):
     model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
     tasks: list[_TaskInput] | None = None
 
     @field_validator("tasks")
@@ -117,6 +121,8 @@ class AssignmentConfirmedPayload(BaseModel):
 
 class PlanConfirmedPayload(BaseModel):
     model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
     plan: str | None = None
 
 
@@ -124,6 +130,44 @@ class ReviewCompletedPayload(BaseModel):
     model_config = _PayloadConfig
     verdict: Literal["pass", "fail"]
     feedback: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Rejection helper (IMP-006)
+# ---------------------------------------------------------------------------
+
+
+def _rejection_patch(
+    checkpoint: str,
+    feedback: str | None,
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a memory patch that persists rejection feedback.
+
+    Writes to the top-level ``rejections`` sidecar (same pattern as
+    ``assignments`` / ``plans``).  Each checkpoint key accumulates an
+    attempt counter so prompt context loaders can include the feedback
+    on retry.
+    """
+    existing_raw = current_memory.get("rejections")
+    existing: dict[str, Any] = (
+        {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+        if isinstance(existing_raw, dict)
+        else {}
+    )
+    merged: dict[str, Any] = dict(existing)
+    prior = merged.get(checkpoint)
+    prior_attempt: int = (
+        int(cast("dict[str, Any]", prior).get("attempt", 0))
+        if isinstance(prior, dict)
+        else 0
+    )
+    attempt = prior_attempt + 1
+    merged[checkpoint] = {
+        "feedback": feedback or "",
+        "attempt": attempt,
+    }
+    return {"rejections": merged}
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +184,15 @@ def apply_brief_correction(
     Empty payload → empty patch (operator approves unchanged).  Missing
     ``work_item`` in memory → ``ValueError`` (operator delivered too
     early; ``load_work_item`` hasn't populated memory yet).
+
+    IMP-006: ``verdict="reject"`` persists feedback to the ``rejections``
+    sidecar and skips corrections.  The flow resolver reads the verdict
+    from the dispatch result (surfaced by the signal delivery hook) and
+    loops back to ``load_work_item``.
     """
     parsed = BriefConfirmedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_brief", parsed.feedback, current_memory)
     if parsed.work_item is None or (
         parsed.work_item.title is None and parsed.work_item.type is None
     ):
@@ -179,6 +230,8 @@ def apply_tasks_correction(
     (rejected at the schema layer per FEAT-015 §9).
     """
     parsed = TasksConfirmedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_tasks", parsed.feedback, current_memory)
     if parsed.tasks is None:
         return {}
     memory = read_lifecycle_memory(current_memory)
@@ -237,6 +290,8 @@ def apply_plan_correction(
     empty patch.  Missing ``current_task_id`` → ``ValueError``.
     """
     parsed = PlanConfirmedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_plan", parsed.feedback, current_memory)
     if parsed.plan is None:
         return {}
     memory = read_lifecycle_memory(current_memory)

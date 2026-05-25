@@ -509,6 +509,37 @@ def register_lifecycle_v03(
         )
         return write_lifecycle_memory(memory)
 
+    async def _read_rejection_feedback(
+        run_id: uuid.UUID, checkpoint: str
+    ) -> str:
+        """Read rejection feedback for *checkpoint* from the ``rejections`` memory sidecar."""
+        from sqlalchemy import select as _select
+
+        from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+        async with session_factory() as session:
+            mem = await session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == run_id)
+            )
+        data: dict[str, Any] = (mem.data if mem is not None else {}) or {}
+        rejections_raw = data.get("rejections")
+        if not isinstance(rejections_raw, dict):
+            return ""
+        rejections = cast("dict[str, Any]", rejections_raw)
+        entry = rejections.get(checkpoint)
+        if not isinstance(entry, dict):
+            return ""
+        fb = str(cast("dict[str, Any]", entry).get("feedback") or "")
+        if not fb:
+            return ""
+        return (
+            "\n--- OPERATOR REJECTION FEEDBACK ---\n"
+            "The operator previously rejected this artefact. "
+            "Address their feedback:\n\n"
+            f"{fb}\n"
+            "--- END FEEDBACK ---\n"
+        )
+
     async def _load_work_item_brief_db(ctx: DispatchContext) -> Mapping[str, Any]:
         # FEAT-014 / T-287: read the brief body from ``WorkItem.body_md``
         # keyed on the run's ``intake.workItem.id`` (or legacy
@@ -555,6 +586,20 @@ def register_lifecycle_v03(
             bindings["workItemBrief"] = body_md
         return bindings
 
+    async def _load_work_item_brief_with_rejection(ctx: DispatchContext) -> Mapping[str, Any]:
+        bindings = dict(await _load_work_item_brief_db(ctx))
+        bindings["rejectionFeedback"] = await _read_rejection_feedback(
+            ctx.run_id, "confirm_brief"
+        )
+        return bindings
+
+    async def _load_work_item_brief_with_tasks_rejection(ctx: DispatchContext) -> Mapping[str, Any]:
+        bindings = dict(await _load_work_item_brief_db(ctx))
+        bindings["rejectionFeedback"] = await _read_rejection_feedback(
+            ctx.run_id, "confirm_tasks"
+        )
+        return bindings
+
     registry.register(
         agent_ref,
         "load_work_item",
@@ -567,11 +612,12 @@ def register_lifecycle_v03(
                 "----- BEGIN WORK ITEM BRIEF -----\n"
                 "{workItemBrief}\n"
                 "----- END WORK ITEM BRIEF -----\n"
+                "{rejectionFeedback}"
             ),
             result_schema=LoadWorkItemResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_load_work_item,
-            prompt_context_loader=_load_work_item_brief_db,
+            prompt_context_loader=_load_work_item_brief_with_rejection,
             session_factory=session_factory,
         ),
     )
@@ -636,11 +682,12 @@ def register_lifecycle_v03(
                 "----- BEGIN WORK ITEM BRIEF -----\n"
                 "{workItemBrief}\n"
                 "----- END WORK ITEM BRIEF -----\n"
+                "{rejectionFeedback}"
             ),
             result_schema=GenerateTasksResult,
             llm_provider=llm_provider,
             memory_patch_builder=_patch_generate_tasks,
-            prompt_context_loader=_load_work_item_brief_db,
+            prompt_context_loader=_load_work_item_brief_with_tasks_rejection,
             session_factory=session_factory,
         ),
     )
@@ -738,9 +785,8 @@ def register_lifecycle_v03(
             mem = await session.scalar(_select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id))
         memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
         task = find_current_task(memory)
+        rejection_fb = await _read_rejection_feedback(ctx.run_id, "confirm_plan")
         if task is None:
-            # Fall back to a placeholder so format_map still succeeds —
-            # the planner will produce a thin plan from taskId alone.
             return {
                 "taskTitle": "<task body not available in memory>",
                 "taskDescription": "",
@@ -748,6 +794,7 @@ def register_lifecycle_v03(
                 "complexity": "medium",
                 "dependsOn": "(none)",
                 "filesHint": "(none)",
+                "rejectionFeedback": rejection_fb,
             }
         criteria = "\n".join(f"- {c}" for c in task.acceptance_criteria) or "(none recorded)"
         deps = ", ".join(task.depends_on) or "(none)"
@@ -759,6 +806,7 @@ def register_lifecycle_v03(
             "complexity": task.complexity,
             "dependsOn": deps,
             "filesHint": files,
+            "rejectionFeedback": rejection_fb,
         }
 
     registry.register(
@@ -778,6 +826,7 @@ def register_lifecycle_v03(
                     "Description:\n{taskDescription}\n\n"
                     "Acceptance criteria:\n{acceptanceCriteria}\n\n"
                     "Files hint:\n{filesHint}\n"
+                    "{rejectionFeedback}"
                 ),
                 result_schema=GeneratePlanResult,
                 llm_provider=llm_provider,

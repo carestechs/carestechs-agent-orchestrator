@@ -212,6 +212,41 @@ class TestTasksRemainingPredicate:
 
 
 # ---------------------------------------------------------------------------
+# checkpoint_approved (IMP-006)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointApprovedPredicate:
+    def test_registered(self) -> None:
+        assert "checkpoint_approved" in flow_predicates.known()
+
+    def test_approve_returns_true(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        assert predicate({}, {"verdict": "approve"}) is True
+
+    def test_reject_returns_false(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        assert predicate({}, {"verdict": "reject"}) is False
+
+    def test_missing_verdict_defaults_to_true(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        assert predicate({}, {"some_other_key": "x"}) is True
+
+    def test_none_last_defaults_to_true(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        assert predicate({}, None) is True
+
+    def test_empty_result_defaults_to_true(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        assert predicate({}, {}) is True
+
+    def test_unexpected_verdict_raises(self) -> None:
+        predicate = flow_predicates.get("checkpoint_approved")
+        with pytest.raises(ValueError, match="must be 'approve' or 'reject'"):
+            predicate({}, {"verdict": "maybe"})
+
+
+# ---------------------------------------------------------------------------
 # Resolver integration — confirm both predicates are reachable through the
 # resolver's ``branch.rule`` lookup path. (Does not modify ``flow_resolver``;
 # this is an integration check that the registry extension is wired.)

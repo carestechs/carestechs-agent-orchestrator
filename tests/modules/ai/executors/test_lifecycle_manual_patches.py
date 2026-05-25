@@ -114,6 +114,29 @@ class TestApplyBriefCorrection:
         with pytest.raises(ValidationError):
             apply_brief_correction({"unknownField": "x"}, mem)
 
+    def test_reject_writes_rejections_sidecar(self) -> None:
+        mem = _memory_with_work_item()
+        patch = apply_brief_correction({"verdict": "reject", "feedback": "too vague"}, mem)
+        assert "rejections" in patch
+        assert patch["rejections"]["confirm_brief"]["feedback"] == "too vague"
+        assert patch["rejections"]["confirm_brief"]["attempt"] == 1
+        assert LIFECYCLE_MEMORY_NS not in patch
+
+    def test_reject_without_feedback(self) -> None:
+        mem = _memory_with_work_item()
+        patch = apply_brief_correction({"verdict": "reject"}, mem)
+        assert patch["rejections"]["confirm_brief"]["feedback"] == ""
+
+    def test_reject_increments_attempt(self) -> None:
+        mem = _memory_with_work_item()
+        mem["rejections"] = {"confirm_brief": {"feedback": "first", "attempt": 1}}
+        patch = apply_brief_correction({"verdict": "reject", "feedback": "second"}, mem)
+        assert patch["rejections"]["confirm_brief"]["attempt"] == 2
+
+    def test_approve_explicit_verdict(self) -> None:
+        mem = _memory_with_work_item()
+        assert apply_brief_correction({"verdict": "approve"}, mem) == {}
+
 
 # ---------------------------------------------------------------------------
 # apply_tasks_correction
@@ -190,6 +213,21 @@ class TestApplyTasksCorrection:
         with pytest.raises(ValidationError):
             apply_tasks_correction({"tasks": [{"id": "T-1"}]}, _memory())
 
+    def test_reject_writes_rejections_sidecar(self) -> None:
+        mem = _memory(tasks=[LifecycleTask(id="T-1", title="A")])
+        patch = apply_tasks_correction({"verdict": "reject", "feedback": "wrong tasks"}, mem)
+        assert "rejections" in patch
+        assert patch["rejections"]["confirm_tasks"]["feedback"] == "wrong tasks"
+        assert LIFECYCLE_MEMORY_NS not in patch
+
+    def test_reject_skips_task_replacement(self) -> None:
+        mem = _memory(tasks=[LifecycleTask(id="T-1", title="A")])
+        patch = apply_tasks_correction(
+            {"verdict": "reject", "feedback": "nope", "tasks": [{"id": "T-new", "title": "X"}]},
+            mem,
+        )
+        assert LIFECYCLE_MEMORY_NS not in patch
+
 
 # ---------------------------------------------------------------------------
 # apply_plan_correction
@@ -221,6 +259,13 @@ class TestApplyPlanCorrection:
         no_task = _memory_with_work_item()
         with pytest.raises(ValueError, match="no current_task_id"):
             apply_plan_correction({"plan": "X"}, no_task)
+
+    def test_reject_writes_rejections_sidecar(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        patch = apply_plan_correction({"verdict": "reject", "feedback": "too shallow"}, mem)
+        assert "rejections" in patch
+        assert patch["rejections"]["confirm_plan"]["feedback"] == "too shallow"
+        assert "plans" not in patch
 
 
 # ---------------------------------------------------------------------------
