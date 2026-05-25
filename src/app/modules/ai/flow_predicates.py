@@ -163,6 +163,30 @@ def _review_passed(  # pyright: ignore[reportUnusedFunction] -- accessed via reg
     raise ValueError(f"review_passed predicate: result.verdict must be 'pass' or 'fail'; got {verdict!r}")
 
 
+@register("checkpoint_approved")
+def _checkpoint_approved(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    _memory: Mapping[str, Any], last: Mapping[str, Any] | None
+) -> bool:
+    """True iff the operator approved; False on rejection.
+
+    Reads ``result.verdict`` from the human-executor dispatch result.
+    Defaults to ``True`` when ``verdict`` is absent — backward compat
+    with existing signals that carry no verdict field (IMP-006).
+    """
+    if last is None:
+        return True
+    verdict = last.get("verdict")
+    if verdict is None:
+        return True
+    if verdict == "approve":
+        return True
+    if verdict == "reject":
+        return False
+    raise ValueError(
+        f"checkpoint_approved predicate: verdict must be 'approve' or 'reject'; got {verdict!r}"
+    )
+
+
 @register("task_rejected")
 def _task_rejected(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     _memory: Mapping[str, Any], last: Mapping[str, Any] | None

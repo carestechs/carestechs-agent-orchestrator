@@ -265,15 +265,27 @@ flow:
   transitions:
     start: [load_work_item]
     load_work_item: [confirm_brief]
-    confirm_brief: [register_work_item]
+    confirm_brief:
+      branch:
+        rule: checkpoint_approved
+        "true": register_work_item
+        "false": load_work_item
     register_work_item: [generate_tasks]
     generate_tasks: [confirm_tasks]
-    confirm_tasks: [propose_tasks]
+    confirm_tasks:
+      branch:
+        rule: checkpoint_approved
+        "true": propose_tasks
+        "false": generate_tasks
     propose_tasks: [confirm_assignment]
     confirm_assignment: [assign_task]
     assign_task: [generate_plan]
     generate_plan: [confirm_plan]
-    confirm_plan: [approve_plan]
+    confirm_plan:
+      branch:
+        rule: checkpoint_approved
+        "true": approve_plan
+        "false": generate_plan
     approve_plan: [request_implementation]
     request_implementation: [submit_implementation]
     submit_implementation: [human_review_implementation]
