@@ -259,19 +259,39 @@ nodes:
         taskId: {type: string}
       required: [taskId]
 
+  - name: terminate_rejection_budget
+    description: >
+      Terminal failure node reached when an operator has rejected a
+      checkpoint artefact more than `LIFECYCLE_MAX_CHECKPOINT_REJECTIONS`
+      times (default 3). Reached via the `checkpoint_rejections_under_bound`
+      predicate on any producing node (load_work_item, generate_tasks,
+      generate_plan). The runtime maps the run to `RunStatus.FAILED`
+      via the _ExecutorFailure path (same as terminate_correction_budget).
+    inputSchema:
+      type: object
+      properties: {}
+
 flow:
   policy: deterministic
   entryNode: start
   transitions:
     start: [load_work_item]
-    load_work_item: [confirm_brief]
+    load_work_item:
+      branch:
+        rule: checkpoint_rejections_under_bound
+        "true": confirm_brief
+        "false": terminate_rejection_budget
     confirm_brief:
       branch:
         rule: checkpoint_approved
         "true": register_work_item
         "false": load_work_item
     register_work_item: [generate_tasks]
-    generate_tasks: [confirm_tasks]
+    generate_tasks:
+      branch:
+        rule: checkpoint_rejections_under_bound
+        "true": confirm_tasks
+        "false": terminate_rejection_budget
     confirm_tasks:
       branch:
         rule: checkpoint_approved
@@ -280,7 +300,11 @@ flow:
     propose_tasks: [confirm_assignment]
     confirm_assignment: [assign_task]
     assign_task: [generate_plan]
-    generate_plan: [confirm_plan]
+    generate_plan:
+      branch:
+        rule: checkpoint_rejections_under_bound
+        "true": confirm_plan
+        "false": terminate_rejection_budget
     confirm_plan:
       branch:
         rule: checkpoint_approved
@@ -307,6 +331,7 @@ flow:
         "false": terminate_correction_budget
     close_work_item: []
     terminate_correction_budget: []
+    terminate_rejection_budget: []
 
 intakeSchema:
   type: object
@@ -341,7 +366,7 @@ intakeSchema:
     - required: [workItem]
     - required: [workItemPath]
 
-terminalNodes: [close_work_item, terminate_correction_budget]
+terminalNodes: [close_work_item, terminate_correction_budget, terminate_rejection_budget]
 
 defaultBudget:
   maxSteps: 600

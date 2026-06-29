@@ -187,6 +187,33 @@ def _checkpoint_approved(  # pyright: ignore[reportUnusedFunction] -- accessed v
     )
 
 
+@register("checkpoint_rejections_under_bound")
+def _checkpoint_rejections_under_bound(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    memory: Mapping[str, Any], _last: Mapping[str, Any] | None
+) -> bool:
+    """True iff no checkpoint has exhausted its rejection budget (IMP-006).
+
+    Reads the ``rejections`` top-level sidecar written by
+    ``_rejection_patch`` in ``lifecycle_manual_patches.py``.  Each entry
+    carries an ``attempt`` counter; returns False when any entry's counter
+    reaches ``LIFECYCLE_MAX_CHECKPOINT_REJECTIONS`` (default 3).
+    First-pass calls with no sidecar always return True.
+    """
+    from app.config import get_settings
+
+    bound = int(get_settings().lifecycle_max_checkpoint_rejections)
+    rejections_raw = memory.get("rejections")
+    if not isinstance(rejections_raw, dict):
+        return True
+    for entry in cast("dict[str, Any]", rejections_raw).values():
+        if isinstance(entry, dict):
+            entry_typed = cast("dict[str, Any]", entry)
+            attempt = int(entry_typed.get("attempt") or 0)
+            if attempt >= bound:
+                return False
+    return True
+
+
 @register("task_rejected")
 def _task_rejected(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     _memory: Mapping[str, Any], last: Mapping[str, Any] | None

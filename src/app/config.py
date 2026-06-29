@@ -89,6 +89,8 @@ class Settings(BaseSettings):
 
     # -- Lifecycle agent (FEAT-005) ---------------------------------------
     lifecycle_max_corrections: int = Field(default=2, ge=1)
+    # IMP-006: maximum operator rejections per checkpoint before the run fails.
+    lifecycle_max_checkpoint_rejections: int = Field(default=3, ge=1)
 
     # -- Run-intake code source (IMP-005) ---------------------------------
     # When True, ``POST /api/v1/runs`` rejects intakes missing the
