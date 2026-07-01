@@ -863,6 +863,7 @@ def register_lifecycle_v03(
     # ------------------------------------------------------------------
 
     from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_implementation_signal,
         intake_for_request_implementation,
     )
 
@@ -872,6 +873,7 @@ def register_lifecycle_v03(
         HumanExecutor(
             ref="human:request_implementation",
             expected_signal_name="implementation-complete",
+            memory_patch_builder=apply_implementation_signal,
             intake_builder=intake_for_request_implementation,
         ),
     )

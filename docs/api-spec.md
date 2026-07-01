@@ -267,11 +267,14 @@ For FEAT-006 lifecycle signals, the caller declares its role via `X-Actor-Role: 
   "name": "implementation-complete",
   "taskId": "T-001",
   "payload": {
-    "commit_sha": "string — optional",
-    "notes": "string — optional"
+    "prUrl": "https://github.com/org/repo/pull/42",
+    "commitSha": "abc123def456",
+    "summary": "string — optional free-text"
   }
 }
 ```
+
+All `payload` fields are optional. An empty `payload: {}` is backward-compatible and leaves `RunMemory` unchanged. When `prUrl` (or any field) is present, the orchestrator persists the values in `RunMemory.data["implementation_refs"][taskId]` so the `human_review_implementation` checkpoint can surface them to the reviewer via `nodeInputs.implementationRef` (FEAT-016).
 
 **Response (202 Accepted):**
 
@@ -1046,6 +1049,7 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-07-01 — FEAT-016 (PR URL in implementation review context) — `POST /api/v1/runs/{id}/signals` with `name="implementation-complete"` now accepts an optional structured payload: `prUrl` (string), `commitSha` (string), `summary` (string). When any field is present, the orchestrator persists the values in `RunMemory.data["implementation_refs"][taskId]` and surfaces them as `nodeInputs.implementationRef` in the `human_review_implementation` checkpoint. Empty payload `{}` is backward-compatible and leaves `implementation_refs` unchanged. Payload is validated by the new `ImplementationCompletePayload` schema (`extra="forbid"`); unknown fields return 422. No new endpoints or DTO changes.
 - 2026-05-17 — IMP-005 (run-intake code source) — `POST /api/v1/runs` accepts a new `intake.codeSource` block: `{repo, baseBranch, workBranch?}`. `repo` matches GitHub `owner/name` (no URL prefix, no `.git`); branch names reject whitespace, control chars, leading `/`, and `..`. New `Settings.lifecycle_code_source_required` (env `LIFECYCLE_CODE_SOURCE_REQUIRED`, default `false`) gates presence enforcement: `false` logs a WARN (`intake-code-source-missing-deprecated`) and accepts; `true` returns 400 (`intake-validation-failed`). Shape errors always reject regardless of the flag. Persists verbatim to `Run.intake.codeSource` (no DB migration — existing JSONB column). Executors read via `read_code_source(ctx, memory=...)`; precedence is memory sidecar → intake → raise. Future producer executors write `workBranch` to `RunMemory.data["codeSource"]` only when intake omitted it (operator-supplied always wins). No new endpoints, no DTO changes outside the intake body, no auth surface change.
 - 2026-05-17 — IMP-004 (human assignment checkpoint, manual variant) — `POST /api/v1/runs/{id}/signals` accepts a new `name` value `assignment-confirmed` when the run uses `agentRef=lifecycle-agent@0.4.0-manual`. Pauses before `assign_task` (T5); payload requires non-empty `assignee` and accepts optional `taskId` (defaults to `current_task_id`). Persists to top-level `assignments[taskId]` sidecar in `RunMemory.data` (variant-only — v0.3.0 memory is unchanged). On multi-task work items the operator confirms an assignee per task — `mark_task_done`'s `tasks_remaining=true` loop-back now routes through `confirm_assignment` (was `assign_task` directly). Idempotency, ordering, and 202-Accepted semantics are unchanged from FEAT-015.
 - 2026-05-13 — FEAT-015 (manual lifecycle variant) — `POST /api/v1/runs/{id}/signals` accepts four new `name` values when the run uses `agentRef=lifecycle-agent@0.4.0-manual`: `brief-confirmed`, `tasks-confirmed`, `plan-confirmed`, `review-completed`. Each maps to a `HumanExecutor` checkpoint in the manual flow and carries an optional payload that the orchestrator translates into a `RunMemory` patch via `lifecycle_manual_patches.py`. Endpoint shape, auth, idempotency, and ordering invariants are unchanged from FEAT-005. Empty payloads mean "approve without edits"; `tasks=[]` (explicit empty list) returns 422. Memory-mutation errors (e.g., signal delivered before memory is ready) fail the matched dispatch; the run terminates with `stop_reason=error` while the signal endpoint itself still returns 202.

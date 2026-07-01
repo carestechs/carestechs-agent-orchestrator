@@ -132,6 +132,20 @@ class ReviewCompletedPayload(BaseModel):
     feedback: str | None = None
 
 
+class ImplementationCompletePayload(BaseModel):
+    """Optional metadata the developer submits with ``implementation-complete``.
+
+    All fields are optional — an empty payload is backward-compatible and
+    leaves ``implementation_refs`` unchanged.  ``extra="forbid"`` surfaces
+    typos as validation errors rather than silent drops (FEAT-016).
+    """
+
+    model_config = _PayloadConfig
+    pr_url: str | None = None
+    commit_sha: str | None = None
+    summary: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Rejection helper (IMP-006)
 # ---------------------------------------------------------------------------
@@ -390,6 +404,41 @@ def apply_review_verdict(
     )
 
 
+def apply_implementation_signal(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist the PR URL (and optional metadata) submitted at ``implementation-complete``.
+
+    Writes to the top-level ``implementation_refs[task_id]`` sidecar —
+    a sibling of ``plans`` and ``assignments``, keyed by ``current_task_id``
+    so multi-task runs accumulate one entry per task without overwriting.
+
+    Empty payload → empty patch (backward compat; existing runs unaffected).
+    Missing ``current_task_id`` → empty patch (defensive; shouldn't occur in
+    normal flow since the signal fires mid-task).
+    """
+    parsed = ImplementationCompletePayload.model_validate(payload)
+    if not parsed.pr_url and not parsed.commit_sha and not parsed.summary:
+        return {}
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id
+    if not task_id:
+        return {}
+    existing_raw: Any = current_memory.get("implementation_refs") or {}
+    existing: dict[str, Any] = (
+        {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+        if isinstance(existing_raw, dict)
+        else {}
+    )
+    existing[task_id] = {
+        "prUrl": parsed.pr_url,
+        "commitSha": parsed.commit_sha,
+        "summary": parsed.summary,
+    }
+    return {"implementation_refs": existing}
+
+
 # ---------------------------------------------------------------------------
 # Intake builders — enrich the step's ``node_inputs`` so DevHub (or any
 # trace consumer) can display the artefact the operator is gating.
@@ -465,21 +514,28 @@ def intake_for_human_review(current_memory: Mapping[str, Any]) -> dict[str, Any]
     current_task = next(
         (t for t in memory.tasks if t.id == task_id), None
     )
+    impl_refs_raw: Any = current_memory.get("implementation_refs") or {}
+    impl_ref: dict[str, Any] | None = None
+    if isinstance(impl_refs_raw, dict):
+        impl_ref = cast("dict[str, Any]", impl_refs_raw).get(task_id)
     return {
         "currentTask": current_task.model_dump(mode="json") if current_task else None,
         "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
         "reviewHistory": [r.model_dump(mode="json") for r in memory.review_history if r.task_id == task_id],
+        "implementationRef": impl_ref,
     }
 
 
 __all__ = [
     "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
+    "ImplementationCompletePayload",
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
     "apply_assignment_confirmation",
     "apply_brief_correction",
+    "apply_implementation_signal",
     "apply_plan_correction",
     "apply_review_verdict",
     "apply_tasks_correction",
