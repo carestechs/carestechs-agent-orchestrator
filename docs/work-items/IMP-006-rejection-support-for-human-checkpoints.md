@@ -11,7 +11,7 @@
 | **ID** | IMP-006 |
 | **Name** | Rejection support for human checkpoints |
 | **Type** | Developer Experience |
-| **Status** | Proposed |
+| **Status** | Completed |
 | **Priority** | High |
 | **Proposed By** | Operator observation during DevHub integration (2026-05-24) |
 | **Date Created** | 2026-05-24 |
