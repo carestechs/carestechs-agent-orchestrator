@@ -390,13 +390,14 @@ class RunSignalDto(BaseModel):
 class SignalCreateRequest(BaseModel):
     """Operator POST body for ``POST /api/v1/runs/{id}/signals``.
 
-    ``name`` is a ``Literal`` so unknown signal names produce a 400
+    ``name`` is a ``Literal`` so unknown signal names produce a 422
     (FastAPI auto) before the service layer is reached.  The union
     covers the v0.1.0 FEAT-005 signal (``implementation-complete``) plus
-    the four FEAT-015 manual-variant signals.  ``task_id`` is required
-    by the schema but accepts an empty string for work-item-scoped
-    signals (``brief-confirmed`` / ``tasks-confirmed``); the service
-    layer skips the known-task-ids check when ``task_id`` is empty.
+    the five manual-variant signals (FEAT-015 + IMP-004).  ``task_id``
+    is required by the schema but accepts an empty string for
+    work-item-scoped signals (``brief-confirmed`` / ``tasks-confirmed``);
+    the service layer skips the known-task-ids check when ``task_id``
+    is empty.
     """
 
     model_config = _CAMEL_CONFIG
@@ -405,6 +406,7 @@ class SignalCreateRequest(BaseModel):
         "implementation-complete",
         "brief-confirmed",
         "tasks-confirmed",
+        "assignment-confirmed",
         "plan-confirmed",
         "review-completed",
     ]

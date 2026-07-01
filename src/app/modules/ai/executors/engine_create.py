@@ -212,7 +212,14 @@ class EngineCreateExecutor:
                 await session.flush()
                 local_id = wi.id
             else:
-                if existing.engine_item_id is None:
+                # Always update to the engine item created by THIS dispatch —
+                # a stale non-null value means a previous run created a
+                # different engine entity (e.g. after a rebuild/reset).
+                # Keeping the old ID causes propose_tasks to fail: it reads
+                # Run.intake.engineItemId (new) but the WorkItem row still
+                # carries the old ID, so the lookup-by-engine_item_id returns
+                # nothing.
+                if existing.engine_item_id != engine_item_id:
                     existing.engine_item_id = engine_item_id
                 if not existing.source_path and source_path:
                     existing.source_path = source_path

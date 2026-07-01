@@ -1166,6 +1166,14 @@ class _CorrectionBudgetExceeded(RuntimeError):
     """
 
 
+class _RejectionBudgetExceeded(RuntimeError):
+    """Sentinel: ``terminate_rejection_budget`` reached (IMP-006).
+
+    Surfaced as a failed local-executor envelope; the runtime maps it to
+    ``RunStatus.FAILED`` via the ``_ExecutorFailure`` path.
+    """
+
+
 # ---------------------------------------------------------------------------
 # v0.4.0-manual — manual variant (FEAT-015 / T-299)
 # ---------------------------------------------------------------------------
@@ -1273,6 +1281,24 @@ def register_lifecycle_v04_manual(
             expected_signal_name="review-completed",
             memory_patch_builder=apply_review_verdict,
             intake_builder=intake_for_human_review,
+        ),
+    )
+
+    # 4. Rejection budget terminal — reached when an operator exhausts
+    # LIFECYCLE_MAX_CHECKPOINT_REJECTIONS rejections at any checkpoint
+    # (IMP-006).  Raising here lets LocalExecutor emit a failed envelope
+    # that the runtime maps to RunStatus.FAILED via _ExecutorFailure.
+    from app.modules.ai.executors.local import LocalExecutor
+
+    async def _terminate_rejection_budget_handler(_ctx: DispatchContext) -> Mapping[str, Any]:
+        raise _RejectionBudgetExceeded("rejection_budget_exceeded")
+
+    registry.register(
+        agent_ref,
+        "terminate_rejection_budget",
+        LocalExecutor(
+            ref="local:terminate_rejection_budget",
+            handler=_terminate_rejection_budget_handler,
         ),
     )
 
