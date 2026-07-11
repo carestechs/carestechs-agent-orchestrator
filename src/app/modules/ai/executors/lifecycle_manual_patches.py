@@ -132,6 +132,33 @@ class ReviewCompletedPayload(BaseModel):
     feedback: str | None = None
 
 
+class MockupApprovedPayload(BaseModel):
+    """Operator verdict on a generated mockup (FEAT-017).
+
+    ``verdict="reject"`` persists feedback so the next ``generate_mockup``
+    invocation can address it.  ``verdict="approve"`` produces an empty
+    patch — approval is expressed through the flow routing, not memory.
+    """
+
+    model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
+
+
+class ImplementationCompletePayload(BaseModel):
+    """Optional metadata the developer submits with ``implementation-complete``.
+
+    All fields are optional — an empty payload is backward-compatible and
+    leaves ``implementation_refs`` unchanged.  ``extra="forbid"`` surfaces
+    typos as validation errors rather than silent drops (FEAT-016).
+    """
+
+    model_config = _PayloadConfig
+    pr_url: str | None = None
+    commit_sha: str | None = None
+    summary: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Rejection helper (IMP-006)
 # ---------------------------------------------------------------------------
@@ -354,6 +381,24 @@ def apply_assignment_confirmation(
     return {"assignments": merged}
 
 
+def apply_mockup_approval(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist mockup rejection feedback or approve with an empty patch (FEAT-017).
+
+    Rejection writes to ``rejections["confirm_mockup"]`` so
+    ``_load_mockup_task_context`` in ``bootstrap.py`` can inject the
+    feedback into the next ``generate_mockup`` invocation.  Approval
+    produces no memory change — the routing verdict is read from the
+    dispatch result by the ``checkpoint_approved`` predicate.
+    """
+    parsed = MockupApprovedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_mockup", parsed.feedback, current_memory)
+    return {}
+
+
 def apply_review_verdict(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
@@ -388,6 +433,41 @@ def apply_review_verdict(
         },
         current_memory,
     )
+
+
+def apply_implementation_signal(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist the PR URL (and optional metadata) submitted at ``implementation-complete``.
+
+    Writes to the top-level ``implementation_refs[task_id]`` sidecar —
+    a sibling of ``plans`` and ``assignments``, keyed by ``current_task_id``
+    so multi-task runs accumulate one entry per task without overwriting.
+
+    Empty payload → empty patch (backward compat; existing runs unaffected).
+    Missing ``current_task_id`` → empty patch (defensive; shouldn't occur in
+    normal flow since the signal fires mid-task).
+    """
+    parsed = ImplementationCompletePayload.model_validate(payload)
+    if not parsed.pr_url and not parsed.commit_sha and not parsed.summary:
+        return {}
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id
+    if not task_id:
+        return {}
+    existing_raw: Any = current_memory.get("implementation_refs") or {}
+    existing: dict[str, Any] = (
+        {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+        if isinstance(existing_raw, dict)
+        else {}
+    )
+    existing[task_id] = {
+        "prUrl": parsed.pr_url,
+        "commitSha": parsed.commit_sha,
+        "summary": parsed.summary,
+    }
+    return {"implementation_refs": existing}
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +527,26 @@ def intake_for_confirm_plan(current_memory: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def intake_for_confirm_mockup(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Surface the generated mockup HTML and description for operator review (FEAT-017)."""
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    mockups_raw: Any = current_memory.get("mockups") or {}
+    mockup_entry: dict[str, Any] = {}
+    if isinstance(mockups_raw, dict):
+        raw = cast("dict[str, Any]", mockups_raw).get(task_id)
+        if isinstance(raw, dict):
+            mockup_entry = cast("dict[str, Any]", raw)
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "mockupHtml": str(mockup_entry.get("mockup_html") or ""),
+        "mockupDescription": str(mockup_entry.get("description") or ""),
+    }
+
+
 def intake_for_request_implementation(current_memory: Mapping[str, Any]) -> dict[str, Any]:
     memory = read_lifecycle_memory(current_memory)
     task_id = memory.current_task_id or ""
@@ -465,26 +565,36 @@ def intake_for_human_review(current_memory: Mapping[str, Any]) -> dict[str, Any]
     current_task = next(
         (t for t in memory.tasks if t.id == task_id), None
     )
+    impl_refs_raw: Any = current_memory.get("implementation_refs") or {}
+    impl_ref: dict[str, Any] | None = None
+    if isinstance(impl_refs_raw, dict):
+        impl_ref = cast("dict[str, Any]", impl_refs_raw).get(task_id)
     return {
         "currentTask": current_task.model_dump(mode="json") if current_task else None,
         "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
         "reviewHistory": [r.model_dump(mode="json") for r in memory.review_history if r.task_id == task_id],
+        "implementationRef": impl_ref,
     }
 
 
 __all__ = [
     "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
+    "ImplementationCompletePayload",
+    "MockupApprovedPayload",
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
     "apply_assignment_confirmation",
     "apply_brief_correction",
+    "apply_implementation_signal",
+    "apply_mockup_approval",
     "apply_plan_correction",
     "apply_review_verdict",
     "apply_tasks_correction",
     "intake_for_confirm_assignment",
     "intake_for_confirm_brief",
+    "intake_for_confirm_mockup",
     "intake_for_confirm_plan",
     "intake_for_confirm_tasks",
     "intake_for_human_review",

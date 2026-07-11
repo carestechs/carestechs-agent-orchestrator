@@ -20,9 +20,11 @@ from app.modules.ai.executors.lifecycle_manual_patches import (
     AssignmentConfirmedPayload,
     apply_assignment_confirmation,
     apply_brief_correction,
+    apply_implementation_signal,
     apply_plan_correction,
     apply_review_verdict,
     apply_tasks_correction,
+    intake_for_human_review,
 )
 from app.modules.ai.tools.lifecycle.memory import (
     LIFECYCLE_MEMORY_NS,
@@ -409,3 +411,104 @@ class TestApplyReviewVerdict:
         no_task = _memory_with_work_item()
         with pytest.raises(ValueError, match="no current_task_id"):
             apply_review_verdict({"verdict": "pass"}, no_task)
+
+
+# ---------------------------------------------------------------------------
+# apply_implementation_signal (FEAT-016)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyImplementationSignal:
+    def test_empty_payload_returns_empty_patch(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        assert apply_implementation_signal({}, mem) == {}
+
+    def test_pr_url_writes_implementation_refs_sidecar(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        patch = apply_implementation_signal({"prUrl": "https://github.com/org/repo/pull/42"}, mem)
+        assert "implementation_refs" in patch
+        assert LIFECYCLE_MEMORY_NS not in patch
+        ref = patch["implementation_refs"]["T-1"]
+        assert ref["prUrl"] == "https://github.com/org/repo/pull/42"
+        assert ref["commitSha"] is None
+        assert ref["summary"] is None
+
+    def test_full_payload_persists_all_fields(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        patch = apply_implementation_signal(
+            {"prUrl": "https://github.com/org/repo/pull/42", "commitSha": "abc123", "summary": "done"},
+            mem,
+        )
+        ref = patch["implementation_refs"]["T-1"]
+        assert ref["prUrl"] == "https://github.com/org/repo/pull/42"
+        assert ref["commitSha"] == "abc123"
+        assert ref["summary"] == "done"
+
+    def test_snake_case_aliases_accepted(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        patch = apply_implementation_signal(
+            {"pr_url": "https://github.com/org/repo/pull/1", "commit_sha": "def456"}, mem
+        )
+        assert patch["implementation_refs"]["T-1"]["prUrl"] == "https://github.com/org/repo/pull/1"
+
+    def test_multi_task_accumulates_without_overwriting(self) -> None:
+        """Second task's entry merges alongside first."""
+        mem = _memory(current_task_id="T-2")
+        mem["implementation_refs"] = {"T-1": {"prUrl": "https://github.com/org/repo/pull/1", "commitSha": None, "summary": None}}
+        patch = apply_implementation_signal({"prUrl": "https://github.com/org/repo/pull/2"}, mem)
+        refs = patch["implementation_refs"]
+        assert "T-1" in refs
+        assert refs["T-1"]["prUrl"] == "https://github.com/org/repo/pull/1"
+        assert refs["T-2"]["prUrl"] == "https://github.com/org/repo/pull/2"
+
+    def test_no_current_task_id_returns_empty_patch(self) -> None:
+        mem = _memory()  # current_task_id=None
+        assert apply_implementation_signal({"prUrl": "https://github.com/org/repo/pull/1"}, mem) == {}
+
+    def test_unknown_field_rejected_by_extra_forbid(self) -> None:
+        mem = _memory(current_task_id="T-1")
+        with pytest.raises(ValidationError):
+            apply_implementation_signal({"prUrl": "https://x.com/pull/1", "bogus": "x"}, mem)
+
+    def test_only_commit_sha_also_writes_refs(self) -> None:
+        """Any non-null field triggers the write."""
+        mem = _memory(current_task_id="T-1")
+        patch = apply_implementation_signal({"commitSha": "abc"}, mem)
+        assert patch["implementation_refs"]["T-1"]["commitSha"] == "abc"
+
+
+# ---------------------------------------------------------------------------
+# intake_for_human_review — implementationRef extension (FEAT-016)
+# ---------------------------------------------------------------------------
+
+
+class TestIntakeForHumanReview:
+    def test_implementation_ref_none_when_absent(self) -> None:
+        mem = _memory(current_task_id="T-1", tasks=[LifecycleTask(id="T-1", title="A")])
+        intake = intake_for_human_review(mem)
+        assert "implementationRef" in intake
+        assert intake["implementationRef"] is None
+
+    def test_implementation_ref_populated_when_present(self) -> None:
+        mem = _memory(current_task_id="T-1", tasks=[LifecycleTask(id="T-1", title="A")])
+        mem["implementation_refs"] = {
+            "T-1": {"prUrl": "https://github.com/org/repo/pull/7", "commitSha": "abc", "summary": None}
+        }
+        intake = intake_for_human_review(mem)
+        assert intake["implementationRef"]["prUrl"] == "https://github.com/org/repo/pull/7"
+
+    def test_implementation_ref_for_other_task_not_included(self) -> None:
+        """current_task_id=T-2 should not see T-1's ref."""
+        mem = _memory(current_task_id="T-2", tasks=[LifecycleTask(id="T-2", title="B")])
+        mem["implementation_refs"] = {
+            "T-1": {"prUrl": "https://github.com/org/repo/pull/1", "commitSha": None, "summary": None}
+        }
+        intake = intake_for_human_review(mem)
+        assert intake["implementationRef"] is None
+
+    def test_existing_fields_still_present(self) -> None:
+        mem = _memory(current_task_id="T-1", tasks=[LifecycleTask(id="T-1", title="A")])
+        intake = intake_for_human_review(mem)
+        assert "currentTask" in intake
+        assert "planMarkdown" in intake
+        assert "reviewHistory" in intake
