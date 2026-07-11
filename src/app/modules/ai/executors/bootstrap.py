@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
 from app.modules.ai.executors.binding import ExecutorBinding, no_executor
+from app.modules.ai.executors.code_source import read_code_source
 from app.modules.ai.executors.coverage import (
     ExecutorCoverageError,
     validate_executor_coverage,
@@ -109,6 +110,23 @@ def register_all_executors(
                 _exempt_lifecycle_v03(agent.ref, [n.name for n in agent.nodes])
             else:
                 register_lifecycle_v03(
+                    registry,
+                    agent.ref,
+                    lifecycle_client=v03_collaborators.lifecycle_client,
+                    llm_provider=v03_collaborators.llm_provider,
+                    session_factory=v03_collaborators.session_factory,
+                    workflow_ids=v03_collaborators.workflow_ids,
+                    actor=v03_collaborators.actor,
+                    max_corrections=v03_collaborators.max_corrections,
+                )
+        elif agent.ref.startswith("lifecycle-agent@0.5"):
+            # FEAT-017: mockup-conditional variant.  Reuses v0.3.0
+            # collaborators + all v0.4.0-manual bindings; layers two new
+            # nodes (generate_mockup, confirm_mockup) on top.
+            if v03_collaborators is None:
+                _exempt_lifecycle_v05_manual(agent.ref, [n.name for n in agent.nodes])
+            else:
+                register_lifecycle_v05_manual(
                     registry,
                     agent.ref,
                     lifecycle_client=v03_collaborators.lifecycle_client,
@@ -598,6 +616,19 @@ def register_lifecycle_v03(
         bindings["rejectionFeedback"] = await _read_rejection_feedback(
             ctx.run_id, "confirm_tasks"
         )
+        try:
+            cs = read_code_source(ctx)
+            branch_line = (
+                f"Work branch: {cs.work_branch}\n" if cs.work_branch else ""
+            )
+            bindings["codeSourceBlock"] = (
+                f"Repository: https://github.com/{cs.repo}\n"
+                f"Base branch: {cs.base_branch}\n"
+                f"{branch_line}"
+                "\n"
+            )
+        except ValueError:
+            bindings["codeSourceBlock"] = ""
         return bindings
 
     registry.register(
@@ -651,6 +682,8 @@ def register_lifecycle_v03(
         def _task(t: Mapping[str, Any]) -> LifecycleTask:
             complexity_raw = str(t.get("complexity", "medium") or "medium")
             complexity = complexity_raw if complexity_raw in ("small", "medium", "large") else "medium"
+            kind_raw = str(t.get("kind", "feature") or "feature")
+            kind = kind_raw if kind_raw in ("feature", "mockup", "bug", "chore") else "feature"
             return LifecycleTask(
                 id=str(t.get("id", "")),
                 title=str(t.get("title", "")),
@@ -660,6 +693,7 @@ def register_lifecycle_v03(
                 complexity=complexity,  # type: ignore[arg-type]
                 depends_on=[str(d) for d in cast(list[Any], t.get("depends_on") or [])],
                 files_hint=[str(f) for f in cast(list[Any], t.get("files_hint") or [])],
+                kind=kind,  # type: ignore[arg-type]
             )
 
         memory = LifecycleMemory(
@@ -679,6 +713,7 @@ def register_lifecycle_v03(
                 "The full work-item brief follows; ground your task list in "
                 "its acceptance criteria, scope, and constraints. Do not "
                 "invent requirements that are not anchored in the brief.\n\n"
+                "{codeSourceBlock}"
                 "----- BEGIN WORK ITEM BRIEF -----\n"
                 "{workItemBrief}\n"
                 "----- END WORK ITEM BRIEF -----\n"
@@ -1322,6 +1357,151 @@ def _exempt_lifecycle_v04_manual(agent_ref: str, node_names: list[str]) -> None:
         no_executor(agent_ref, node_name, reason)
 
 
+def register_lifecycle_v05_manual(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    llm_provider: LLMProvider,
+    session_factory: async_sessionmaker[AsyncSession],
+    workflow_ids: Mapping[str, uuid.UUID],
+    max_corrections: int = 2,
+    actor: str | None = "lifecycle-agent",
+) -> None:
+    """Register bindings for ``lifecycle-agent@0.5.0-manual`` (FEAT-017).
+
+    Delegates to :func:`register_lifecycle_v04_manual` to inherit every
+    v0.4.0-manual binding (all v0.3.0 shared bindings + five human
+    checkpoints + human reviewer), then layers two new bindings:
+
+    - ``generate_mockup``: :class:`LLMContentExecutor` that authors a
+      self-contained HTML mockup for tasks with ``kind="mockup"``.
+    - ``confirm_mockup``: :class:`HumanExecutor` gated by
+      ``mockup-approved`` signal; rejection loops back to
+      ``generate_mockup`` via the ``checkpoint_approved`` predicate.
+    """
+    from app.modules.ai.executors.human import HumanExecutor
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_mockup_approval,
+        intake_for_confirm_mockup,
+    )
+    from app.modules.ai.executors.lifecycle_schemas import GenerateMockupResult
+    from app.modules.ai.executors.llm_content import LLMContentExecutor
+    from app.modules.ai.tools.lifecycle.memory import find_current_task, read_lifecycle_memory
+    from sqlalchemy import select as _select
+
+    from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+    # 1. All v0.4.0-manual bindings.
+    register_lifecycle_v04_manual(
+        registry,
+        agent_ref,
+        lifecycle_client=lifecycle_client,
+        llm_provider=llm_provider,
+        session_factory=session_factory,
+        workflow_ids=workflow_ids,
+        max_corrections=max_corrections,
+        actor=actor,
+    )
+
+    # 2. Context loader for generate_mockup — reads current task body from memory.
+    async def _load_mockup_task_context(ctx: DispatchContext) -> Mapping[str, Any]:
+        async with session_factory() as _session:
+            mem = await _session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+            )
+        memory_data: dict[str, Any] = (mem.data if mem is not None else {}) or {}
+        lifecycle_memory = read_lifecycle_memory(memory_data)
+        task = find_current_task(lifecycle_memory)
+        rejection_fb_raw = memory_data.get("rejections")
+        rejection_fb = ""
+        if isinstance(rejection_fb_raw, dict):
+            entry = cast("dict[str, Any]", rejection_fb_raw).get("confirm_mockup")
+            if isinstance(entry, dict):
+                fb = str(cast("dict[str, Any]", entry).get("feedback") or "")
+                if fb:
+                    rejection_fb = (
+                        "\n--- OPERATOR REJECTION FEEDBACK ---\n"
+                        "The operator previously rejected this mockup. "
+                        "Address their feedback:\n\n"
+                        f"{fb}\n"
+                        "--- END FEEDBACK ---\n"
+                    )
+        return {
+            "taskId": task.id if task else "",
+            "taskTitle": task.title if task else "",
+            "taskDescription": task.description if task else "",
+            "acceptanceCriteria": (
+                "\n".join(f"- {c}" for c in task.acceptance_criteria) if task else ""
+            ),
+            "rejectionFeedback": rejection_fb,
+        }
+
+    # 3. Memory patch builder for generate_mockup.
+    def _patch_generate_mockup(
+        result: Mapping[str, Any], current_memory: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        task_id = str(result.get("task_id") or "")
+        mockup_html = str(result.get("mockup_html") or "")
+        description = str(result.get("description") or "")
+        if not task_id:
+            return {}
+        existing_raw: Any = current_memory.get("mockups") or {}
+        existing: dict[str, Any] = (
+            {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+            if isinstance(existing_raw, dict)
+            else {}
+        )
+        existing[task_id] = {"mockup_html": mockup_html, "description": description}
+        return {"mockups": existing}
+
+    # 4. generate_mockup — LLM-content executor.
+    _mockup_prompt = (Path(__file__).parent / "prompts" / "lifecycle" / "generate_mockup.md").read_text(encoding="utf-8")
+    registry.register(
+        agent_ref,
+        "generate_mockup",
+        LLMContentExecutor(
+            ref="llm:generate_mockup",
+            system_prompt=_mockup_prompt,
+            user_prompt_template=(
+                "Generate a mockup for task {taskId}: {taskTitle}.\n\n"
+                "Description: {taskDescription}\n\n"
+                "Acceptance criteria:\n{acceptanceCriteria}\n"
+                "{rejectionFeedback}"
+            ),
+            result_schema=GenerateMockupResult,
+            llm_provider=llm_provider,
+            memory_patch_builder=_patch_generate_mockup,
+            prompt_context_loader=_load_mockup_task_context,
+            session_factory=session_factory,
+        ),
+    )
+
+    # 5. confirm_mockup — HumanExecutor.
+    registry.register(
+        agent_ref,
+        "confirm_mockup",
+        HumanExecutor(
+            ref="human:confirm_mockup",
+            expected_signal_name="mockup-approved",
+            memory_patch_builder=apply_mockup_approval,
+            intake_builder=intake_for_confirm_mockup,
+        ),
+    )
+
+    logger.info(
+        "register_lifecycle_v05_manual: agent_ref=%s registered "
+        "(generate_mockup + confirm_mockup + v0.4.0-manual shared bindings)",
+        agent_ref,
+    )
+
+
+def _exempt_lifecycle_v05_manual(agent_ref: str, node_names: list[str]) -> None:
+    reason = "v0.5.0-manual collaborators not provided to register_all_executors"
+    for node_name in node_names:
+        no_executor(agent_ref, node_name, reason)
+
+
 def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
     session_factory: async_sessionmaker[AsyncSession],
 ):
@@ -1507,5 +1687,6 @@ __all__ = [
     "register_engine_executor",
     "register_lifecycle_v03",
     "register_lifecycle_v04_manual",
+    "register_lifecycle_v05_manual",
     "run_coverage_validation",
 ]

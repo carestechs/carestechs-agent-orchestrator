@@ -132,6 +132,19 @@ class ReviewCompletedPayload(BaseModel):
     feedback: str | None = None
 
 
+class MockupApprovedPayload(BaseModel):
+    """Operator verdict on a generated mockup (FEAT-017).
+
+    ``verdict="reject"`` persists feedback so the next ``generate_mockup``
+    invocation can address it.  ``verdict="approve"`` produces an empty
+    patch — approval is expressed through the flow routing, not memory.
+    """
+
+    model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
+
+
 class ImplementationCompletePayload(BaseModel):
     """Optional metadata the developer submits with ``implementation-complete``.
 
@@ -368,6 +381,24 @@ def apply_assignment_confirmation(
     return {"assignments": merged}
 
 
+def apply_mockup_approval(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist mockup rejection feedback or approve with an empty patch (FEAT-017).
+
+    Rejection writes to ``rejections["confirm_mockup"]`` so
+    ``_load_mockup_task_context`` in ``bootstrap.py`` can inject the
+    feedback into the next ``generate_mockup`` invocation.  Approval
+    produces no memory change — the routing verdict is read from the
+    dispatch result by the ``checkpoint_approved`` predicate.
+    """
+    parsed = MockupApprovedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_mockup", parsed.feedback, current_memory)
+    return {}
+
+
 def apply_review_verdict(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
@@ -496,6 +527,26 @@ def intake_for_confirm_plan(current_memory: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def intake_for_confirm_mockup(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Surface the generated mockup HTML and description for operator review (FEAT-017)."""
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    mockups_raw: Any = current_memory.get("mockups") or {}
+    mockup_entry: dict[str, Any] = {}
+    if isinstance(mockups_raw, dict):
+        raw = cast("dict[str, Any]", mockups_raw).get(task_id)
+        if isinstance(raw, dict):
+            mockup_entry = cast("dict[str, Any]", raw)
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "mockupHtml": str(mockup_entry.get("mockup_html") or ""),
+        "mockupDescription": str(mockup_entry.get("description") or ""),
+    }
+
+
 def intake_for_request_implementation(current_memory: Mapping[str, Any]) -> dict[str, Any]:
     memory = read_lifecycle_memory(current_memory)
     task_id = memory.current_task_id or ""
@@ -530,17 +581,20 @@ __all__ = [
     "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
     "ImplementationCompletePayload",
+    "MockupApprovedPayload",
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
     "apply_assignment_confirmation",
     "apply_brief_correction",
     "apply_implementation_signal",
+    "apply_mockup_approval",
     "apply_plan_correction",
     "apply_review_verdict",
     "apply_tasks_correction",
     "intake_for_confirm_assignment",
     "intake_for_confirm_brief",
+    "intake_for_confirm_mockup",
     "intake_for_confirm_plan",
     "intake_for_confirm_tasks",
     "intake_for_human_review",

@@ -74,6 +74,7 @@ class LifecycleTask(BaseModel):
     complexity: Literal["small", "medium", "large"] = "medium"
     depends_on: list[str] = Field(default_factory=list[str])
     files_hint: list[str] = Field(default_factory=list[str])
+    kind: Literal["feature", "mockup", "bug", "chore"] = "feature"
 
 
 class LifecycleReview(BaseModel):

@@ -66,6 +66,10 @@ class GenerateTasksTask(BaseModel):
         default_factory=list,
         description="Optional list of file paths the task is expected to touch — a hint, not a contract.",
     )
+    kind: Literal["feature", "mockup", "bug", "chore"] = Field(
+        default="feature",
+        description="Task kind. Use 'mockup' when the task requires a UI mockup to be generated and approved before implementation.",
+    )
 
 
 class GenerateTasksResult(BaseModel):
@@ -85,6 +89,16 @@ class GeneratePlanResult(BaseModel):
     plan_markdown: str
 
 
+class GenerateMockupResult(BaseModel):
+    """LLM-generated HTML mockup for the ``generate_mockup`` node (FEAT-017)."""
+
+    model_config = _FORBID_NONE
+
+    task_id: str
+    mockup_html: str = Field(description="Self-contained HTML document (inline CSS, no external deps).")
+    description: str = Field(description="1-2 sentence summary of what the mockup depicts.")
+
+
 class ReviewImplementationResult(BaseModel):
     """LLM verdict for the ``review_implementation`` composite node."""
 
@@ -96,6 +110,7 @@ class ReviewImplementationResult(BaseModel):
 
 
 __all__ = [
+    "GenerateMockupResult",
     "GeneratePlanResult",
     "GenerateTasksResult",
     "GenerateTasksTask",

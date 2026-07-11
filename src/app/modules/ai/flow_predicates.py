@@ -214,6 +214,31 @@ def _checkpoint_rejections_under_bound(  # pyright: ignore[reportUnusedFunction]
     return True
 
 
+@register("current_task_is_mockup")
+def _current_task_is_mockup(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    memory: Mapping[str, Any], _last: Mapping[str, Any] | None
+) -> bool:
+    """True iff the current task's ``kind`` is ``"mockup"`` (FEAT-017).
+
+    Reads ``current_task_id`` from lifecycle memory and matches it against
+    the task list.  Returns ``False`` safely when ``current_task_id`` is
+    ``None`` or the task is not found — the safe default is to skip the
+    mockup path, not to enter it unexpectedly.
+    """
+    from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
+
+    lifecycle_memory = read_lifecycle_memory(memory)
+    if lifecycle_memory.current_task_id is None:
+        return False
+    task = next(
+        (t for t in lifecycle_memory.tasks if t.id == lifecycle_memory.current_task_id),
+        None,
+    )
+    if task is None:
+        return False
+    return task.kind == "mockup"
+
+
 @register("task_rejected")
 def _task_rejected(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     _memory: Mapping[str, Any], last: Mapping[str, Any] | None

@@ -13,6 +13,10 @@ workflow. Each task carries enough body that the next stage
 (`generate_plan`) and the final reviewer can work against the task's
 intent without re-reading the brief.
 
+When the user message includes a repository URL and branch, use that
+context to ground `files_hint` in realistic paths for that codebase and
+to calibrate `complexity` against the likely scope of changes.
+
 ## Output
 
 Call the tool exactly once with a single field:
@@ -31,6 +35,7 @@ Each task object has the following fields:
 | `complexity` | enum | yes | One of `"small"`, `"medium"`, `"large"`. Rough estimate; not load-bearing. |
 | `depends_on` | string[] | no | Other task ids this task requires complete first. Empty by default. Use this to express genuine ordering — the planner reads it. |
 | `files_hint` | string[] | no | Optional file paths the task is expected to touch. A best-effort hint, not a contract; leave empty if unsure. |
+| `kind` | enum | no | One of `"feature"` (default), `"mockup"`, `"bug"`, `"chore"`. Use `"mockup"` when the task's primary deliverable is a UI mockup that must be reviewed and approved before any code is written. All other tasks use the default `"feature"`. |
 
 ## Constraints
 
