@@ -701,35 +701,10 @@ def register_lifecycle_v03(
         )
         return write_lifecycle_memory(memory)
 
-    registry.register(
-        agent_ref,
-        "generate_tasks",
-        LLMContentExecutor(
-            ref="llm:generate_tasks",
-            system_prompt=_load_prompt("generate_tasks"),
-            user_prompt_template=(
-                "Generate the task breakdown for work item id: {workItemId}.\n"
-                "The full work-item brief follows; ground your task list in "
-                "its acceptance criteria, scope, and constraints. Do not "
-                "invent requirements that are not anchored in the brief.\n\n"
-                "{codeSourceBlock}"
-                "----- BEGIN WORK ITEM BRIEF -----\n"
-                "{workItemBrief}\n"
-                "----- END WORK ITEM BRIEF -----\n"
-                "{rejectionFeedback}"
-            ),
-            result_schema=GenerateTasksResult,
-            llm_provider=llm_provider,
-            memory_patch_builder=_patch_generate_tasks,
-            prompt_context_loader=_load_work_item_brief_with_tasks_rejection,
-            session_factory=session_factory,
-        ),
-    )
-
     # ------------------------------------------------------------------
-    # generate_tasks — optional platform override.
-    # When AGENT_PLATFORM_URL is set, replace the LLM-content binding
-    # with AgentPlatformExecutor pointing at the generate-tasks capability.
+    # generate_tasks — LLM-content or platform, mutually exclusive.
+    # When AGENT_PLATFORM_URL is set, register AgentPlatformExecutor for
+    # the generate-tasks capability; otherwise register LLMContentExecutor.
     # ------------------------------------------------------------------
     from app.config import get_settings as _get_settings_platform
     _platform_settings = _get_settings_platform()
@@ -807,6 +782,31 @@ def register_lifecycle_v03(
         logger.info(
             "register_lifecycle_v03: agent_ref=%s generate_tasks → platform capability=generate-tasks",
             agent_ref,
+        )
+    else:
+        registry.register(
+            agent_ref,
+            "generate_tasks",
+            LLMContentExecutor(
+                ref="llm:generate_tasks",
+                system_prompt=_load_prompt("generate_tasks"),
+                user_prompt_template=(
+                    "Generate the task breakdown for work item id: {workItemId}.\n"
+                    "The full work-item brief follows; ground your task list in "
+                    "its acceptance criteria, scope, and constraints. Do not "
+                    "invent requirements that are not anchored in the brief.\n\n"
+                    "{codeSourceBlock}"
+                    "----- BEGIN WORK ITEM BRIEF -----\n"
+                    "{workItemBrief}\n"
+                    "----- END WORK ITEM BRIEF -----\n"
+                    "{rejectionFeedback}"
+                ),
+                result_schema=GenerateTasksResult,
+                llm_provider=llm_provider,
+                memory_patch_builder=_patch_generate_tasks,
+                prompt_context_loader=_load_work_item_brief_with_tasks_rejection,
+                session_factory=session_factory,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -929,32 +929,11 @@ def register_lifecycle_v03(
             "rejectionFeedback": rejection_fb,
         }
 
-    registry.register(
-        agent_ref,
-        "generate_plan",
-        LLMContentExecutor(
-            ref="llm:generate_plan",
-            system_prompt=_load_prompt("generate_plan"),
-            user_prompt_template=(
-                "Author an implementation plan for the task below.\n\n"
-                "Task id: {taskId}\n"
-                "Title: {taskTitle}\n"
-                "Complexity: {complexity}\n"
-                "Depends on: {dependsOn}\n\n"
-                "Description:\n{taskDescription}\n\n"
-                "Acceptance criteria:\n{acceptanceCriteria}\n\n"
-                "Files hint:\n{filesHint}\n"
-                "{rejectionFeedback}"
-            ),
-            result_schema=GeneratePlanResult,
-            llm_provider=llm_provider,
-            memory_patch_builder=_patch_generate_plan,
-            prompt_context_loader=_load_current_task_body,
-            session_factory=session_factory,
-        ),
-    )
-
-    # Platform auto-upgrade for generate_plan (same rule as generate_tasks).
+    # ------------------------------------------------------------------
+    # generate_plan — LLM-content or platform, mutually exclusive.
+    # Same rule as generate_tasks: if AGENT_PLATFORM_URL is set, use the
+    # plan-generation capability; otherwise use LLMContentExecutor.
+    # ------------------------------------------------------------------
     from app.config import get_settings as _get_settings_gp
     _gp_settings = _get_settings_gp()
     if _gp_settings.agent_platform_url is not None:
@@ -983,7 +962,9 @@ def register_lifecycle_v03(
                     "title": str(bindings.get("taskTitle") or ""),
                     "description": str(bindings.get("taskDescription") or ""),
                     "acceptanceCriteria": ac_list,
-                    "complexity": str(bindings.get("complexity") or "medium"),
+                    "complexity": {"small": "S", "medium": "M", "large": "L"}.get(
+                        str(bindings.get("complexity") or "medium"), "M"
+                    ),
                     "dependencies": [d.strip() for d in str(bindings.get("dependsOn") or "").split(",") if d.strip() and d.strip() != "(none)"],
                     "fileHints": [f.strip().strip("`") for f in str(bindings.get("filesHint") or "").splitlines() if f.strip() and f.strip() not in ("(none)", "-")],
                 },
@@ -1041,6 +1022,31 @@ def register_lifecycle_v03(
         logger.info(
             "register_lifecycle_v03: agent_ref=%s generate_plan → platform capability=plan-generation",
             agent_ref,
+        )
+    else:
+        registry.register(
+            agent_ref,
+            "generate_plan",
+            LLMContentExecutor(
+                ref="llm:generate_plan",
+                system_prompt=_load_prompt("generate_plan"),
+                user_prompt_template=(
+                    "Author an implementation plan for the task below.\n\n"
+                    "Task id: {taskId}\n"
+                    "Title: {taskTitle}\n"
+                    "Complexity: {complexity}\n"
+                    "Depends on: {dependsOn}\n\n"
+                    "Description:\n{taskDescription}\n\n"
+                    "Acceptance criteria:\n{acceptanceCriteria}\n\n"
+                    "Files hint:\n{filesHint}\n"
+                    "{rejectionFeedback}"
+                ),
+                result_schema=GeneratePlanResult,
+                llm_provider=llm_provider,
+                memory_patch_builder=_patch_generate_plan,
+                prompt_context_loader=_load_current_task_body,
+                session_factory=session_factory,
+            ),
         )
 
     # ------------------------------------------------------------------
