@@ -421,9 +421,9 @@ def register_lifecycle_v03(
     through it on a ``pass`` verdict.
 
     The mapping table lives in ``docs/design/feat-011-lifecycle-deterministic-port.md``
-    (section "Node-to-executor mapping table (v0.3.0)").  Composite nodes
-    chain LLM-content + engine via :class:`CompositeLLMEngineExecutor`
-    (Option 1 from the design doc).
+    (section "Node-to-executor mapping table (v0.3.0)").  ``generate_plan``
+    was formerly a composite node; it is now split into ``generate_plan``
+    (LLM-content only) and ``advance_plan`` (EngineExecutor for T6).
 
     PR 3 simplifications (documented in the FEAT-011 PR 3 body):
 
@@ -472,7 +472,6 @@ def register_lifecycle_v03(
 
     # Local imports to keep the bootstrap module's import graph small —
     # mirrors the ``register_engine_executor`` pattern.
-    from app.modules.ai.executors.composite import CompositeLLMEngineExecutor
     from app.modules.ai.executors.human import HumanExecutor
     from app.modules.ai.executors.lifecycle_schemas import (
         GeneratePlanResult,
@@ -728,6 +727,89 @@ def register_lifecycle_v03(
     )
 
     # ------------------------------------------------------------------
+    # generate_tasks — optional platform override.
+    # When AGENT_PLATFORM_URL is set, replace the LLM-content binding
+    # with AgentPlatformExecutor pointing at the generate-tasks capability.
+    # ------------------------------------------------------------------
+    from app.config import get_settings as _get_settings_platform
+    _platform_settings = _get_settings_platform()
+    if _platform_settings.agent_platform_url is not None:
+        from app.modules.ai.executors.platform import (
+            AgentPlatformExecutor,
+            register_platform_transformer,
+        )
+        import httpx as _httpx
+
+        _platform_base = str(_platform_settings.agent_platform_url or "").rstrip("/")  # type: ignore[union-attr]
+        _callback_base = str(_platform_settings.public_base_url or "").rstrip("/")
+
+        async def _build_generate_tasks_platform_input(ctx: DispatchContext) -> dict[str, Any]:
+            bindings = await _load_work_item_brief_with_tasks_rejection(ctx)
+            work_item_raw: Any = ctx.intake.get("workItem")
+            wi_id = (
+                cast("Mapping[str, Any]", work_item_raw).get("id")
+                if isinstance(work_item_raw, Mapping)
+                else None
+            ) or ctx.intake.get("workItemId") or ""
+            try:
+                cs = read_code_source(ctx)
+                code_source: dict[str, Any] = {
+                    "repo": cs.repo,
+                    "baseBranch": cs.base_branch,
+                }
+                if cs.work_branch:
+                    code_source["workBranch"] = cs.work_branch
+            except ValueError:
+                code_source = {"repo": "", "baseBranch": "main"}
+            return {
+                "workItem": {"id": str(wi_id), "content": str(bindings.get("workItemBrief") or "")},
+                "codeSource": code_source,
+            }
+
+        _complexity_map: dict[str, str] = {
+            "S": "small", "M": "medium", "L": "large", "XL": "large",
+        }
+
+        def _transform_generate_tasks(
+            raw: dict[str, Any], current_memory: dict[str, Any]
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            tasks_in: list[dict[str, Any]] = list(raw.get("tasks") or [])
+            converted: list[dict[str, Any]] = []
+            for i, t in enumerate(tasks_in, 1):
+                converted.append({
+                    "id": f"T-{i:03d}",
+                    "title": t.get("title", ""),
+                    "description": t.get("description", ""),
+                    "acceptance_criteria": list(t.get("acceptanceCriteria") or []),
+                    "complexity": _complexity_map.get(str(t.get("complexity", "M")), "medium"),
+                    "depends_on": list(t.get("dependencies") or []),
+                    "files_hint": list(t.get("fileHints") or []),
+                    "kind": "feature",
+                })
+            transformed = {"tasks": converted}
+            memory_patch = _patch_generate_tasks(transformed, current_memory)
+            return transformed, memory_patch
+
+        _gt_executor_id = f"platform:generate_tasks:{agent_ref}"
+        register_platform_transformer(_gt_executor_id, _transform_generate_tasks)
+        registry.register(
+            agent_ref,
+            "generate_tasks",
+            AgentPlatformExecutor(
+                ref=_gt_executor_id,
+                capability="generate-tasks",
+                platform_url=_platform_base,
+                callback_url=f"{_callback_base}/hooks/platform/{_gt_executor_id}",
+                input_builder=_build_generate_tasks_platform_input,
+                client=_httpx.AsyncClient(),
+            ),
+        )
+        logger.info(
+            "register_lifecycle_v03: agent_ref=%s generate_tasks → platform capability=generate-tasks",
+            agent_ref,
+        )
+
+    # ------------------------------------------------------------------
     # propose_tasks — T1xN create_item + T2+T4 + W2 (BUG-004 / new node).
     # ------------------------------------------------------------------
 
@@ -786,9 +868,12 @@ def register_lifecycle_v03(
     )
 
     # ------------------------------------------------------------------
-    # generate_plan — LLM plan + T6 only (current task).  T7 is a
-    # separate ``approve_plan`` node so the unplanned-tasks loop can
-    # branch on completion.
+    # generate_plan — LLM plan authoring only (current task).
+    # T6 (planning → plan_review) lives in the sibling ``advance_plan``
+    # node so the LLM call and the engine transition are separate units.
+    # This lets the platform (async job) own the LLM part while the
+    # engine transition remains a standard EngineExecutor.  T7 is the
+    # subsequent ``approve_plan`` node.
     # ------------------------------------------------------------------
 
     def _patch_generate_plan(result: Mapping[str, Any], current_memory: Mapping[str, Any]) -> dict[str, Any]:
@@ -847,34 +932,133 @@ def register_lifecycle_v03(
     registry.register(
         agent_ref,
         "generate_plan",
-        CompositeLLMEngineExecutor(
-            ref="composite:generate_plan",
-            llm_executor=LLMContentExecutor(
-                ref="llm:generate_plan",
-                system_prompt=_load_prompt("generate_plan"),
-                user_prompt_template=(
-                    "Author an implementation plan for the task below.\n\n"
-                    "Task id: {taskId}\n"
-                    "Title: {taskTitle}\n"
-                    "Complexity: {complexity}\n"
-                    "Depends on: {dependsOn}\n\n"
-                    "Description:\n{taskDescription}\n\n"
-                    "Acceptance criteria:\n{acceptanceCriteria}\n\n"
-                    "Files hint:\n{filesHint}\n"
-                    "{rejectionFeedback}"
-                ),
-                result_schema=GeneratePlanResult,
-                llm_provider=llm_provider,
-                prompt_context_loader=_load_current_task_body,
+        LLMContentExecutor(
+            ref="llm:generate_plan",
+            system_prompt=_load_prompt("generate_plan"),
+            user_prompt_template=(
+                "Author an implementation plan for the task below.\n\n"
+                "Task id: {taskId}\n"
+                "Title: {taskTitle}\n"
+                "Complexity: {complexity}\n"
+                "Depends on: {dependsOn}\n\n"
+                "Description:\n{taskDescription}\n\n"
+                "Acceptance criteria:\n{acceptanceCriteria}\n\n"
+                "Files hint:\n{filesHint}\n"
+                "{rejectionFeedback}"
             ),
-            transition_key="task.T6",
-            to_status="plan_review",
-            lifecycle_client=lifecycle_client,
-            session_factory=session_factory,
+            result_schema=GeneratePlanResult,
+            llm_provider=llm_provider,
             memory_patch_builder=_patch_generate_plan,
-            actor=actor,
-            target_id_resolver=_resolve_current_task_engine_id,
+            prompt_context_loader=_load_current_task_body,
+            session_factory=session_factory,
         ),
+    )
+
+    # Platform auto-upgrade for generate_plan (same rule as generate_tasks).
+    from app.config import get_settings as _get_settings_gp
+    _gp_settings = _get_settings_gp()
+    if _gp_settings.agent_platform_url is not None:
+        from app.modules.ai.executors.platform import (
+            AgentPlatformExecutor,
+            register_platform_transformer,
+        )
+        import httpx as _httpx
+
+        _gp_platform_base = str(_gp_settings.agent_platform_url or "").rstrip("/")  # type: ignore[union-attr]
+        _gp_callback_base = str(_gp_settings.public_base_url or "").rstrip("/")
+
+        async def _build_generate_plan_platform_input(ctx: DispatchContext) -> dict[str, Any]:
+            bindings = await _load_current_task_body(ctx)
+            try:
+                cs = read_code_source(ctx)
+                code_source: dict[str, Any] = {"repo": cs.repo, "baseBranch": cs.base_branch}
+                if cs.work_branch:
+                    code_source["workBranch"] = cs.work_branch
+            except ValueError:
+                code_source = {"repo": "", "baseBranch": "main"}
+            ac_raw = str(bindings.get("acceptanceCriteria") or "")
+            ac_list = [line.lstrip("- ").strip() for line in ac_raw.splitlines() if line.strip()]
+            return {
+                "task": {
+                    "title": str(bindings.get("taskTitle") or ""),
+                    "description": str(bindings.get("taskDescription") or ""),
+                    "acceptanceCriteria": ac_list,
+                    "complexity": str(bindings.get("complexity") or "medium"),
+                    "dependencies": [d.strip() for d in str(bindings.get("dependsOn") or "").split(",") if d.strip() and d.strip() != "(none)"],
+                    "fileHints": [f.strip().strip("`") for f in str(bindings.get("filesHint") or "").splitlines() if f.strip() and f.strip() not in ("(none)", "-")],
+                },
+                "codeSource": code_source,
+            }
+
+        def _transform_generate_plan(
+            raw: dict[str, Any], current_memory: dict[str, Any]
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            # Convert structured plan result → plan_markdown string.
+            overview = str(raw.get("overview") or "")
+            steps = list(raw.get("implementationSteps") or [])
+            files = list(raw.get("filesAffected") or [])
+            risks = list(raw.get("edgeCasesAndRisks") or [])
+            verification = list(raw.get("acceptanceVerification") or [])
+
+            lines: list[str] = [f"## Overview\n\n{overview}"]
+            if steps:
+                lines.append("\n## Implementation Steps\n")
+                for s in steps:
+                    lines.append(f"### {s.get('title', '')}\n**File:** `{s.get('filePath', '')}` ({s.get('action', '')})\n\n{s.get('description', '')}")
+            if files:
+                lines.append("\n## Files Affected\n")
+                for f in files:
+                    lines.append(f"- `{f.get('filePath', '')}` ({f.get('action', '')}) — {f.get('summary', '')}")
+            if risks:
+                lines.append("\n## Edge Cases & Risks\n")
+                for r in risks:
+                    lines.append(f"- {r}")
+            if verification:
+                lines.append("\n## Acceptance Verification\n")
+                for v in verification:
+                    lines.append(f"- **{v.get('criterion', '')}**: {v.get('howToVerify', '')}")
+
+            lm = read_lifecycle_memory(current_memory)
+            task = find_current_task(lm)
+            task_id = task.id if task is not None else ""
+            transformed = {"task_id": task_id, "plan_markdown": "\n\n".join(lines)}
+            return transformed, _patch_generate_plan(transformed, current_memory)
+
+        _gp_executor_id = f"platform:generate_plan:{agent_ref}"
+        register_platform_transformer(_gp_executor_id, _transform_generate_plan)
+        registry.register(
+            agent_ref,
+            "generate_plan",
+            AgentPlatformExecutor(
+                ref=_gp_executor_id,
+                capability="plan-generation",
+                platform_url=_gp_platform_base,
+                callback_url=f"{_gp_callback_base}/hooks/platform/{_gp_executor_id}",
+                input_builder=_build_generate_plan_platform_input,
+                client=_httpx.AsyncClient(),
+            ),
+        )
+        logger.info(
+            "register_lifecycle_v03: agent_ref=%s generate_plan → platform capability=plan-generation",
+            agent_ref,
+        )
+
+    # ------------------------------------------------------------------
+    # advance_plan — T6: planning → plan_review (current task).
+    # Separated from generate_plan so the LLM authoring step (local or
+    # platform) and the engine transition are independent units.
+    # ------------------------------------------------------------------
+
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "advance_plan",
+        transition_key="task.T6",
+        to_status="plan_review",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+        target_id_resolver=_resolve_current_task_engine_id,
     )
 
     # ------------------------------------------------------------------
@@ -1071,6 +1255,81 @@ def register_lifecycle_v03(
             "register_lifecycle_v03: reviewer binding=%s (LIFECYCLE_REVIEWER)",
             reviewer_choice,
         )
+
+        # Platform auto-upgrade: when AGENT_PLATFORM_URL is set and the
+        # reviewer is the in-process LLM, swap it for the review-code
+        # platform capability — same rule as generate_tasks.
+        if reviewer_choice == "llm-content":
+            from app.config import get_settings as _get_settings_rv
+            _rv_settings = _get_settings_rv()
+            if _rv_settings.agent_platform_url is not None:
+                from app.modules.ai.executors.platform import (
+                    AgentPlatformExecutor,
+                    register_platform_transformer,
+                )
+                import httpx as _httpx
+
+                _rv_platform_base = str(_rv_settings.agent_platform_url or "").rstrip("/")  # type: ignore[union-attr]
+                _rv_callback_base = str(_rv_settings.public_base_url or "").rstrip("/")
+
+                async def _build_review_platform_input(ctx: DispatchContext) -> dict[str, Any]:
+                    from sqlalchemy import select as _select
+                    from app.modules.ai.models import RunMemory as _RunMemoryModel
+
+                    async with session_factory() as _session:
+                        _mem = await _session.scalar(
+                            _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+                        )
+                    _mem_data: dict[str, Any] = (_mem.data if _mem is not None else {}) or {}
+                    _lifecycle_mem = read_lifecycle_memory(_mem_data)
+                    _task = find_current_task(_lifecycle_mem)
+                    _impl_refs = cast(Mapping[str, Any], _mem_data.get("implementation_refs") or {})
+                    _task_id = _task.id if _task is not None else ""
+                    _impl_ref = cast(Mapping[str, Any], _impl_refs.get(_task_id) or {})
+                    _description = _task.description or "" if _task is not None else ""
+                    _criteria: list[str] = list(_task.acceptance_criteria) if _task is not None else []
+                    return {
+                        "implementationRef": {
+                            "prUrl": str(_impl_ref.get("prUrl") or ""),
+                            "commitSha": str(_impl_ref.get("commitSha") or ""),
+                        },
+                        "task": {"description": _description, "acceptanceCriteria": _criteria},
+                    }
+
+                def _transform_review_result(
+                    raw: dict[str, Any], current_memory: dict[str, Any]
+                ) -> tuple[dict[str, Any], dict[str, Any]]:
+                    recommendation = str(raw.get("overallRecommendation") or "comment")
+                    summary = str(raw.get("summary") or "")
+                    failed = [c for c in list(raw.get("criteria") or []) if not c.get("passed", True)]
+                    verdict = "pass" if recommendation in ("approve", "comment") else "fail"
+                    if failed:
+                        failed_txt = "\n".join(
+                            f"- {c['criterion']}: {c.get('explanation', '')}" for c in failed
+                        )
+                        feedback = f"{summary}\n\nFailed criteria:\n{failed_txt}"
+                    else:
+                        feedback = summary
+                    _lm = read_lifecycle_memory(current_memory)
+                    _t = find_current_task(_lm)
+                    transformed = {"task_id": _t.id if _t else "", "verdict": verdict, "feedback": feedback}
+                    return transformed, _patch_review(transformed, current_memory)
+
+                _rv_executor_id = f"platform:review_implementation:{agent_ref}"
+                register_platform_transformer(_rv_executor_id, _transform_review_result)
+                reviewer_executor = AgentPlatformExecutor(
+                    ref=_rv_executor_id,
+                    capability="review-code",
+                    platform_url=_rv_platform_base,
+                    callback_url=f"{_rv_callback_base}/hooks/platform/{_rv_executor_id}",
+                    input_builder=_build_review_platform_input,
+                    client=_httpx.AsyncClient(),
+                )
+                logger.info(
+                    "register_lifecycle_v03: agent_ref=%s review_implementation → platform capability=review-code",
+                    agent_ref,
+                )
+
         registry.register(agent_ref, "review_implementation", reviewer_executor)
     else:
         logger.info(

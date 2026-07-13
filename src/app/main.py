@@ -16,6 +16,7 @@ from app.modules.ai.router import (
     executor_hooks_router,
     github_hooks_router,
     hooks_router,
+    platform_hooks_router,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def create_app() -> FastAPI:
     application.include_router(api_router)
     application.include_router(hooks_router)
     application.include_router(executor_hooks_router)
+    application.include_router(platform_hooks_router)
     application.include_router(github_hooks_router)
 
     # -- Middleware ---------------------------------------------------------

@@ -121,8 +121,20 @@ nodes:
 
   - name: generate_plan
     description: >
-      Author an implementation plan for the current task (LLM-content)
-      and fire T6 (planning → plan_review).
+      Author an implementation plan for the current task (LLM-content or
+      platform plan-generation capability). Writes the plan to RunMemory.
+      The sibling `advance_plan` node fires T6.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: advance_plan
+    description: >
+      Fire T6 (planning → plan_review) on the current task. Separated from
+      `generate_plan` so the LLM authoring step and the engine transition
+      are independent executor bindings.
     inputSchema:
       type: object
       properties:
@@ -264,7 +276,8 @@ flow:
         rule: checkpoint_approved
         "true": generate_plan
         "false": generate_mockup
-    generate_plan:
+    generate_plan: [advance_plan]
+    advance_plan:
       branch:
         rule: checkpoint_rejections_under_bound
         "true": confirm_plan

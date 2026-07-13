@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # intentionally not in the literal yet to avoid premature contract freeze.
     lifecycle_reviewer: Literal["llm-content", "stub-pass"] = "llm-content"
 
+    # -- Agent platform (carestechs-agent-platform) -----------------------
+    # When set, generate_tasks / generate_plan / review_implementation are
+    # routed to the platform via AgentPlatformExecutor instead of in-process
+    # LLMContentExecutor.  Set to the platform's base URL, e.g.:
+    #   AGENT_PLATFORM_URL=http://agent-platform-api:8000   (umbrella)
+    #   AGENT_PLATFORM_URL=http://localhost:8001             (local dev)
+    # Leave unset to keep the default in-process LLM path.
+    agent_platform_url: AnyHttpUrl | None = None
+
     # -- Deterministic lifecycle flow (FEAT-006) --------------------------
     # When True (v1 default) the impl-review approver collapses to `admin`;
     # when False a `dev` other than the implementer is expected.

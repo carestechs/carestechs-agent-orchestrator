@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Annotated, Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -926,6 +929,117 @@ async def receive_executor_webhook(
                 "status": 409,
                 "detail": "dispatch already terminal with a different outcome",
             },
+            media_type="application/problem+json",
+        )
+    meta: dict[str, Any] = {"eventId": str(event_id)}
+    if status_str == "already_received":
+        meta["alreadyReceived"] = True
+    return JSONResponse(status_code=200, content={"data": {"received": True}, "meta": meta})
+
+
+# ---------------------------------------------------------------------------
+# Agent-platform callback webhook
+# ---------------------------------------------------------------------------
+
+platform_hooks_router = APIRouter(prefix="/hooks/platform")
+
+
+@platform_hooks_router.post("/{executor_id}", status_code=200)
+async def receive_platform_callback(
+    executor_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db_session)],
+    supervisor: Annotated[RunSupervisor, Depends(get_supervisor)],
+) -> JSONResponse:
+    """Ingest an agent-platform job completion callback.
+
+    The platform POSTs ``{ dispatchId, outcome: "success"|"failure",
+    result?, error? }`` when a job reaches a terminal state.  This
+    handler normalises the platform's outcome vocabulary to the
+    orchestrator's ``"ok"``/``"error"`` convention, optionally applies
+    a registered result transformer + memory patch, then delegates to
+    the standard ``handle_executor_webhook`` pipeline.
+
+    No HMAC verification — the platform runs on the same DevTools umbrella
+    network.  Add a shared secret once the platform grows a signing header.
+    """
+    import json as _json
+
+    raw: bytes = request.state.raw_body
+    try:
+        body: dict[str, Any] = _json.loads(raw)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "https://orchestrator.local/problems/validation-error",
+                     "title": "Validation error", "status": 400,
+                     "detail": "invalid JSON body"},
+            media_type="application/problem+json",
+        )
+
+    # Normalise platform outcome → orchestrator outcome.
+    raw_outcome = body.get("outcome")
+    if raw_outcome == "success":
+        body = {**body, "outcome": "ok"}
+    elif raw_outcome == "failure":
+        body = {**body, "outcome": "error"}
+
+    # Apply registered result transformer + memory patch if present.
+    from app.modules.ai.executors.platform import get_platform_transformer
+
+    transformer = get_platform_transformer(executor_id)
+    if transformer is not None and body.get("outcome") == "ok":
+        raw_result: dict[str, Any] = body.get("result") or {}
+        # Load current RunMemory for this dispatch's run.
+        from sqlalchemy import select as _select
+        from app.modules.ai.models import Dispatch as _Dispatch, RunMemory as _RunMemory
+
+        try:
+            dispatch_id_raw = body.get("dispatchId") or body.get("dispatch_id")
+            dispatch_uuid = uuid.UUID(str(dispatch_id_raw))
+            dispatch_row = await db.scalar(
+                _select(_Dispatch).where(_Dispatch.dispatch_id == dispatch_uuid)
+            )
+            current_memory: dict[str, Any] = {}
+            if dispatch_row is not None:
+                mem_row = await db.scalar(
+                    _select(_RunMemory).where(_RunMemory.run_id == dispatch_row.run_id)
+                )
+                current_memory = (mem_row.data if mem_row is not None else {}) or {}
+            transformed_result, memory_patch = transformer(raw_result, current_memory)
+            if memory_patch:
+                transformed_result = {**transformed_result, "__memory_patch": memory_patch}
+            body = {**body, "result": transformed_result}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "platform_hook: transformer failed executor_id=%s exc=%r — "
+                "forwarding raw result without patch",
+                executor_id, exc,
+            )
+
+    event_id, status_str = await service.handle_executor_webhook(
+        executor_id=executor_id,
+        body=body,
+        raw_body=raw,
+        signature_ok=True,  # internal umbrella — no HMAC
+        db=db,
+        supervisor=supervisor,
+    )
+
+    if status_str == "unknown_dispatch":
+        return JSONResponse(
+            status_code=404,
+            content={"type": "https://orchestrator.local/problems/not-found",
+                     "title": "Unknown dispatch", "status": 404,
+                     "detail": "no dispatch matches the supplied dispatchId"},
+            media_type="application/problem+json",
+        )
+    if status_str == "conflict":
+        return JSONResponse(
+            status_code=409,
+            content={"type": "https://orchestrator.local/problems/conflict",
+                     "title": "Conflicting outcome", "status": 409,
+                     "detail": "dispatch already terminal with a different outcome"},
             media_type="application/problem+json",
         )
     meta: dict[str, Any] = {"eventId": str(event_id)}

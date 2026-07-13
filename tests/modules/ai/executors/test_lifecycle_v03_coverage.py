@@ -23,7 +23,6 @@ from app.modules.ai.executors.bootstrap import (
     register_lifecycle_v03,
     run_coverage_validation,
 )
-from app.modules.ai.executors.composite import CompositeLLMEngineExecutor
 from app.modules.ai.executors.engine import EngineExecutor
 from app.modules.ai.executors.engine_create import EngineCreateExecutor
 from app.modules.ai.executors.human import HumanExecutor
@@ -119,7 +118,8 @@ class TestCoverageWiredV03:
             "generate_tasks": LLMContentExecutor,
             "propose_tasks": ProposeTasksExecutor,
             "assign_task": EngineExecutor,
-            "generate_plan": CompositeLLMEngineExecutor,
+            "generate_plan": LLMContentExecutor,
+            "advance_plan": EngineExecutor,
             "approve_plan": EngineExecutor,
             "request_implementation": HumanExecutor,
             "submit_implementation": SubmitImplementationExecutor,
@@ -209,6 +209,7 @@ class TestCoverageWithoutV03Wiring:
             "propose_tasks",
             "assign_task",
             "generate_plan",
+            "advance_plan",
             "approve_plan",
             "request_implementation",
             "submit_implementation",
