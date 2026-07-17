@@ -244,17 +244,21 @@ def make_commit_brief_handler(
         path = f"docs/work-items/{wi.id}-{_slug(wi.title)}.md"
         message = f"docs({wi.id}): brief"
 
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            client = _make_client(pat, branch, http_client)
-            sha = await client.put_file(
-                owner=owner, repo=repo, path=path, content=content, message=message
-            )
-            await _append_event_log(
-                client, owner, repo,
-                run_id=str(ctx.run_id), agent_ref=agent_ref,
-                event="artifact_committed", step="commit_brief",
-                work_item_id=wi.id, task_id=None, detail=f"{path}@{sha[:7]}",
-            )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                client = _make_client(pat, branch, http_client)
+                sha = await client.put_file(
+                    owner=owner, repo=repo, path=path, content=content, message=message
+                )
+                await _append_event_log(
+                    client, owner, repo,
+                    run_id=str(ctx.run_id), agent_ref=agent_ref,
+                    event="artifact_committed", step="commit_brief",
+                    work_item_id=wi.id, task_id=None, detail=f"{path}@{sha[:7]}",
+                )
+        except ProviderError as exc:
+            logger.warning("commit_brief skipped due to GitHub API error: %s", exc)
+            return {"skipped": True, "reason": str(exc)}
         return {"commitSha": sha, "path": path}
 
     return _handler
@@ -283,17 +287,21 @@ def make_commit_tasks_handler(
         path = f"tasks/{wi_id}-tasks.md"
         message = f"tasks({wi_id}): generate task list"
 
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            client = _make_client(pat, branch, http_client)
-            sha = await client.put_file(
-                owner=owner, repo=repo, path=path, content=content, message=message
-            )
-            await _append_event_log(
-                client, owner, repo,
-                run_id=str(ctx.run_id), agent_ref=agent_ref,
-                event="artifact_committed", step="commit_tasks",
-                work_item_id=wi_id, task_id=None, detail=f"{path}@{sha[:7]}",
-            )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                client = _make_client(pat, branch, http_client)
+                sha = await client.put_file(
+                    owner=owner, repo=repo, path=path, content=content, message=message
+                )
+                await _append_event_log(
+                    client, owner, repo,
+                    run_id=str(ctx.run_id), agent_ref=agent_ref,
+                    event="artifact_committed", step="commit_tasks",
+                    work_item_id=wi_id, task_id=None, detail=f"{path}@{sha[:7]}",
+                )
+        except ProviderError as exc:
+            logger.warning("commit_tasks skipped due to GitHub API error: %s", exc)
+            return {"skipped": True, "reason": str(exc)}
         return {"commitSha": sha, "path": path}
 
     return _handler
@@ -326,18 +334,22 @@ def make_commit_plan_handler(
         path = f"plans/plan-{task.id}-{_slug(task.title)}.md"
         message = f"plan({task.id}): implementation plan"
 
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            client = _make_client(pat, branch, http_client)
-            sha = await client.put_file(
-                owner=owner, repo=repo, path=path, content=content, message=message
-            )
-            wi_id = memory.work_item.id if memory.work_item else None
-            await _append_event_log(
-                client, owner, repo,
-                run_id=str(ctx.run_id), agent_ref=agent_ref,
-                event="artifact_committed", step="commit_plan",
-                work_item_id=wi_id, task_id=task.id, detail=f"{path}@{sha[:7]}",
-            )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                client = _make_client(pat, branch, http_client)
+                sha = await client.put_file(
+                    owner=owner, repo=repo, path=path, content=content, message=message
+                )
+                wi_id = memory.work_item.id if memory.work_item else None
+                await _append_event_log(
+                    client, owner, repo,
+                    run_id=str(ctx.run_id), agent_ref=agent_ref,
+                    event="artifact_committed", step="commit_plan",
+                    work_item_id=wi_id, task_id=task.id, detail=f"{path}@{sha[:7]}",
+                )
+        except ProviderError as exc:
+            logger.warning("commit_plan skipped due to GitHub API error: %s", exc)
+            return {"skipped": True, "reason": str(exc)}
         return {"commitSha": sha, "path": path}
 
     return _handler
@@ -371,18 +383,22 @@ def make_commit_review_handler(
         path = f"tasks/{task.id}-implementation-review.md"
         message = f"review({task.id}): implementation {verdict}"
 
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            client = _make_client(pat, branch, http_client)
-            sha = await client.put_file(
-                owner=owner, repo=repo, path=path, content=content, message=message
-            )
-            wi_id = memory.work_item.id if memory.work_item else None
-            await _append_event_log(
-                client, owner, repo,
-                run_id=str(ctx.run_id), agent_ref=agent_ref,
-                event="artifact_committed", step="commit_review",
-                work_item_id=wi_id, task_id=task.id, detail=f"{path}@{sha[:7]}",
-            )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                client = _make_client(pat, branch, http_client)
+                sha = await client.put_file(
+                    owner=owner, repo=repo, path=path, content=content, message=message
+                )
+                wi_id = memory.work_item.id if memory.work_item else None
+                await _append_event_log(
+                    client, owner, repo,
+                    run_id=str(ctx.run_id), agent_ref=agent_ref,
+                    event="artifact_committed", step="commit_review",
+                    work_item_id=wi_id, task_id=task.id, detail=f"{path}@{sha[:7]}",
+                )
+        except ProviderError as exc:
+            logger.warning("commit_review skipped due to GitHub API error: %s", exc)
+            return {"skipped": True, "reason": str(exc)}
         return {"commitSha": sha, "path": path, "verdict": verdict}
 
     return _handler
