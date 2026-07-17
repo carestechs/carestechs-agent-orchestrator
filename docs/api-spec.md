@@ -313,23 +313,43 @@ The endpoint accepts four additional signal `name` values when the run's `agentR
 
 Source of truth: `src/app/modules/ai/executors/lifecycle_manual_patches.py` (Pydantic schemas + memory-patch builders).
 
-**`brief-confirmed`** — resume from `confirm_brief` after the operator reviews the LLM-derived work-item brief. `taskId` is omitted or empty.
+**`brief-confirmed`** — resume from `confirm_brief` after the operator reviews the LLM-derived work-item brief (`@0.4.0-manual`, `@0.5.0-manual`) or authors it from scratch (`@0.6.0-human`). `taskId` is omitted or empty.
 
 | Field | Required | Type | Notes |
 |-------|----------|------|-------|
-| `payload.workItem.title` | no | string | Replaces the LLM-derived title. |
+| `payload.workItem.title` | no | string | Replaces the LLM-derived title (merge mode) or the canonical title (`@0.6.0-human`). |
 | `payload.workItem.type` | no | string | One of `FEAT`, `BUG`, `IMP`. |
+| `payload.workItem.summary` | no | string | Full brief summary. Merged on top of any existing value. |
+| `payload.workItem.acceptanceCriteria` | no | string[] | Replaces the acceptance criteria list when provided. |
+
+**`@0.6.0-human` mode:** no `load_work_item` step runs, so `RunMemory` has no work item when `confirm_brief` fires. In this mode `workItem.id`, `workItem.title`, and `workItem.type` are **required** in the payload (returns 500 → run fails with `stop_reason=error` if absent). `summary` and `acceptanceCriteria` are optional but recommended so downstream nodes (plan, review) have material to work with.
 
 ```json
-// Approve without edits
+// Approve without edits (prior variants — LLM brief accepted as-is)
 { "name": "brief-confirmed", "payload": {} }
 
-// Correct title and type
+// Correct title and type (prior variants)
 { "name": "brief-confirmed",
   "payload": { "workItem": { "title": "Corrected", "type": "BUG" } } }
+
+// Full authoring (@0.6.0-human — required fields + optional detail)
+{ "name": "brief-confirmed",
+  "payload": {
+    "workItem": {
+      "id": "FEAT-101",
+      "title": "Add user authentication",
+      "type": "FEAT",
+      "summary": "Implement JWT-based login and refresh token flow.",
+      "acceptanceCriteria": [
+        "Login endpoint returns a signed JWT.",
+        "Refresh token rotates on every use."
+      ]
+    }
+  }
+}
 ```
 
-**`tasks-confirmed`** — resume from `confirm_tasks` after the operator reviews the LLM-generated task list. `taskId` is omitted or empty. When `payload.tasks` is provided, it replaces `LifecycleMemory.tasks` wholesale; `propose_tasks` then fans out to the engine for the replacement list.
+**`tasks-confirmed`** — resume from `confirm_tasks` after the operator reviews the LLM-generated task list. `taskId` is omitted or empty. When `payload.tasks` is provided, it replaces `LifecycleMemory.tasks` wholesale; `propose_tasks` then fans out to the engine for the replacement list. In `@0.6.0-human`, this checkpoint immediately routes to `confirm_task_review` (the independent review gate introduced in FEAT-019) before fan-out.
 
 | Field | Required | Type | Notes |
 |-------|----------|------|-------|
@@ -339,6 +359,42 @@ Source of truth: `src/app/modules/ai/executors/lifecycle_manual_patches.py` (Pyd
 | `payload.tasks[].summary` | no | string | Optional. Becomes `description` for operator-introduced tasks. |
 | `payload.tasks[].description` | no | string | Optional. Carries over from existing entry by id match. |
 | `payload.tasks[].complexity` | no | string | `small`/`medium`/`large`. Carries over by id match. |
+| `payload.tasks[].kind` | no | string | `feature`/`mockup`/`bug`/`chore`. Gates the `current_task_is_mockup` branch at `assign_task` — `"mockup"` tasks route to `confirm_mockup` before planning. Defaults to `"feature"` when absent. |
+| `payload.tasks[].workflow` | no | string | **FEAT-019.** `standard`/`mockup-first`/`investigation-first`. Auto-derived when absent (`kind=mockup` → `mockup-first`, otherwise `standard`). |
+| `payload.tasks[].dependencies` | no | string[] | **FEAT-019.** Sibling task IDs this task depends on (e.g. `["T-001"]`). Stored in `LifecycleTask.depends_on`. |
+| `payload.tasks[].filesToModify` | no | string[] | **FEAT-019.** Hint list of files expected to be modified. Stored in `LifecycleTask.files_hint`. |
+
+**`tasks-reviewed`** — **`@0.6.0-human` only (FEAT-019).** Resume from `confirm_task_review`, the independent review gate between `confirm_tasks` and `propose_tasks`. A reviewer (may be the same operator in single-person setups) inspects the task list for completeness, correct kinds/complexities, and acceptance-criteria coverage. `approve` routes to `propose_tasks`; `revise` loops back to `confirm_tasks`.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.verdict` | no | string | `"approve"` (default) or `"revise"`. |
+| `payload.feedback` | no | string | On revise: persisted to `RunMemory.data["rejections"]["confirm_task_review"]`; surfaced on the next `confirm_tasks` intake. |
+
+```json
+// Approve — proceed to propose_tasks
+{ "name": "tasks-reviewed", "payload": { "verdict": "approve" } }
+
+// Revise — loop back to confirm_tasks with feedback
+{ "name": "tasks-reviewed",
+  "payload": { "verdict": "revise", "feedback": "T-002 missing AC; T-003 complexity should be large." } }
+```
+
+**`docs-update-confirmed`** — **`@0.6.0-human` only (FEAT-019).** Resume from `confirm_docs_update`, the gate between the last `mark_task_done` (all tasks done) and `close_work_item`. The operator confirms that all artefact files (brief, task list, plans) are committed to the project repo and docs are in sync. `approve` routes to `close_work_item`; `revise` holds for re-check.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.verdict` | no | string | `"approve"` (default) or `"revise"`. |
+| `payload.feedback` | no | string | On revise: persisted to `RunMemory.data["rejections"]["confirm_docs_update"]`; surfaced on re-dispatch. |
+
+```json
+// Approve — proceed to close_work_item
+{ "name": "docs-update-confirmed", "payload": { "verdict": "approve" } }
+
+// Revise — hold at confirm_docs_update
+{ "name": "docs-update-confirmed",
+  "payload": { "verdict": "revise", "feedback": "Missing plan file for T-002." } }
+```
 
 ```json
 { "name": "tasks-confirmed",
@@ -371,6 +427,28 @@ Source of truth: `src/app/modules/ai/executors/lifecycle_manual_patches.py` (Pyd
 ```json
 { "name": "plan-confirmed", "taskId": "T-001",
   "payload": { "plan": "# Updated plan\n\n1. Step one ...\n" } }
+```
+
+**`mockup-approved`** — resume from `confirm_mockup` for tasks with `kind="mockup"`. Only reached when `assign_task` branches `current_task_is_mockup=true`. `taskId` is required and must match `LifecycleMemory.current_task_id`.
+
+| Field | Required | Type | Notes |
+|-------|----------|------|-------|
+| `payload.verdict` | no | string | `"approve"` (default) or `"reject"`. |
+| `payload.feedback` | no | string | On reject: persisted to `RunMemory.data["rejections"]["confirm_mockup"]`; the next iteration can surface it. |
+| `payload.mockupHtml` | no | string | **`@0.6.0-human` only.** Full HTML content of the operator-generated mockup. On approve: written to `RunMemory.data["mockups"][taskId].mockup_html`. Ignored on reject and in prior variants. |
+
+```json
+// Approve (prior variants — LLM generated the HTML in generate_mockup)
+{ "name": "mockup-approved", "taskId": "T-001",
+  "payload": { "verdict": "approve" } }
+
+// Approve with HTML (@0.6.0-human — operator supplies the mockup)
+{ "name": "mockup-approved", "taskId": "T-001",
+  "payload": { "verdict": "approve", "mockupHtml": "<!DOCTYPE html>..." } }
+
+// Reject with feedback
+{ "name": "mockup-approved", "taskId": "T-001",
+  "payload": { "verdict": "reject", "feedback": "Needs dark mode." } }
 ```
 
 **`review-completed`** — resume from `human_review_implementation` after the operator reviews the submitted implementation. `taskId` is required. `pass` routes to `approve_review` (T10 → done); `fail` routes to `correct_implementation`, which loops back to `request_implementation` if the correction budget allows.
@@ -1049,6 +1127,8 @@ Agent definitions are files on disk in v1 — this endpoint reads them, it does 
 
 ## Changelog
 
+- 2026-07-17 — FEAT-019 (framework gap closure — `@0.6.0-human`) — Added two new checkpoint signals for `lifecycle-agent@0.6.0-human`: (1) `tasks-reviewed` — independent task-list review gate between `confirm_tasks` and `propose_tasks`; `verdict="approve"` advances to `propose_tasks`, `"revise"` loops back to `confirm_tasks` with optional feedback stored in `rejections["confirm_task_review"]`; (2) `docs-update-confirmed` — definition-of-done gate between `mark_task_done` (all tasks done) and `close_work_item`; `"approve"` closes the work item, `"revise"` loops with feedback. Extended `tasks-confirmed` payload: `tasks[].workflow` (`standard`/`mockup-first`/`investigation-first`), `tasks[].dependencies` (list of sibling task IDs), `tasks[].filesToModify` (list of file path hints). Both new signals require `@0.6.0-human`; prior variants are unchanged. No new HTTP endpoints; auth, idempotency, and 202-Accepted semantics unchanged.
+- 2026-07-13 — FEAT-018 (fully human-input lifecycle variant — `lifecycle-agent@0.6.0-human`) — New agent variant that makes zero LLM or platform calls; all artefacts (brief, task list, mockup, plan) are supplied by the operator via signal payloads. Signal contract changes: (1) `brief-confirmed` extended — `payload.workItem` now accepts `summary` (string) and `acceptanceCriteria` (string[]) on all manual variants; in `@0.6.0-human` mode (no prior `load_work_item` step) `workItem.id`, `workItem.title`, and `workItem.type` are required and the builder creates `LifecycleMemory.work_item` from scratch. (2) `tasks-confirmed` extended — `payload.tasks[].kind` accepted (`"feature"` | `"mockup"` | `"bug"` | `"chore"`); defaults to `"feature"` when absent; gates the `current_task_is_mockup` branch at `assign_task`. (3) `mockup-approved` extended — `payload.mockupHtml` accepted on `verdict="approve"` in `@0.6.0-human`; written to `RunMemory.data["mockups"][taskId].mockup_html`; ignored in prior variants. No new HTTP endpoints; no auth surface change; idempotency and 202-Accepted semantics unchanged.
 - 2026-07-11 — FEAT-017 (mockup task conditional flow) — `POST /api/v1/runs/{id}/signals` accepts a new `name` value `mockup-approved` when the run uses `agentRef=lifecycle-agent@0.5.0-manual` and the current task has `kind="mockup"`. Payload: `{ "verdict": "approve" | "reject", "feedback"?: string }`. Approve routes to `generate_plan`; reject persists feedback to `RunMemory.data["rejections"]["confirm_mockup"]` and loops back to `generate_mockup` (up to `LIFECYCLE_MAX_CHECKPOINT_REJECTIONS`). Idempotency, ordering, and 202-Accepted semantics are unchanged from FEAT-015. Non-mockup tasks never reach `confirm_mockup` — the `current_task_is_mockup` predicate gates the branch at `assign_task`.
 - 2026-07-01 — FEAT-016 (PR URL in implementation review context) — `POST /api/v1/runs/{id}/signals` with `name="implementation-complete"` now accepts an optional structured payload: `prUrl` (string), `commitSha` (string), `summary` (string). When any field is present, the orchestrator persists the values in `RunMemory.data["implementation_refs"][taskId]` and surfaces them as `nodeInputs.implementationRef` in the `human_review_implementation` checkpoint. Empty payload `{}` is backward-compatible and leaves `implementation_refs` unchanged. Payload is validated by the new `ImplementationCompletePayload` schema (`extra="forbid"`); unknown fields return 422. No new endpoints or DTO changes.
 - 2026-05-17 — IMP-005 (run-intake code source) — `POST /api/v1/runs` accepts a new `intake.codeSource` block: `{repo, baseBranch, workBranch?}`. `repo` matches GitHub `owner/name` (no URL prefix, no `.git`); branch names reject whitespace, control chars, leading `/`, and `..`. New `Settings.lifecycle_code_source_required` (env `LIFECYCLE_CODE_SOURCE_REQUIRED`, default `false`) gates presence enforcement: `false` logs a WARN (`intake-code-source-missing-deprecated`) and accepts; `true` returns 400 (`intake-validation-failed`). Shape errors always reject regardless of the flag. Persists verbatim to `Run.intake.codeSource` (no DB migration — existing JSONB column). Executors read via `read_code_source(ctx, memory=...)`; precedence is memory sidecar → intake → raise. Future producer executors write `workBranch` to `RunMemory.data["codeSource"]` only when intake omitted it (operator-supplied always wins). No new endpoints, no DTO changes outside the intake body, no auth surface change.

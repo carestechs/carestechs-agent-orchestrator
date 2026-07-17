@@ -1,0 +1,372 @@
+# lifecycle-agent@0.6.0-human — FEAT-018 + FEAT-019
+#
+# Fully human-input variant.  Every content-generating node from prior
+# variants (load_work_item, generate_tasks, generate_plan, generate_mockup)
+# is removed.  The orchestrator makes zero LLM or platform calls; all
+# artefacts (brief, task list, plan, mockup) are supplied by the operator
+# via signal payloads.
+#
+# Flow (compared with @0.5.0-manual):
+#   - start → confirm_brief  (no load_work_item preceding it)
+#   - confirm_tasks → confirm_task_review → propose_tasks  (FEAT-019: independent review gate)
+#   - assign_task → confirm_mockup | confirm_plan  (no generate_mockup)
+#   - confirm_plan → approve_plan  (no generate_plan / advance_plan)
+#   - mark_task_done (all done) → confirm_docs_update → close_work_item  (FEAT-019: docs gate)
+#
+# Extended signal payloads (FEAT-018):
+#   brief-confirmed    — workItem.{title, type, summary, acceptanceCriteria}
+#   tasks-confirmed    — tasks[].kind now accepted + workflow/dependencies/files_to_modify (FEAT-019)
+#   mockup-approved    — mockupHtml supplied by operator on approve
+#   tasks-reviewed     — verdict approve/revise for confirm_task_review  (FEAT-019)
+#   docs-update-confirmed — verdict approve/revise for confirm_docs_update  (FEAT-019)
+#
+# Bootstrap wiring: ``register_lifecycle_v06_human`` in
+# ``src/app/modules/ai/executors/bootstrap.py``.  Standalone function —
+# does not delegate to any prior variant helper.
+
+ref: lifecycle-agent@0.6.0-human
+version: "0.6.0-human"
+description: >
+  Fully human-input lifecycle variant. The operator supplies every
+  artefact (brief, task list, mockup, plan) via signal payloads —
+  typically by running an external tool such as Claude Code and pasting
+  the output into DevHub. The orchestrator handles only state transitions,
+  engine wiring, and memory. Zero LLM or platform calls from the
+  orchestrator side.
+
+nodes:
+  - name: start
+    description: >
+      Synthetic entry marker.
+    inputSchema:
+      type: object
+
+  - name: log_run_started
+    description: >
+      Write the ``started`` event to ``metrics/events.ndjson`` (FEAT-019,
+      Change 6).  No-op when ``GITHUB_PAT`` is absent.
+    inputSchema:
+      type: object
+
+  - name: confirm_brief
+    description: >
+      First human checkpoint. The operator is shown the raw work-item
+      content (from intake) and supplies the canonical brief via
+      ``brief-confirmed`` payload: title, type, and optionally summary
+      and acceptanceCriteria. On approve the brief is persisted to
+      RunMemory and the work item is registered with the engine (W1).
+      On reject the checkpoint loops with operator feedback.
+    inputSchema:
+      type: object
+
+  - name: register_work_item
+    description: >
+      Create the engine work item (W1) using the brief written by
+      confirm_brief.
+    inputSchema:
+      type: object
+
+  - name: commit_brief
+    description: >
+      Commit the work-item brief to the project repo via the GitHub Contents
+      API (FEAT-019, Change 4).  No-op when ``GITHUB_PAT`` is absent.
+    inputSchema:
+      type: object
+
+  - name: confirm_tasks
+    description: >
+      Pause for ``tasks-confirmed``. The operator supplies the full task
+      list (titles, complexities, kinds) in the payload. The list is
+      written to RunMemory wholesale; propose_tasks fans out to the engine.
+      On reject the checkpoint loops with feedback.
+    inputSchema:
+      type: object
+
+  - name: confirm_task_review
+    description: >
+      Independent review of the operator-authored task list (FEAT-019).
+      A reviewer (may be the same operator in single-person setups)
+      inspects the task list for completeness, correct kinds/complexities,
+      and AC coverage. Approve routes to commit_tasks. Revise loops back
+      to confirm_tasks.
+    inputSchema:
+      type: object
+
+  - name: commit_tasks
+    description: >
+      Commit the task list to the project repo via the GitHub Contents
+      API after the independent review passes (FEAT-019, Change 4).
+      No-op when ``GITHUB_PAT`` is absent.
+    inputSchema:
+      type: object
+
+  - name: propose_tasks
+    description: >
+      T1xN create_item + T2+T4 per task + W2 (synchronous fanout).
+    inputSchema:
+      type: object
+
+  - name: confirm_assignment
+    description: >
+      Pause for ``assignment-confirmed`` before T5 on the current task.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+
+  - name: assign_task
+    description: >
+      Advance the current task via T5 (assigning → planning).
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: confirm_mockup
+    description: >
+      Human checkpoint for tasks with kind="mockup". The operator
+      generates the HTML mockup externally (e.g. with Claude Code) and
+      supplies it via ``mockup-approved`` payload with
+      ``outcome="approve"`` and ``mockupHtml``. On reject the checkpoint
+      loops with feedback up to the rejection budget.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: confirm_plan
+    description: >
+      Pause for ``plan-confirmed``. The operator supplies the full
+      implementation plan markdown in the payload. On reject the
+      checkpoint loops with feedback.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: commit_plan
+    description: >
+      Commit the implementation plan to the project repo after the operator
+      approves it (FEAT-019, Change 4).  No-op when ``GITHUB_PAT`` is absent.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+
+  - name: approve_plan
+    description: >
+      Fire T6+T7 (planning → plan_review → implementing) on the current
+      task. Separated from confirm_plan so the human-input step and the
+      engine transitions are independent executor bindings.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: request_implementation
+    description: >
+      Pause for ``implementation-complete`` signal. The implementer
+      optionally supplies prUrl, commitSha, and summary in the payload
+      (FEAT-016).
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: submit_implementation
+    description: >
+      Idempotent T9 (implementing → impl_review) on the current task.
+    inputSchema:
+      type: object
+
+  - name: human_review_implementation
+    description: >
+      Pause for ``review-completed`` from a human reviewer. Pass routes
+      to approve_review (T10 → done); fail routes to
+      correct_implementation.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: commit_review
+    description: >
+      Commit the implementation review file to the project repo after the
+      reviewer approves (FEAT-019, Change 4).  No-op when ``GITHUB_PAT``
+      is absent.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+
+  - name: approve_review
+    description: >
+      Fire T10 (impl_review → done) on the current task.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: mark_task_done
+    description: >
+      Append the approved task id to completed_task_ids and advance
+      current_task_id to the next pending task.
+    inputSchema:
+      type: object
+
+  - name: correct_implementation
+    description: >
+      Record a rejection for the current task; loop or terminate on
+      correction budget.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: confirm_docs_update
+    description: >
+      Operator confirms that all artefact files (brief, task list, plans)
+      are committed to the project repo and docs are in sync (FEAT-019).
+      Approve routes to close_work_item. Revise holds here for re-check.
+    inputSchema:
+      type: object
+
+  - name: log_run_completed
+    description: >
+      Write the ``completed`` event to ``metrics/events.ndjson`` (FEAT-019,
+      Change 6).  No-op when ``GITHUB_PAT`` is absent.
+    inputSchema:
+      type: object
+
+  - name: close_work_item
+    description: >
+      Chain W4 + W6 to close the work item. Terminal node.
+    inputSchema:
+      type: object
+      properties:
+        workItemId: {type: string}
+      required: [workItemId]
+
+  - name: terminate_correction_budget
+    description: >
+      Terminal failure — correction budget exhausted.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: terminate_rejection_budget
+    description: >
+      Terminal failure — checkpoint rejection budget exhausted.
+    inputSchema:
+      type: object
+      properties: {}
+
+flow:
+  policy: deterministic
+  entryNode: start
+  transitions:
+    start: [log_run_started]
+    log_run_started: [confirm_brief]
+    confirm_brief:
+      branch:
+        rule: checkpoint_approved
+        "true": register_work_item
+        "false": confirm_brief
+    register_work_item: [commit_brief]
+    commit_brief: [confirm_tasks]
+    confirm_tasks:
+      branch:
+        rule: checkpoint_approved
+        "true": confirm_task_review
+        "false": confirm_tasks
+    confirm_task_review:
+      branch:
+        rule: checkpoint_approved
+        "true": commit_tasks
+        "false": confirm_tasks
+    commit_tasks: [propose_tasks]
+    propose_tasks: [confirm_assignment]
+    confirm_assignment: [assign_task]
+    assign_task:
+      branch:
+        rule: current_task_is_mockup
+        "true": confirm_mockup
+        "false": confirm_plan
+    confirm_mockup:
+      branch:
+        rule: checkpoint_approved
+        "true": confirm_plan
+        "false": confirm_mockup
+    confirm_plan:
+      branch:
+        rule: checkpoint_approved
+        "true": commit_plan
+        "false": confirm_plan
+    commit_plan: [approve_plan]
+    approve_plan: [request_implementation]
+    request_implementation: [submit_implementation]
+    submit_implementation: [human_review_implementation]
+    human_review_implementation:
+      branch:
+        rule: review_passed
+        "true": commit_review
+        "false": correct_implementation
+    commit_review: [approve_review]
+    approve_review: [mark_task_done]
+    mark_task_done:
+      branch:
+        rule: tasks_remaining
+        "true": confirm_assignment
+        "false": confirm_docs_update
+    confirm_docs_update:
+      branch:
+        rule: checkpoint_approved
+        "true": log_run_completed
+        "false": confirm_docs_update
+    log_run_completed: [close_work_item]
+    correct_implementation:
+      branch:
+        rule: correction_attempts_under_bound
+        "true": request_implementation
+        "false": terminate_correction_budget
+    close_work_item: []
+    terminate_correction_budget: []
+    terminate_rejection_budget: []
+
+intakeSchema:
+  type: object
+  properties:
+    workItem:
+      type: object
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [FEAT, BUG, IMP]}
+        content: {type: string}
+      required: [id, kind]
+    workItemPath: {type: string}
+    codeSource:
+      type: object
+      required: [repo, baseBranch]
+      additionalProperties: false
+      properties:
+        repo:        {type: string, pattern: "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"}
+        baseBranch:  {type: string, minLength: 1}
+        workBranch:  {type: string, minLength: 1}
+  anyOf:
+    - required: [workItem]
+    - required: [workItemPath]
+
+terminalNodes: [close_work_item, terminate_correction_budget, terminate_rejection_budget]
+
+defaultBudget:
+  maxSteps: 400

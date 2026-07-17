@@ -137,6 +137,13 @@ class Settings(BaseSettings):
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
 
+    # FEAT-019: artifact commit target branch.  When set, @0.6.0-human commit
+    # nodes push artefacts (brief, task list, plans, reviews) to this branch
+    # via the GitHub Contents API using the same ``github_pat`` credential.
+    # Must be a valid git ref (e.g. ``main``).  When absent the commit nodes
+    # are no-ops (a warning is logged and the step completes without writing).
+    github_artifact_branch: str | None = None
+
     # -- Flow-engine lifecycle surface (FEAT-006 rc2) ---------------------
     # Points at the same flow engine as ``engine_base_url``; separate field
     # because the lifecycle surface (workflows / items / transitions) is

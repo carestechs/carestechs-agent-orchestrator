@@ -406,8 +406,11 @@ class SignalCreateRequest(BaseModel):
         "implementation-complete",
         "brief-confirmed",
         "tasks-confirmed",
+        "tasks-reviewed",
         "assignment-confirmed",
+        "mockup-approved",
         "plan-confirmed",
+        "docs-update-confirmed",
         "review-completed",
     ]
     task_id: str = ""

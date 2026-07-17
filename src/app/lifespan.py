@@ -212,11 +212,16 @@ def _bootstrap_executor_registry(
             workflow_ids=workflow_ids,
         )
 
+    _settings = get_settings()
+    _pat = _settings.github_pat.get_secret_value() if _settings.github_pat else None
+    _branch = _settings.github_artifact_branch or "main"
     register_all_executors(
         registry,
         agents_dir,
         v03_collaborators=v03_collaborators,
         session_factory=session_factory,
+        github_pat=_pat,
+        github_artifact_branch=_branch,
     )
     try:
         run_coverage_validation(registry, agents_dir)

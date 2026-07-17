@@ -77,6 +77,8 @@ def register_all_executors(
     *,
     v03_collaborators: LifecycleV03Collaborators | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
+    github_pat: str | None = None,
+    github_artifact_branch: str = "main",
 ) -> None:
     """Register an executor for every node of every loaded agent.
 
@@ -118,6 +120,23 @@ def register_all_executors(
                     workflow_ids=v03_collaborators.workflow_ids,
                     actor=v03_collaborators.actor,
                     max_corrections=v03_collaborators.max_corrections,
+                )
+        elif agent.ref.startswith("lifecycle-agent@0.6"):
+            # FEAT-018: fully human-input variant.  Zero LLM/platform calls;
+            # all content-producing steps are replaced by human checkpoints.
+            if v03_collaborators is None:
+                _exempt_lifecycle_v06_human(agent.ref, [n.name for n in agent.nodes])
+            else:
+                register_lifecycle_v06_human(
+                    registry,
+                    agent.ref,
+                    lifecycle_client=v03_collaborators.lifecycle_client,
+                    session_factory=v03_collaborators.session_factory,
+                    workflow_ids=v03_collaborators.workflow_ids,
+                    actor=v03_collaborators.actor,
+                    max_corrections=v03_collaborators.max_corrections,
+                    github_pat=github_pat,
+                    github_artifact_branch=github_artifact_branch,
                 )
         elif agent.ref.startswith("lifecycle-agent@0.5"):
             # FEAT-017: mockup-conditional variant.  Reuses v0.3.0
@@ -1767,6 +1786,564 @@ def _exempt_lifecycle_v05_manual(agent_ref: str, node_names: list[str]) -> None:
         no_executor(agent_ref, node_name, reason)
 
 
+def register_lifecycle_v06_human(
+    registry: ExecutorRegistry,
+    agent_ref: str,
+    *,
+    lifecycle_client: FlowEngineLifecycleClient | None,
+    session_factory: async_sessionmaker[AsyncSession],
+    workflow_ids: Mapping[str, uuid.UUID],
+    max_corrections: int = 2,
+    actor: str | None = "lifecycle-agent",
+    github_pat: str | None = None,
+    github_artifact_branch: str = "main",
+) -> None:
+    """Register bindings for ``lifecycle-agent@0.6.0-human`` (FEAT-018).
+
+    Standalone function — does not delegate to any prior variant.  The
+    orchestrator makes zero LLM or platform calls; every content-producing
+    step (brief, tasks, mockup, plan) is supplied by the operator via
+    signal payloads at the corresponding human checkpoint.
+
+    Nodes registered directly here (covers the full @0.6.0-human YAML):
+
+    Engine side  — register_work_item (W1), propose_tasks (W2+T1xN),
+                   assign_task (T5), approve_plan (T6+T7 sequence),
+                   submit_implementation (T9), approve_review (T10),
+                   mark_task_done (local), correct_implementation (local),
+                   close_work_item (W4+W6 sequence),
+                   terminate_correction_budget (local).
+
+    Human side   — confirm_brief, confirm_tasks, confirm_task_review (FEAT-019),
+                   confirm_assignment, confirm_mockup, confirm_plan,
+                   request_implementation, human_review_implementation,
+                   confirm_docs_update (FEAT-019), terminate_rejection_budget.
+
+    Artifact     — log_run_started, commit_brief, commit_tasks, commit_plan,
+                   commit_review, log_run_completed (FEAT-019, Changes 4+6).
+                   All are no-ops when ``github_pat`` is None.
+
+    Synthetic    — start (no_executor).
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    from app.modules.ai.executors.engine_create import EngineCreateExecutor
+    from app.modules.ai.executors.human import HumanExecutor
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_assignment_confirmation,
+        apply_brief_correction,
+        apply_docs_update_verdict,
+        apply_implementation_signal,
+        apply_mockup_approval,
+        apply_plan_correction,
+        apply_review_verdict,
+        apply_task_review_verdict,
+        apply_tasks_correction,
+        intake_for_confirm_assignment,
+        intake_for_confirm_brief,
+        intake_for_confirm_docs_update,
+        intake_for_confirm_mockup,
+        intake_for_confirm_plan,
+        intake_for_confirm_task_review,
+        intake_for_confirm_tasks,
+        intake_for_human_review,
+        intake_for_request_implementation,
+    )
+    from app.modules.ai.executors.github_artifacts import (
+        make_commit_brief_handler,
+        make_commit_plan_handler,
+        make_commit_review_handler,
+        make_commit_tasks_handler,
+        make_log_run_completed_handler,
+        make_log_run_started_handler,
+    )
+    from app.modules.ai.executors.local import LocalExecutor
+    from app.modules.ai.executors.propose_tasks import ProposeTasksExecutor
+    from app.modules.ai.executors.sequence import SequenceEngineExecutor
+    from app.modules.ai.executors.submit_implementation import SubmitImplementationExecutor
+    from app.modules.ai.models import RunMemory as _RunMemoryModel
+    from app.modules.ai.tools.lifecycle.memory import (
+        find_current_task,
+        read_lifecycle_memory,
+        write_lifecycle_memory,
+    )
+
+    if lifecycle_client is None:
+        raise RuntimeError(
+            "register_lifecycle_v06_human: lifecycle_client is required "
+            "(engine-bound nodes need it)"
+        )
+    work_item_workflow_id = workflow_ids.get("work_item_workflow")
+    task_workflow_id = workflow_ids.get("task_workflow")
+    if work_item_workflow_id is None or task_workflow_id is None:
+        raise RuntimeError(
+            "register_lifecycle_v06_human: workflow_ids must contain "
+            "'work_item_workflow' and 'task_workflow' keys. "
+            "Ensure lifespan.ensure_workflows() ran before register_all_executors."
+        )
+
+    # ------------------------------------------------------------------
+    # Synthetic start — never dispatched.
+    # ------------------------------------------------------------------
+    no_executor(
+        agent_ref,
+        "start",
+        "synthetic entry marker; never dispatched (resolver-level only)",
+    )
+
+    # ------------------------------------------------------------------
+    # log_run_started — write the started event to metrics/events.ndjson.
+    # No-op when github_pat is absent.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "log_run_started",
+        LocalExecutor(
+            ref="local:log_run_started",
+            handler=make_log_run_started_handler(
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Shared target resolver: current task's engine_item_id from memory.
+    # ------------------------------------------------------------------
+    async def _resolve_task_engine_id(ctx: DispatchContext) -> _uuid.UUID | None:
+        async with session_factory() as _session:
+            mem = await _session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == ctx.run_id)
+            )
+        memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
+        task = find_current_task(memory)
+        if task is None or task.engine_item_id is None:
+            return None
+        try:
+            return _uuid.UUID(task.engine_item_id)
+        except ValueError:
+            return None
+
+    # ------------------------------------------------------------------
+    # confirm_brief — operator authors the brief (no prior load_work_item).
+    # intake_for_confirm_brief surfaces workItemSummary from memory
+    # (will be None on first fire; that's expected — the operator fills
+    # it in via the payload rather than reviewing an LLM draft).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_brief",
+        HumanExecutor(
+            ref="human:confirm_brief",
+            expected_signal_name="brief-confirmed",
+            memory_patch_builder=apply_brief_correction,
+            intake_builder=intake_for_confirm_brief,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # register_work_item — W1: create engine work item.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "register_work_item",
+        EngineCreateExecutor(
+            ref="engine:work_item.W1",
+            workflow_id=work_item_workflow_id,
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            opened_by=actor or "lifecycle-agent",
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # commit_brief — commit the brief to the project repo (FEAT-019 Ch4).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "commit_brief",
+        LocalExecutor(
+            ref="local:commit_brief",
+            handler=make_commit_brief_handler(
+                session_factory=session_factory,
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_tasks — operator supplies the full task list.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_tasks",
+        HumanExecutor(
+            ref="human:confirm_tasks",
+            expected_signal_name="tasks-confirmed",
+            memory_patch_builder=apply_tasks_correction,
+            intake_builder=intake_for_confirm_tasks,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_task_review — independent review of the task list (FEAT-019).
+    # On reject, stores feedback to rejections["confirm_task_review"] so
+    # the next confirm_tasks intake can surface it.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_task_review",
+        HumanExecutor(
+            ref="human:confirm_task_review",
+            expected_signal_name="tasks-reviewed",
+            memory_patch_builder=apply_task_review_verdict,
+            intake_builder=intake_for_confirm_task_review,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # commit_tasks — commit the task list after the review passes (FEAT-019 Ch4).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "commit_tasks",
+        LocalExecutor(
+            ref="local:commit_tasks",
+            handler=make_commit_tasks_handler(
+                session_factory=session_factory,
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # propose_tasks — W2 + T1xN create + T2+T4 per task (synchronous).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "propose_tasks",
+        ProposeTasksExecutor(
+            ref="local:propose_tasks",
+            task_workflow_id=task_workflow_id,
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_assignment — operator picks the assignee.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_assignment",
+        HumanExecutor(
+            ref="human:confirm_assignment",
+            expected_signal_name="assignment-confirmed",
+            memory_patch_builder=apply_assignment_confirmation,
+            intake_builder=intake_for_confirm_assignment,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # assign_task — T5: assigning → planning.
+    # ------------------------------------------------------------------
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "assign_task",
+        transition_key="task.T5",
+        to_status="planning",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+        target_id_resolver=_resolve_task_engine_id,
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_mockup — operator supplies the HTML mockup for kind=mockup
+    # tasks; reuses the same intake_builder as @0.5.0-manual (returns
+    # mockupHtml: "" when memory.mockups[task_id] is absent — the operator
+    # fills the field in the approve payload).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_mockup",
+        HumanExecutor(
+            ref="human:confirm_mockup",
+            expected_signal_name="mockup-approved",
+            memory_patch_builder=apply_mockup_approval,
+            intake_builder=intake_for_confirm_mockup,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_plan — operator supplies the implementation plan.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_plan",
+        HumanExecutor(
+            ref="human:confirm_plan",
+            expected_signal_name="plan-confirmed",
+            memory_patch_builder=apply_plan_correction,
+            intake_builder=intake_for_confirm_plan,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # commit_plan — commit the implementation plan after it's approved (FEAT-019 Ch4).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "commit_plan",
+        LocalExecutor(
+            ref="local:commit_plan",
+            handler=make_commit_plan_handler(
+                session_factory=session_factory,
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # approve_plan — T6 (planning → plan_review) then T7 (→ implementing).
+    # In prior variants T6 lived in advance_plan and T7 in approve_plan.
+    # @0.6.0-human has no advance_plan, so approve_plan chains both hops.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "approve_plan",
+        SequenceEngineExecutor(
+            ref="sequence:approve_plan",
+            hops=[("task.T6", "plan_review"), ("task.T7", "implementing")],
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+            target_id_resolver=_resolve_task_engine_id,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # request_implementation — pause for implementation-complete signal.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "request_implementation",
+        HumanExecutor(
+            ref="human:request_implementation",
+            expected_signal_name="implementation-complete",
+            memory_patch_builder=apply_implementation_signal,
+            intake_builder=intake_for_request_implementation,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # submit_implementation — T9: implementing → impl_review (idempotent).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "submit_implementation",
+        SubmitImplementationExecutor(
+            ref="local:submit_implementation",
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # human_review_implementation — pause for review-completed signal.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "human_review_implementation",
+        HumanExecutor(
+            ref="human:review_implementation",
+            expected_signal_name="review-completed",
+            memory_patch_builder=apply_review_verdict,
+            intake_builder=intake_for_human_review,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # commit_review — commit the implementation review after approval (FEAT-019 Ch4).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "commit_review",
+        LocalExecutor(
+            ref="local:commit_review",
+            handler=make_commit_review_handler(
+                session_factory=session_factory,
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # approve_review — T10: impl_review → done.
+    # ------------------------------------------------------------------
+    register_engine_executor(
+        registry,
+        agent_ref,
+        "approve_review",
+        transition_key="task.T10",
+        to_status="done",
+        lifecycle_client=lifecycle_client,
+        session_factory=session_factory,
+        actor=actor,
+        target_id_resolver=_resolve_task_engine_id,
+    )
+
+    # ------------------------------------------------------------------
+    # mark_task_done — advance current_task_id to next pending task.
+    # ------------------------------------------------------------------
+    async def _mark_task_done_handler(_ctx: DispatchContext) -> Mapping[str, Any]:
+        async with session_factory() as _session:
+            mem = await _session.scalar(
+                _select(_RunMemoryModel).where(_RunMemoryModel.run_id == _ctx.run_id)
+            )
+        memory = read_lifecycle_memory((mem.data if mem is not None else {}) or {})
+        completed_id = memory.current_task_id
+        if completed_id is not None and completed_id not in memory.completed_task_ids:
+            memory.completed_task_ids.append(completed_id)
+        next_id: str | None = next(
+            (t.id for t in memory.tasks if t.id not in memory.completed_task_ids),
+            None,
+        )
+        memory.current_task_id = next_id
+        return {
+            "completedTaskId": completed_id,
+            "nextTaskId": next_id,
+            "__memory_patch": write_lifecycle_memory(memory),
+        }
+
+    registry.register(
+        agent_ref,
+        "mark_task_done",
+        LocalExecutor(
+            ref="local:mark_task_done",
+            handler=_mark_task_done_handler,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # correct_implementation — record rejection, loop or terminate.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "correct_implementation",
+        LocalExecutor(
+            ref="local:correct_implementation",
+            handler=_make_correct_implementation_handler(session_factory),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # confirm_docs_update — docs-update / definition-of-done gate (FEAT-019).
+    # The operator confirms that all artefact files are committed and docs
+    # are in sync before the work item closes.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "confirm_docs_update",
+        HumanExecutor(
+            ref="human:confirm_docs_update",
+            expected_signal_name="docs-update-confirmed",
+            memory_patch_builder=apply_docs_update_verdict,
+            intake_builder=intake_for_confirm_docs_update,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # log_run_completed — write the completed event before closing (FEAT-019 Ch6).
+    # Change 7 (DevHub callback) is a no-op: the engine webhook already
+    # transitions the work item to Completed via the reactor path.
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "log_run_completed",
+        LocalExecutor(
+            ref="local:log_run_completed",
+            handler=make_log_run_completed_handler(
+                session_factory=session_factory,
+                pat=github_pat,
+                branch=github_artifact_branch,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # close_work_item — W4 (in_progress → ready) then W6 (ready → closed).
+    # ------------------------------------------------------------------
+    registry.register(
+        agent_ref,
+        "close_work_item",
+        SequenceEngineExecutor(
+            ref="sequence:close_work_item",
+            hops=[("work_item.W4", "ready"), ("work_item.W6", "closed")],
+            lifecycle_client=lifecycle_client,
+            session_factory=session_factory,
+            actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # terminate_correction_budget — correction budget exhausted.
+    # ------------------------------------------------------------------
+    async def _terminate_correction_budget_handler(_ctx: DispatchContext) -> Mapping[str, Any]:
+        raise _CorrectionBudgetExceeded("correction_budget_exceeded")
+
+    registry.register(
+        agent_ref,
+        "terminate_correction_budget",
+        LocalExecutor(
+            ref="local:terminate_correction_budget",
+            handler=_terminate_correction_budget_handler,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # terminate_rejection_budget — checkpoint rejection budget exhausted.
+    # ------------------------------------------------------------------
+    async def _terminate_rejection_budget_handler(_ctx: DispatchContext) -> Mapping[str, Any]:
+        raise _RejectionBudgetExceeded("rejection_budget_exceeded")
+
+    registry.register(
+        agent_ref,
+        "terminate_rejection_budget",
+        LocalExecutor(
+            ref="local:terminate_rejection_budget",
+            handler=_terminate_rejection_budget_handler,
+        ),
+    )
+
+    logger.info(
+        "register_lifecycle_v06_human: agent_ref=%s registered "
+        "(all-human-input variant — zero LLM/platform calls)",
+        agent_ref,
+    )
+
+
+def _exempt_lifecycle_v06_human(agent_ref: str, node_names: list[str]) -> None:
+    reason = "v0.6.0-human collaborators not provided to register_all_executors"
+    for node_name in node_names:
+        no_executor(agent_ref, node_name, reason)
+
+
 def _make_correct_implementation_handler(  # type: ignore[no-untyped-def]
     session_factory: async_sessionmaker[AsyncSession],
 ):
@@ -1953,5 +2530,6 @@ __all__ = [
     "register_lifecycle_v03",
     "register_lifecycle_v04_manual",
     "register_lifecycle_v05_manual",
+    "register_lifecycle_v06_human",
     "run_coverage_validation",
 ]
