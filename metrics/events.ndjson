@@ -1,1 +1,2 @@
 {"ts": "2026-07-18T16:22:12.765060+00:00", "run_id": "019f7609-0da4-71fe-9e99-d0e4d5ad80ca", "agent_ref": "lifecycle-agent@0.6.0-human", "step": "start", "event": "started", "work_item_id": "IMP-007", "task_id": null, "detail": null}
+{"ts": "2026-07-18T16:22:18.094938+00:00", "run_id": "019f7609-0da4-71fe-9e99-d0e4d5ad80ca", "agent_ref": "lifecycle-agent@0.6.0-human", "step": "commit_brief", "event": "artifact_committed", "work_item_id": "IMP-007", "task_id": null, "detail": "docs/work-items/IMP-007-per-run-cost-tracking.md@b449898"}
