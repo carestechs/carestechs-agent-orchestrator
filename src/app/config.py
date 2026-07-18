@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # intentionally not in the literal yet to avoid premature contract freeze.
     lifecycle_reviewer: Literal["llm-content", "stub-pass"] = "llm-content"
 
+    # -- Agent platform (carestechs-agent-platform) -----------------------
+    # When set, generate_tasks / generate_plan / review_implementation are
+    # routed to the platform via AgentPlatformExecutor instead of in-process
+    # LLMContentExecutor.  Set to the platform's base URL, e.g.:
+    #   AGENT_PLATFORM_URL=http://agent-platform-api:8000   (umbrella)
+    #   AGENT_PLATFORM_URL=http://localhost:8001             (local dev)
+    # Leave unset to keep the default in-process LLM path.
+    agent_platform_url: AnyHttpUrl | None = None
+
     # -- Deterministic lifecycle flow (FEAT-006) --------------------------
     # When True (v1 default) the impl-review approver collapses to `admin`;
     # when False a `dev` other than the implementer is expected.
@@ -127,6 +136,13 @@ class Settings(BaseSettings):
     github_pat: SecretStr | None = None
     github_app_id: str | None = None
     github_private_key: SecretStr | None = None
+
+    # FEAT-019: artifact commit target branch.  When set, @0.6.0-human commit
+    # nodes push artefacts (brief, task list, plans, reviews) to this branch
+    # via the GitHub Contents API using the same ``github_pat`` credential.
+    # Must be a valid git ref (e.g. ``main``).  When absent the commit nodes
+    # are no-ops (a warning is logged and the step completes without writing).
+    github_artifact_branch: str | None = None
 
     # -- Flow-engine lifecycle surface (FEAT-006 rc2) ---------------------
     # Points at the same flow engine as ``engine_base_url``; separate field

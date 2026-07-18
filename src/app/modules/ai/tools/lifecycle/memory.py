@@ -41,6 +41,10 @@ class WorkItemRef(BaseModel):
     type: Literal["FEAT", "BUG", "IMP"]
     title: str
     path: str
+    # FEAT-018: operator-supplied summary and acceptance criteria
+    # (human-input variant); empty strings preserve backward compatibility.
+    summary: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list[str])
 
 
 class LifecycleTask(BaseModel):
@@ -75,6 +79,9 @@ class LifecycleTask(BaseModel):
     depends_on: list[str] = Field(default_factory=list[str])
     files_hint: list[str] = Field(default_factory=list[str])
     kind: Literal["feature", "mockup", "bug", "chore"] = "feature"
+    # FEAT-019: operator-supplied workflow hint for artifact commits and DevHub rendering.
+    # None means auto-derive (kind=mockup → mockup-first, else standard).
+    workflow: Literal["standard", "mockup-first", "investigation-first"] | None = None
 
 
 class LifecycleReview(BaseModel):

@@ -134,14 +134,21 @@ nodes:
 
   - name: generate_plan
     description: >
-      Author an implementation plan for the current task (LLM-content) and
-      fire T6 (planning → plan_review). One task at a time — the per-task
-      loop runs assign → plan → implement → review → approve sequentially
-      and the loop-back from `mark_task_done` resumes at `assign_task` for
-      the next un-completed task. (BUG-013 — the v0.1.0-style "plan all
-      then implement all" self-loop was structurally broken because no
-      v0.3.0 writer advanced ``current_task_id``; sequential per-task is
-      simpler and provably correct.)
+      Author an implementation plan for the current task (LLM-content or
+      platform plan-generation capability). Writes the plan to RunMemory.
+      The sibling `advance_plan` node fires T6 so the LLM authoring step
+      and the engine transition are independent units.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+      required: [taskId]
+
+  - name: advance_plan
+    description: >
+      Fire T6 (planning → plan_review) on the current task. Separated from
+      `generate_plan` so the LLM authoring step (local or platform) and the
+      engine transition are independent executor bindings.
     inputSchema:
       type: object
       properties:
@@ -300,7 +307,8 @@ flow:
     propose_tasks: [confirm_assignment]
     confirm_assignment: [assign_task]
     assign_task: [generate_plan]
-    generate_plan:
+    generate_plan: [advance_plan]
+    advance_plan:
       branch:
         rule: checkpoint_rejections_under_bound
         "true": confirm_plan

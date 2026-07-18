@@ -62,8 +62,13 @@ _PayloadConfig = ConfigDict(
 
 class _WorkItemCorrection(BaseModel):
     model_config = _PayloadConfig
+    id: str | None = None
     title: str | None = None
     type: Literal["FEAT", "BUG", "IMP"] | None = None
+    # FEAT-018: full-authoring fields for @0.6.0-human (ignored in prior
+    # variants when work_item is already populated from load_work_item).
+    summary: str | None = None
+    acceptance_criteria: list[str] | None = None
 
 
 class BriefConfirmedPayload(BaseModel):
@@ -88,6 +93,14 @@ class _TaskInput(BaseModel):
     summary: str | None = None
     description: str | None = None
     complexity: Literal["small", "medium", "large"] | None = None
+    # FEAT-018: kind field for @0.6.0-human; None falls back to LifecycleTask default "feature".
+    kind: Literal["feature", "mockup", "bug", "chore"] | None = None
+    # FEAT-019: explicit workflow hint; None → auto-derive at render time.
+    workflow: Literal["standard", "mockup-first", "investigation-first"] | None = None
+    # FEAT-019: sibling task IDs this task depends on (maps to LifecycleTask.depends_on).
+    dependencies: list[str] = Field(default_factory=list)
+    # FEAT-019: file paths expected to change (maps to LifecycleTask.files_hint).
+    files_to_modify: list[str] = Field(default_factory=list)
 
 
 class TasksConfirmedPayload(BaseModel):
@@ -133,11 +146,44 @@ class ReviewCompletedPayload(BaseModel):
 
 
 class MockupApprovedPayload(BaseModel):
-    """Operator verdict on a generated mockup (FEAT-017).
+    """Operator verdict on a generated mockup (FEAT-017 / FEAT-018).
 
     ``verdict="reject"`` persists feedback so the next ``generate_mockup``
     invocation can address it.  ``verdict="approve"`` produces an empty
-    patch — approval is expressed through the flow routing, not memory.
+    patch in @0.5.0-manual (the LLM already wrote the HTML in generate_mockup).
+
+    FEAT-018 (@0.6.0-human): no generate_mockup runs, so the operator
+    supplies ``mockupHtml`` directly on approve; the patch builder writes
+    it to ``RunMemory.mockups[task_id]``.  Field is ignored on reject.
+    """
+
+    model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
+    mockup_html: str | None = None
+
+
+class TasksReviewedPayload(BaseModel):
+    """Operator verdict at the ``confirm_task_review`` checkpoint (FEAT-019).
+
+    Independent reviewer signs off (or requests revisions) on the authored
+    task list before it is fanned out to the engine.  ``verdict="approve"``
+    advances to ``propose_tasks``; ``verdict="reject"`` loops back to
+    ``confirm_tasks`` with optional reviewer feedback surfaced as
+    ``rejections["confirm_task_review"]`` in memory.
+    """
+
+    model_config = _PayloadConfig
+    verdict: Literal["approve", "reject"] = "approve"
+    feedback: str | None = None
+
+
+class DocsUpdateConfirmedPayload(BaseModel):
+    """Operator confirmation at the ``confirm_docs_update`` checkpoint (FEAT-019).
+
+    Gate before ``close_work_item``.  ``verdict="approve"`` advances to
+    closure; ``verdict="reject"`` holds at the checkpoint for a re-check.
+    Optional ``notes`` are stored in the rejection sidecar.
     """
 
     model_config = _PayloadConfig
@@ -206,38 +252,63 @@ def apply_brief_correction(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Optional title / type overrides for the LLM-derived brief.
+    """Title / type / summary overrides for an LLM-derived brief, or full
+    authoring for ``@0.6.0-human`` where no prior ``load_work_item`` ran.
 
-    Empty payload → empty patch (operator approves unchanged).  Missing
-    ``work_item`` in memory → ``ValueError`` (operator delivered too
-    early; ``load_work_item`` hasn't populated memory yet).
-
-    IMP-006: ``verdict="reject"`` persists feedback to the ``rejections``
-    sidecar and skips corrections.  The flow resolver reads the verdict
-    from the dispatch result (surfaced by the signal delivery hook) and
-    loops back to ``load_work_item``.
+    Modes:
+    - ``verdict="reject"`` → rejection patch; skips corrections.
+    - ``verdict="approve"`` + no ``work_item`` in payload → empty patch.
+    - ``verdict="approve"`` + ``work_item`` + memory already has work_item
+      → merge/override (prior variants @0.4/0.5-manual).
+    - ``verdict="approve"`` + ``work_item.id`` in payload + memory empty
+      → create WorkItemRef from scratch (@0.6.0-human).
     """
     parsed = BriefConfirmedPayload.model_validate(payload)
     if parsed.verdict == "reject":
         return _rejection_patch("confirm_brief", parsed.feedback, current_memory)
-    if parsed.work_item is None or (
-        parsed.work_item.title is None and parsed.work_item.type is None
-    ):
+    wi = parsed.work_item
+    if wi is None:
         return {}
     memory = read_lifecycle_memory(current_memory)
-    if memory.work_item is None:
-        raise ValueError(
-            "brief-confirmed received but lifecycle.v1.work_item is not yet "
-            "populated — wait for load_work_item to complete."
+    if memory.work_item is not None:
+        # Prior variants: merge operator corrections on top of LLM draft.
+        # When all override fields are absent, nothing changed — skip the patch.
+        if (
+            wi.title is None
+            and wi.type is None
+            and wi.summary is None
+            and wi.acceptance_criteria is None
+        ):
+            return {}
+        merged_title = wi.title or memory.work_item.title
+        merged_type = wi.type or memory.work_item.type
+        memory.work_item = WorkItemRef(
+            id=memory.work_item.id,
+            type=merged_type,
+            title=merged_title,
+            path=memory.work_item.path,
+            summary=wi.summary if wi.summary is not None else memory.work_item.summary,
+            acceptance_criteria=(
+                wi.acceptance_criteria
+                if wi.acceptance_criteria is not None
+                else memory.work_item.acceptance_criteria
+            ),
         )
-    merged_title = parsed.work_item.title or memory.work_item.title
-    merged_type = parsed.work_item.type or memory.work_item.type
-    memory.work_item = WorkItemRef(
-        id=memory.work_item.id,
-        type=merged_type,
-        title=merged_title,
-        path=memory.work_item.path,
-    )
+    else:
+        # @0.6.0-human: operator authors the brief from scratch.
+        if not wi.id or not wi.title or not wi.type:
+            raise ValueError(
+                "brief-confirmed for a run without a prior load_work_item step "
+                "requires workItem.id, workItem.title, and workItem.type in the payload."
+            )
+        memory.work_item = WorkItemRef(
+            id=wi.id,
+            type=wi.type,
+            title=wi.title,
+            path="",
+            summary=wi.summary or "",
+            acceptance_criteria=wi.acceptance_criteria or [],
+        )
     return {LIFECYCLE_MEMORY_NS: to_run_memory(memory)}
 
 
@@ -276,6 +347,10 @@ def apply_tasks_correction(
                         "title": entry.title,
                         "description": entry.description or existing.description,
                         "complexity": entry.complexity or existing.complexity,
+                        "kind": entry.kind or existing.kind,
+                        "workflow": entry.workflow if entry.workflow is not None else existing.workflow,
+                        "depends_on": entry.dependencies if entry.dependencies else existing.depends_on,
+                        "files_hint": entry.files_to_modify if entry.files_to_modify else existing.files_hint,
                     }
                 )
             )
@@ -286,6 +361,10 @@ def apply_tasks_correction(
                     title=entry.title,
                     description=entry.description or entry.summary or "",
                     complexity=entry.complexity or "medium",
+                    kind=entry.kind or "feature",
+                    workflow=entry.workflow,
+                    depends_on=entry.dependencies,
+                    files_hint=entry.files_to_modify,
                 )
             )
     memory.tasks = new_tasks
@@ -385,18 +464,40 @@ def apply_mockup_approval(
     payload: Mapping[str, Any],
     current_memory: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Persist mockup rejection feedback or approve with an empty patch (FEAT-017).
+    """Persist mockup rejection feedback or write operator-supplied HTML on approve.
 
     Rejection writes to ``rejections["confirm_mockup"]`` so
     ``_load_mockup_task_context`` in ``bootstrap.py`` can inject the
-    feedback into the next ``generate_mockup`` invocation.  Approval
-    produces no memory change — the routing verdict is read from the
-    dispatch result by the ``checkpoint_approved`` predicate.
+    feedback into the next ``generate_mockup`` invocation.
+
+    Approval in @0.5.0-manual: empty patch — the HTML was already written
+    by ``generate_mockup``'s LLMContentExecutor.
+
+    Approval in @0.6.0-human (FEAT-018): ``mockupHtml`` in the payload is
+    written to ``RunMemory.mockups[task_id]`` so downstream nodes (plan,
+    implementation) see the same memory shape as the automated path.
     """
     parsed = MockupApprovedPayload.model_validate(payload)
     if parsed.verdict == "reject":
         return _rejection_patch("confirm_mockup", parsed.feedback, current_memory)
-    return {}
+    if not parsed.mockup_html:
+        return {}
+    # Operator supplied HTML — write it to the mockups sidecar.
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    if not task_id:
+        return {}
+    existing_raw: Any = current_memory.get("mockups") or {}
+    existing: dict[str, Any] = (
+        {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+        if isinstance(existing_raw, dict)
+        else {}
+    )
+    existing[task_id] = {
+        "mockup_html": parsed.mockup_html,
+        "description": "",
+    }
+    return {"mockups": existing}
 
 
 def apply_review_verdict(
@@ -577,25 +678,101 @@ def intake_for_human_review(current_memory: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+# ---------------------------------------------------------------------------
+# FEAT-019 — task-list review + docs-update checkpoints
+# ---------------------------------------------------------------------------
+
+
+def apply_task_review_verdict(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verdict for the independent task-list review checkpoint.
+
+    On approve: empty patch (predicate reads ``verdict`` from the surfaced
+    payload fields; no memory write needed).  On reject: persist the
+    reviewer's feedback to ``rejections["confirm_task_review"]`` so the
+    next ``confirm_tasks`` intake can surface it.
+    """
+    parsed = TasksReviewedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_task_review", parsed.feedback, current_memory)
+    return {}
+
+
+def apply_docs_update_verdict(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verdict for the docs-update / definition-of-done checkpoint.
+
+    On approve: empty patch.  On reject: persist feedback to
+    ``rejections["confirm_docs_update"]`` for the next loop iteration.
+    """
+    parsed = DocsUpdateConfirmedPayload.model_validate(payload)
+    if parsed.verdict == "reject":
+        return _rejection_patch("confirm_docs_update", parsed.feedback, current_memory)
+    return {}
+
+
+def intake_for_confirm_task_review(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the authored task list to the independent reviewer (FEAT-019)."""
+    memory = read_lifecycle_memory(current_memory)
+    # Surface any prior rejection feedback so the reviewer sees what was flagged.
+    prior_feedback: str | None = None
+    rejections_raw: Any = current_memory.get("rejections") or {}
+    if isinstance(rejections_raw, dict):
+        prior_entry = cast("dict[str, Any]", rejections_raw).get("confirm_task_review")
+        if isinstance(prior_entry, dict):
+            prior_feedback = str(cast("dict[str, Any]", prior_entry).get("feedback") or "")
+    return {
+        "tasks": [t.model_dump(mode="json", by_alias=True) for t in memory.tasks],
+        "priorFeedback": prior_feedback,
+    }
+
+
+def intake_for_confirm_docs_update(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the work item and completed task summary for the docs-update gate (FEAT-019)."""
+    memory = read_lifecycle_memory(current_memory)
+    prior_feedback: str | None = None
+    rejections_raw: Any = current_memory.get("rejections") or {}
+    if isinstance(rejections_raw, dict):
+        prior_entry = cast("dict[str, Any]", rejections_raw).get("confirm_docs_update")
+        if isinstance(prior_entry, dict):
+            prior_feedback = str(cast("dict[str, Any]", prior_entry).get("feedback") or "")
+    return {
+        "workItem": memory.work_item.model_dump(mode="json", by_alias=True) if memory.work_item else None,
+        "tasks": [t.model_dump(mode="json", by_alias=True) for t in memory.tasks],
+        "completedTaskIds": list(memory.completed_task_ids),
+        "priorFeedback": prior_feedback,
+    }
+
+
 __all__ = [
     "AssignmentConfirmedPayload",
     "BriefConfirmedPayload",
+    "DocsUpdateConfirmedPayload",
     "ImplementationCompletePayload",
     "MockupApprovedPayload",
     "PlanConfirmedPayload",
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
+    "TasksReviewedPayload",
     "apply_assignment_confirmation",
     "apply_brief_correction",
+    "apply_docs_update_verdict",
     "apply_implementation_signal",
     "apply_mockup_approval",
     "apply_plan_correction",
     "apply_review_verdict",
+    "apply_task_review_verdict",
     "apply_tasks_correction",
     "intake_for_confirm_assignment",
     "intake_for_confirm_brief",
+    "intake_for_confirm_docs_update",
     "intake_for_confirm_mockup",
     "intake_for_confirm_plan",
+    "intake_for_confirm_task_review",
     "intake_for_confirm_tasks",
     "intake_for_human_review",
     "intake_for_request_implementation",

@@ -101,9 +101,11 @@ class TestApplyBriefCorrection:
         with pytest.raises(ValidationError):
             apply_brief_correction({"workItem": {"type": "INVALID"}}, mem)
 
-    def test_no_memory_workitem_raises_value_error(self) -> None:
+    def test_no_memory_workitem_without_id_raises_value_error(self) -> None:
+        # @0.6.0-human create-from-scratch path: requires id, title, type.
+        # Supplying only title (missing id) must raise ValueError.
         empty = _memory()
-        with pytest.raises(ValueError, match="not yet populated"):
+        with pytest.raises(ValueError, match="requires workItem.id"):
             apply_brief_correction({"workItem": {"title": "X"}}, empty)
 
     def test_snake_case_alias_accepted(self) -> None:
