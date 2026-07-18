@@ -1,43 +1,48 @@
 """FEAT-020 — Validator executor handlers for lifecycle-agent@0.6.0-human.
 
-Three LocalExecutor handler factories:
+Two LocalExecutor handler factories that fetch validator scripts from the
+working repo via the GitHub Contents/tarball API and run them:
 
-- ``make_validate_tasks_handler`` — renders in-memory task list to a temp
-  markdown file and runs ``validate-tasks.py`` from ia-framework tools.
-  Result written to ``validatorResults.tasks`` in RunMemory.
+- ``make_validate_tasks_handler`` — fetches ``.ai-framework/tools/validate-tasks.py``
+  from the run's ``codeSource.repo``, renders the in-memory task list to a temp
+  markdown file, and runs the script.  Result written to
+  ``validatorResults.tasks`` in RunMemory.
 
-- ``make_run_tests_handler`` — runs ``uv run pytest`` with a bounded timeout.
-  Result written to ``testResults[task_id]`` in RunMemory.
-
-- ``make_validate_specs_strict_handler`` — runs ``validate-specs.py --strict``
-  against the project's docs/ tree.  On failure: writes a rejection patch to
-  RunMemory so ``confirm_docs_update`` surfaces the failure as ``priorFeedback``
-  on next dispatch.  Returns ``{"passed": bool}`` for the ``validator_passed``
+- ``make_validate_specs_strict_handler`` — downloads a shallow tarball of the
+  working repo, extracts it to a temp directory, and runs
+  ``.ai-framework/tools/validate-specs.py docs/ --strict`` from the extracted
+  root.  On failure: writes a rejection patch to RunMemory so
+  ``confirm_docs_update`` surfaces the output as ``priorFeedback`` on next
+  dispatch.  Returns ``{"passed": bool}`` for the ``validator_passed``
   predicate to route on.
 
-All handlers skip non-fatally when the required tool path or repo path is
-absent — validator unavailability never terminates a run.
+Both handlers skip non-fatally when ``GITHUB_PAT`` is absent or the run has no
+``codeSource`` — validator unavailability never terminates a run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
+import tarfile
 import tempfile
 from collections.abc import Mapping
 from typing import Any
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.ai.executors.base import DispatchContext
+from app.modules.ai.executors.code_source import read_code_source
 
 logger = logging.getLogger(__name__)
 
-_SKIPPED_NO_TOOLS = {"skipped": True, "reason": "ia_framework_tools_path not configured"}
-_SKIPPED_NO_REPO = {"skipped": True, "reason": "lifecycle_project_repo_path not configured"}
-_SKIPPED_TOOL_NOT_FOUND = {"skipped": True, "reason": "validator script not found on disk"}
+_SKIPPED_NO_PAT = {"skipped": True, "passed": True, "reason": "GITHUB_PAT not configured"}
+_SKIPPED_NO_SOURCE = {"skipped": True, "passed": True, "reason": "codeSource missing from run intake"}
+_SKIPPED_SCRIPT_NOT_FOUND = {"skipped": True, "passed": True, "reason": "validator script not found in repo"}
 
 
 async def _run_subprocess(
@@ -80,22 +85,114 @@ async def _read_memory(
     return ((row.data if row is not None else {}) or {}).copy()
 
 
+async def _fetch_file_from_github(
+    pat: str,
+    repo: str,
+    path: str,
+    ref: str,
+) -> str | None:
+    """Fetch a single file's raw content from the GitHub Contents API.
+
+    Returns the file content as a string, or ``None`` when the file is not
+    found (404) or any other HTTP error occurs.
+    """
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"token {pat}",
+        "Accept": "application/vnd.github.v3.raw",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(url, headers=headers, params={"ref": ref})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.text
+    except httpx.HTTPError as exc:
+        logger.warning("_fetch_file_from_github: HTTP error fetching %s@%s: %s", path, ref, exc)
+        return None
+
+
+async def _download_repo_tarball(
+    pat: str,
+    repo: str,
+    ref: str,
+) -> bytes | None:
+    """Download a gzip tarball of the repo at *ref*.
+
+    Returns raw bytes on success, ``None`` on any HTTP / network error.
+    The tarball may be large; caller is responsible for cleanup.
+    """
+    url = f"https://api.github.com/repos/{repo}/tarball/{ref}"
+    headers = {
+        "Authorization": f"token {pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as client:
+            resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.content
+    except httpx.HTTPError as exc:
+        logger.warning("_download_repo_tarball: HTTP error downloading %s@%s: %s", repo, ref, exc)
+        return None
+
+
+def _extract_tarball(data: bytes, dest: str) -> str:
+    """Extract a gzip tarball into *dest*, return the extracted root dir.
+
+    GitHub tarballs contain a single top-level directory named
+    ``{owner}-{repo}-{sha}/``.  Returns the full path to that directory.
+    """
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        tar.extractall(dest)
+    entries = sorted(
+        e for e in os.listdir(dest) if os.path.isdir(os.path.join(dest, e))
+    )
+    return os.path.join(dest, entries[0]) if entries else dest
+
+
 def make_validate_tasks_handler(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    tools_path: str | None,
+    github_pat: str | None,
     agent_ref: str,
 ) -> Any:
-    """Factory for the ``run_validate_tasks`` LocalExecutor handler."""
+    """Factory for the ``run_validate_tasks`` LocalExecutor handler.
+
+    Fetches ``.ai-framework/tools/validate-tasks.py`` from the run's
+    ``codeSource.repo`` via the GitHub Contents API, renders the in-memory
+    task list to a temp markdown file, and executes the script.  Skips
+    non-fatally when ``GITHUB_PAT`` or ``codeSource`` are absent.
+    """
 
     async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
-        if not tools_path:
-            return _SKIPPED_NO_TOOLS
+        if not github_pat:
+            logger.info("run_validate_tasks: GITHUB_PAT not configured — skipping")
+            return _SKIPPED_NO_PAT
 
-        script = os.path.join(tools_path, "validate-tasks.py")
-        if not os.path.isfile(script):
-            logger.warning("run_validate_tasks: script not found at %s — skipping", script)
-            return _SKIPPED_TOOL_NOT_FOUND
+        try:
+            cs = read_code_source(ctx)
+        except (ValueError, Exception):
+            logger.info("run_validate_tasks: codeSource missing from intake — skipping")
+            return _SKIPPED_NO_SOURCE
+
+        branch = cs.work_branch or cs.base_branch
+
+        script_content = await _fetch_file_from_github(
+            github_pat,
+            cs.repo,
+            ".ai-framework/tools/validate-tasks.py",
+            branch,
+        )
+        if script_content is None:
+            logger.info(
+                "run_validate_tasks: validate-tasks.py not found in %s@%s — skipping",
+                cs.repo, branch,
+            )
+            return {**_SKIPPED_SCRIPT_NOT_FOUND, "repo": cs.repo, "ref": branch}
 
         from app.modules.ai.executors.github_artifacts import render_task_list_markdown
         from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
@@ -106,22 +203,18 @@ def make_validate_tasks_handler(
 
         md = render_task_list_markdown(lifecycle_mem.tasks, wi_id)
 
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".md",
-            prefix=f"tasks-{wi_id}-",
-            delete=False,
-        ) as tmp:
-            tmp.write(md)
-            tmp_path = tmp.name
+        with tempfile.TemporaryDirectory(prefix="orchestrator-validate-tasks-") as tmp_dir:
+            script_path = os.path.join(tmp_dir, "validate-tasks.py")
+            tasks_path = os.path.join(tmp_dir, f"tasks-{wi_id}.md")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script_content)
+            with open(tasks_path, "w", encoding="utf-8") as f:
+                f.write(md)
 
-        try:
-            exit_code, output = await _run_subprocess(["python", script, tmp_path])
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            exit_code, output = await _run_subprocess(
+                ["python", script_path, tasks_path],
+                cwd=tmp_dir,
+            )
 
         passed = exit_code == 0
         result: dict[str, Any] = {"exit_code": exit_code, "output": output, "passed": passed}
@@ -131,8 +224,8 @@ def make_validate_tasks_handler(
         validator_results["tasks"] = result
 
         logger.info(
-            "run_validate_tasks: run=%s passed=%s exit_code=%d",
-            ctx.run_id, passed, exit_code,
+            "run_validate_tasks: run=%s repo=%s passed=%s exit_code=%d",
+            ctx.run_id, cs.repo, passed, exit_code,
         )
         return {
             "passed": passed,
@@ -144,84 +237,70 @@ def make_validate_tasks_handler(
     return _handler
 
 
-def make_run_tests_handler(
-    session_factory: async_sessionmaker[AsyncSession],
-    *,
-    timeout_seconds: int = 300,
-    agent_ref: str,
-) -> Any:
-    """Factory for the ``run_tests`` LocalExecutor handler."""
-
-    async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
-        from app.modules.ai.tools.lifecycle.memory import read_lifecycle_memory
-
-        memory_data = await _read_memory(session_factory, ctx.run_id)
-        lifecycle_mem = read_lifecycle_memory(memory_data)
-        task_id = lifecycle_mem.current_task_id or ctx.intake.get("taskId") or "unknown"
-
-        exit_code, output = await _run_subprocess(
-            ["uv", "run", "pytest", "tests/", "--tb=short", "-q", "--no-header"],
-            timeout=float(timeout_seconds),
-        )
-
-        passed = exit_code == 0
-        result: dict[str, Any] = {"exit_code": exit_code, "output": output, "passed": passed}
-
-        existing = await _read_memory(session_factory, ctx.run_id)
-        test_results: dict[str, Any] = dict(existing.get("testResults") or {})
-        test_results[task_id] = result
-
-        logger.info(
-            "run_tests: run=%s task=%s passed=%s exit_code=%d",
-            ctx.run_id, task_id, passed, exit_code,
-        )
-        return {
-            "passed": passed,
-            "exit_code": exit_code,
-            "output": output,
-            "task_id": task_id,
-            "__memory_patch": {"testResults": test_results},
-        }
-
-    return _handler
-
-
 def make_validate_specs_strict_handler(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    tools_path: str | None,
-    repo_path: str | None,
+    github_pat: str | None,
 ) -> Any:
     """Factory for the ``run_validate_specs_strict`` LocalExecutor handler.
 
-    On failure the handler writes a rejection patch to RunMemory so the
-    ``confirm_docs_update`` intake builder surfaces the output as
-    ``priorFeedback`` on the next dispatch.
+    Downloads a shallow tarball of the run's ``codeSource.repo``, extracts
+    it to a temp directory, and runs ``.ai-framework/tools/validate-specs.py
+    docs/ --strict`` from the extracted root.  On failure the handler writes
+    a rejection patch to RunMemory so the ``confirm_docs_update`` intake
+    builder surfaces the output as ``priorFeedback`` on the next dispatch.
+    Returns ``{"passed": bool}`` for the ``validator_passed`` predicate.
     """
 
     async def _handler(ctx: DispatchContext) -> Mapping[str, Any]:
-        if not tools_path:
-            return {**_SKIPPED_NO_TOOLS, "passed": True}
-        if not repo_path:
-            return {**_SKIPPED_NO_REPO, "passed": True}
+        if not github_pat:
+            logger.info("run_validate_specs_strict: GITHUB_PAT not configured — skipping")
+            return _SKIPPED_NO_PAT
 
-        script = os.path.join(tools_path, "validate-specs.py")
-        if not os.path.isfile(script):
-            logger.warning(
-                "run_validate_specs_strict: script not found at %s — skipping", script
-            )
-            return {**_SKIPPED_TOOL_NOT_FOUND, "passed": True}
+        try:
+            cs = read_code_source(ctx)
+        except (ValueError, Exception):
+            logger.info("run_validate_specs_strict: codeSource missing from intake — skipping")
+            return _SKIPPED_NO_SOURCE
 
-        docs_dir = os.path.join(repo_path, "docs")
-        exit_code, output = await _run_subprocess(
-            ["python", script, docs_dir, "--strict"],
-            cwd=repo_path,
+        branch = cs.work_branch or cs.base_branch
+
+        logger.info(
+            "run_validate_specs_strict: downloading tarball for %s@%s",
+            cs.repo, branch,
         )
+        tarball = await _download_repo_tarball(github_pat, cs.repo, branch)
+        if tarball is None:
+            logger.warning(
+                "run_validate_specs_strict: tarball download failed for %s@%s — skipping",
+                cs.repo, branch,
+            )
+            return {**_SKIPPED_NO_SOURCE, "reason": "tarball download failed"}
+
+        loop = asyncio.get_event_loop()
+        with tempfile.TemporaryDirectory(prefix="orchestrator-validate-specs-") as tmp_dir:
+            root_dir = await loop.run_in_executor(
+                None, lambda: _extract_tarball(tarball, tmp_dir)
+            )
+
+            script = os.path.join(root_dir, ".ai-framework", "tools", "validate-specs.py")
+            if not os.path.isfile(script):
+                logger.info(
+                    "run_validate_specs_strict: validate-specs.py not found in %s@%s — skipping",
+                    cs.repo, branch,
+                )
+                return {**_SKIPPED_SCRIPT_NOT_FOUND, "repo": cs.repo, "ref": branch}
+
+            docs_dir = os.path.join(root_dir, "docs")
+            exit_code, output = await _run_subprocess(
+                ["python", script, docs_dir, "--strict"],
+                cwd=root_dir,
+            )
 
         passed = exit_code == 0
         logger.info(
-            "run_validate_specs_strict: run=%s passed=%s exit_code=%d",
-            ctx.run_id, passed, exit_code,
+            "run_validate_specs_strict: run=%s repo=%s passed=%s exit_code=%d",
+            ctx.run_id, cs.repo, passed, exit_code,
         )
 
         if passed:
@@ -237,7 +316,7 @@ def make_validate_specs_strict_handler(
 
         # Failure — write a rejection patch so confirm_docs_update shows
         # the validator output as priorFeedback on the next dispatch.
-        from app.modules.ai.executors.lifecycle_manual_patches import _rejection_patch
+        from app.modules.ai.executors.lifecycle_manual_patches import _rejection_patch  # pyright: ignore[reportPrivateUsage]
 
         memory_data = await _read_memory(session_factory, ctx.run_id)
         validator_results = dict(memory_data.get("validatorResults") or {})

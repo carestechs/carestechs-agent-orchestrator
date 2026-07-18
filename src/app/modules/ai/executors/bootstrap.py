@@ -79,9 +79,6 @@ def register_all_executors(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     github_pat: str | None = None,
     github_artifact_branch: str = "main",
-    ia_framework_tools_path: str | None = None,
-    lifecycle_project_repo_path: str | None = None,
-    lifecycle_test_timeout_seconds: int = 300,
 ) -> None:
     """Register an executor for every node of every loaded agent.
 
@@ -140,9 +137,6 @@ def register_all_executors(
                     max_corrections=v03_collaborators.max_corrections,
                     github_pat=github_pat,
                     github_artifact_branch=github_artifact_branch,
-                    ia_framework_tools_path=ia_framework_tools_path,
-                    lifecycle_project_repo_path=lifecycle_project_repo_path,
-                    lifecycle_test_timeout_seconds=lifecycle_test_timeout_seconds,
                 )
         elif agent.ref.startswith("lifecycle-agent@0.5"):
             # FEAT-017: mockup-conditional variant.  Reuses v0.3.0
@@ -1803,9 +1797,6 @@ def register_lifecycle_v06_human(
     actor: str | None = "lifecycle-agent",
     github_pat: str | None = None,
     github_artifact_branch: str = "main",
-    ia_framework_tools_path: str | None = None,
-    lifecycle_project_repo_path: str | None = None,
-    lifecycle_test_timeout_seconds: int = 300,
 ) -> None:
     """Register bindings for ``lifecycle-agent@0.6.0-human`` (FEAT-018/020).
 
@@ -2315,12 +2306,16 @@ def register_lifecycle_v06_human(
 
     # ------------------------------------------------------------------
     # FEAT-020 — validator nodes.
-    # All skip non-fatally when tool paths are absent.
+    # Scripts are fetched from codeSource.repo via GitHub Contents API;
+    # all skip non-fatally when GITHUB_PAT or codeSource are absent.
     # ------------------------------------------------------------------
     from app.modules.ai.executors.lifecycle_validators import (
-        make_run_tests_handler,
         make_validate_specs_strict_handler,
         make_validate_tasks_handler,
+    )
+    from app.modules.ai.executors.lifecycle_manual_patches import (
+        apply_tests_completed,
+        intake_for_run_tests,
     )
 
     registry.register(
@@ -2330,22 +2325,22 @@ def register_lifecycle_v06_human(
             ref="local:run_validate_tasks",
             handler=make_validate_tasks_handler(
                 session_factory,
-                tools_path=ia_framework_tools_path,
+                github_pat=github_pat,
                 agent_ref=agent_ref,
             ),
         ),
     )
 
+    # run_tests is a manual step — the operator runs the test suite and
+    # reports the result via the tests-completed signal (FEAT-020).
     registry.register(
         agent_ref,
         "run_tests",
-        LocalExecutor(
-            ref="local:run_tests",
-            handler=make_run_tests_handler(
-                session_factory,
-                timeout_seconds=lifecycle_test_timeout_seconds,
-                agent_ref=agent_ref,
-            ),
+        HumanExecutor(
+            ref="human:run_tests",
+            expected_signal_name="tests-completed",
+            memory_patch_builder=apply_tests_completed,
+            intake_builder=intake_for_run_tests,
         ),
     )
 
@@ -2356,8 +2351,7 @@ def register_lifecycle_v06_human(
             ref="local:run_validate_specs_strict",
             handler=make_validate_specs_strict_handler(
                 session_factory,
-                tools_path=ia_framework_tools_path,
-                repo_path=lifecycle_project_repo_path,
+                github_pat=github_pat,
             ),
         ),
     )

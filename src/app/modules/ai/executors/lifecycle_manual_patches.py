@@ -191,6 +191,20 @@ class DocsUpdateConfirmedPayload(BaseModel):
     feedback: str | None = None
 
 
+class TestsCompletedPayload(BaseModel):
+    """Operator-reported test result at the ``run_tests`` human checkpoint (FEAT-020).
+
+    The operator runs the project's test suite manually and pastes the outcome
+    here.  ``passed`` drives the ``testResult`` shown to the reviewer in
+    ``human_review_implementation`` nodeInputs.  ``output`` is the raw console
+    output (pytest summary, etc.) truncated to a reasonable length.
+    """
+
+    model_config = _PayloadConfig
+    passed: bool
+    output: str = ""
+
+
 class ImplementationCompletePayload(BaseModel):
     """Optional metadata the developer submits with ``implementation-complete``.
 
@@ -740,6 +754,55 @@ def intake_for_confirm_task_review(current_memory: Mapping[str, Any]) -> dict[st
     }
 
 
+def apply_tests_completed(
+    payload: Mapping[str, Any],
+    current_memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist the operator-reported test result for the current task.
+
+    Writes to the top-level ``testResults[task_id]`` sidecar so
+    ``intake_for_human_review`` can surface it as ``testResult`` in
+    ``human_review_implementation`` nodeInputs.
+    """
+    parsed = TestsCompletedPayload.model_validate(payload)
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id
+    if not task_id:
+        return {}
+    existing_raw: Any = current_memory.get("testResults") or {}
+    existing: dict[str, Any] = (
+        {str(k): v for k, v in cast("dict[str, Any]", existing_raw).items()}
+        if isinstance(existing_raw, dict)
+        else {}
+    )
+    existing[task_id] = {
+        "passed": parsed.passed,
+        "output": parsed.output,
+    }
+    return {"testResults": existing}
+
+
+def intake_for_run_tests(current_memory: Mapping[str, Any]) -> dict[str, Any]:
+    """Surface current task + implementation ref so the operator knows what to test."""
+    memory = read_lifecycle_memory(current_memory)
+    task_id = memory.current_task_id or ""
+    current_task = next(
+        (t for t in memory.tasks if t.id == task_id), None
+    )
+    impl_refs_raw: Any = current_memory.get("implementation_refs") or {}
+    impl_ref: dict[str, Any] | None = None
+    if isinstance(impl_refs_raw, dict) and task_id:
+        impl_ref = cast("dict[str, Any]", impl_refs_raw).get(task_id)
+    return {
+        "currentTask": current_task.model_dump(mode="json") if current_task else None,
+        "implementationRef": impl_ref,
+        "instructions": (
+            "Run the project's test suite and report the result. "
+            "Signal with {passed: true/false, output: '<pytest summary>'}."
+        ),
+    }
+
+
 def intake_for_confirm_docs_update(current_memory: Mapping[str, Any]) -> dict[str, Any]:
     """Expose the work item and completed task summary for the docs-update gate (FEAT-019)."""
     memory = read_lifecycle_memory(current_memory)
@@ -767,6 +830,7 @@ __all__ = [
     "ReviewCompletedPayload",
     "TasksConfirmedPayload",
     "TasksReviewedPayload",
+    "TestsCompletedPayload",
     "apply_assignment_confirmation",
     "apply_brief_correction",
     "apply_docs_update_verdict",
@@ -776,6 +840,7 @@ __all__ = [
     "apply_review_verdict",
     "apply_task_review_verdict",
     "apply_tasks_correction",
+    "apply_tests_completed",
     "intake_for_confirm_assignment",
     "intake_for_confirm_brief",
     "intake_for_confirm_docs_update",
@@ -785,4 +850,5 @@ __all__ = [
     "intake_for_confirm_tasks",
     "intake_for_human_review",
     "intake_for_request_implementation",
+    "intake_for_run_tests",
 ]

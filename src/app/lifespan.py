@@ -222,9 +222,6 @@ def _bootstrap_executor_registry(
         session_factory=session_factory,
         github_pat=_pat,
         github_artifact_branch=_branch,
-        ia_framework_tools_path=_settings.ia_framework_tools_path,
-        lifecycle_project_repo_path=_settings.lifecycle_project_repo_path,
-        lifecycle_test_timeout_seconds=_settings.lifecycle_test_timeout_seconds,
     )
     try:
         run_coverage_validation(registry, agents_dir)

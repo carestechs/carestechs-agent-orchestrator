@@ -196,10 +196,10 @@ nodes:
 
   - name: run_tests
     description: >
-      Run uv run pytest after submit_implementation (FEAT-020). Result
-      written to testResults[task_id] and surfaced in
-      human_review_implementation nodeInputs. Skips non-fatally on
-      timeout or missing pytest.
+      Manual test-run checkpoint (FEAT-020). The operator runs the project's
+      test suite and signals the result via tests-completed with
+      {passed: bool, output: str}. Result surfaced in
+      human_review_implementation nodeInputs as testResult.
     inputSchema:
       type: object
       properties:
