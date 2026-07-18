@@ -79,6 +79,9 @@ def register_all_executors(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     github_pat: str | None = None,
     github_artifact_branch: str = "main",
+    ia_framework_tools_path: str | None = None,
+    lifecycle_project_repo_path: str | None = None,
+    lifecycle_test_timeout_seconds: int = 300,
 ) -> None:
     """Register an executor for every node of every loaded agent.
 
@@ -137,6 +140,9 @@ def register_all_executors(
                     max_corrections=v03_collaborators.max_corrections,
                     github_pat=github_pat,
                     github_artifact_branch=github_artifact_branch,
+                    ia_framework_tools_path=ia_framework_tools_path,
+                    lifecycle_project_repo_path=lifecycle_project_repo_path,
+                    lifecycle_test_timeout_seconds=lifecycle_test_timeout_seconds,
                 )
         elif agent.ref.startswith("lifecycle-agent@0.5"):
             # FEAT-017: mockup-conditional variant.  Reuses v0.3.0
@@ -1797,8 +1803,11 @@ def register_lifecycle_v06_human(
     actor: str | None = "lifecycle-agent",
     github_pat: str | None = None,
     github_artifact_branch: str = "main",
+    ia_framework_tools_path: str | None = None,
+    lifecycle_project_repo_path: str | None = None,
+    lifecycle_test_timeout_seconds: int = 300,
 ) -> None:
-    """Register bindings for ``lifecycle-agent@0.6.0-human`` (FEAT-018).
+    """Register bindings for ``lifecycle-agent@0.6.0-human`` (FEAT-018/020).
 
     Standalone function — does not delegate to any prior variant.  The
     orchestrator makes zero LLM or platform calls; every content-producing
@@ -1822,6 +1831,9 @@ def register_lifecycle_v06_human(
     Artifact     — log_run_started, commit_brief, commit_tasks, commit_plan,
                    commit_review, log_run_completed (FEAT-019, Changes 4+6).
                    All are no-ops when ``github_pat`` is None.
+
+    Validator    — run_validate_tasks, run_tests, run_validate_specs_strict
+                   (FEAT-020).  All skip non-fatally when tool paths absent.
 
     Synthetic    — start (no_executor).
     """
@@ -2298,6 +2310,55 @@ def register_lifecycle_v06_human(
             lifecycle_client=lifecycle_client,
             session_factory=session_factory,
             actor=actor,
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # FEAT-020 — validator nodes.
+    # All skip non-fatally when tool paths are absent.
+    # ------------------------------------------------------------------
+    from app.modules.ai.executors.lifecycle_validators import (
+        make_run_tests_handler,
+        make_validate_specs_strict_handler,
+        make_validate_tasks_handler,
+    )
+
+    registry.register(
+        agent_ref,
+        "run_validate_tasks",
+        LocalExecutor(
+            ref="local:run_validate_tasks",
+            handler=make_validate_tasks_handler(
+                session_factory,
+                tools_path=ia_framework_tools_path,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    registry.register(
+        agent_ref,
+        "run_tests",
+        LocalExecutor(
+            ref="local:run_tests",
+            handler=make_run_tests_handler(
+                session_factory,
+                timeout_seconds=lifecycle_test_timeout_seconds,
+                agent_ref=agent_ref,
+            ),
+        ),
+    )
+
+    registry.register(
+        agent_ref,
+        "run_validate_specs_strict",
+        LocalExecutor(
+            ref="local:run_validate_specs_strict",
+            handler=make_validate_specs_strict_handler(
+                session_factory,
+                tools_path=ia_framework_tools_path,
+                repo_path=lifecycle_project_repo_path,
+            ),
         ),
     )
 

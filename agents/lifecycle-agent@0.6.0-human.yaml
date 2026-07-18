@@ -92,6 +92,16 @@ nodes:
     inputSchema:
       type: object
 
+  - name: run_validate_tasks
+    description: >
+      Run validate-tasks.py from ia-framework tools against a temp
+      rendering of the in-memory task list (FEAT-020). Result written
+      to validatorResults.tasks and surfaced in confirm_task_review
+      nodeInputs. Skips non-fatally when IA_FRAMEWORK_TOOLS_PATH is
+      absent.
+    inputSchema:
+      type: object
+
   - name: commit_tasks
     description: >
       Commit the task list to the project repo via the GitHub Contents
@@ -184,6 +194,17 @@ nodes:
     inputSchema:
       type: object
 
+  - name: run_tests
+    description: >
+      Run uv run pytest after submit_implementation (FEAT-020). Result
+      written to testResults[task_id] and surfaced in
+      human_review_implementation nodeInputs. Skips non-fatally on
+      timeout or missing pytest.
+    inputSchema:
+      type: object
+      properties:
+        taskId: {type: string}
+
   - name: human_review_implementation
     description: >
       Pause for ``review-completed`` from a human reviewer. Pass routes
@@ -235,7 +256,19 @@ nodes:
     description: >
       Operator confirms that all artefact files (brief, task list, plans)
       are committed to the project repo and docs are in sync (FEAT-019).
-      Approve routes to close_work_item. Revise holds here for re-check.
+      Approve routes to run_validate_specs_strict. Revise holds here for
+      re-check.
+    inputSchema:
+      type: object
+
+  - name: run_validate_specs_strict
+    description: >
+      Run validate-specs.py --strict against the project docs/ tree after
+      the operator approves confirm_docs_update (FEAT-020). On pass:
+      proceeds to log_run_completed. On fail: writes failure output to
+      rejections["confirm_docs_update"] and loops back for re-check.
+      Requires LIFECYCLE_PROJECT_REPO_PATH; skips non-fatally (passed=true)
+      when absent.
     inputSchema:
       type: object
 
@@ -287,8 +320,9 @@ flow:
     confirm_tasks:
       branch:
         rule: checkpoint_approved
-        "true": confirm_task_review
+        "true": run_validate_tasks
         "false": confirm_tasks
+    run_validate_tasks: [confirm_task_review]
     confirm_task_review:
       branch:
         rule: checkpoint_approved
@@ -315,7 +349,8 @@ flow:
     commit_plan: [approve_plan]
     approve_plan: [request_implementation]
     request_implementation: [submit_implementation]
-    submit_implementation: [human_review_implementation]
+    submit_implementation: [run_tests]
+    run_tests: [human_review_implementation]
     human_review_implementation:
       branch:
         rule: review_passed
@@ -331,6 +366,11 @@ flow:
     confirm_docs_update:
       branch:
         rule: checkpoint_approved
+        "true": run_validate_specs_strict
+        "false": confirm_docs_update
+    run_validate_specs_strict:
+      branch:
+        rule: validator_passed
         "true": log_run_completed
         "false": confirm_docs_update
     log_run_completed: [close_work_item]

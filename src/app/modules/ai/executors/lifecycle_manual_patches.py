@@ -670,11 +670,16 @@ def intake_for_human_review(current_memory: Mapping[str, Any]) -> dict[str, Any]
     impl_ref: dict[str, Any] | None = None
     if isinstance(impl_refs_raw, dict):
         impl_ref = cast("dict[str, Any]", impl_refs_raw).get(task_id)
+    test_result: Any = None
+    test_results_raw: Any = current_memory.get("testResults") or {}
+    if isinstance(test_results_raw, dict) and task_id:
+        test_result = cast("dict[str, Any]", test_results_raw).get(task_id)
     return {
         "currentTask": current_task.model_dump(mode="json") if current_task else None,
         "planMarkdown": _resolve_plan_markdown(current_memory, task_id),
         "reviewHistory": [r.model_dump(mode="json") for r in memory.review_history if r.task_id == task_id],
         "implementationRef": impl_ref,
+        "testResult": test_result,
     }
 
 
@@ -716,18 +721,22 @@ def apply_docs_update_verdict(
 
 
 def intake_for_confirm_task_review(current_memory: Mapping[str, Any]) -> dict[str, Any]:
-    """Expose the authored task list to the independent reviewer (FEAT-019)."""
+    """Expose the authored task list and validator result to the reviewer (FEAT-019/020)."""
     memory = read_lifecycle_memory(current_memory)
-    # Surface any prior rejection feedback so the reviewer sees what was flagged.
     prior_feedback: str | None = None
     rejections_raw: Any = current_memory.get("rejections") or {}
     if isinstance(rejections_raw, dict):
         prior_entry = cast("dict[str, Any]", rejections_raw).get("confirm_task_review")
         if isinstance(prior_entry, dict):
             prior_feedback = str(cast("dict[str, Any]", prior_entry).get("feedback") or "")
+    validator_result: Any = None
+    validator_results_raw: Any = current_memory.get("validatorResults") or {}
+    if isinstance(validator_results_raw, dict):
+        validator_result = cast("dict[str, Any]", validator_results_raw).get("tasks")
     return {
         "tasks": [t.model_dump(mode="json", by_alias=True) for t in memory.tasks],
         "priorFeedback": prior_feedback,
+        "validatorResult": validator_result,
     }
 
 
