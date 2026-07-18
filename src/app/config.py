@@ -144,6 +144,18 @@ class Settings(BaseSettings):
     # are no-ops (a warning is logged and the step completes without writing).
     github_artifact_branch: str | None = None
 
+    # FEAT-020: validator integration.
+    # Path to carestechs-ia-framework/tools/ on the orchestrator host.
+    # When absent, run_validate_tasks and run_validate_specs_strict skip
+    # non-fatally.
+    ia_framework_tools_path: str | None = None
+    # Path to the project repo checkout on the orchestrator host; required by
+    # run_validate_specs_strict (validate-specs.py reads the docs/ tree).
+    # When absent, run_validate_specs_strict skips non-fatally.
+    lifecycle_project_repo_path: str | None = None
+    # Wall-clock cap for pytest runs dispatched by run_tests (seconds).
+    lifecycle_test_timeout_seconds: int = Field(default=300, ge=30)
+
     # -- Flow-engine lifecycle surface (FEAT-006 rc2) ---------------------
     # Points at the same flow engine as ``engine_base_url``; separate field
     # because the lifecycle surface (workflows / items / transitions) is

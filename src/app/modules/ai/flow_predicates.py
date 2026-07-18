@@ -239,6 +239,25 @@ def _current_task_is_mockup(  # pyright: ignore[reportUnusedFunction] -- accesse
     return task.kind == "mockup"
 
 
+@register("validator_passed")
+def _validator_passed(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
+    _memory: Mapping[str, Any], last: Mapping[str, Any] | None
+) -> bool:
+    """True iff the last validator/test node reported ``passed=True``.
+
+    Used by ``run_validate_specs_strict`` to route between
+    ``log_run_completed`` (pass) and a loop-back to ``confirm_docs_update``
+    (fail).  When ``last`` is absent or ``passed`` is missing the predicate
+    defaults to ``True`` — a missing result never blocks the run.
+    """
+    if last is None:
+        return True
+    passed = last.get("passed")
+    if passed is None:
+        return True
+    return bool(passed)
+
+
 @register("task_rejected")
 def _task_rejected(  # pyright: ignore[reportUnusedFunction] -- accessed via registry
     _memory: Mapping[str, Any], last: Mapping[str, Any] | None
